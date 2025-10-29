@@ -1,17 +1,53 @@
 """
 methods.py
 
-Implementation of the covariate-adaptive methods evaluated in the
-CAHB-PP simulation study (Sec. 3.3 of CAHB_PP(2).pdf):
+Covariate-Adaptive Randomization Methods for CAHB-PP Simulation Study
 
-- KBCD        : Jiang et al. (2018) kernel-based biased coin design.
-- CAHB        : Jin et al. (2023) covariate-adjusted historical borrowing.
-- CAHB_PP     : Proposed CAHB with local power prior discount a(x).
-- rMAP_KBCD   : Schmidli et al. (2014) robust MAP prior combined with KBCD.
+This module implements four covariate-adaptive randomization and analysis methods
+evaluated in Section 3.3 of the CAHB-PP manuscript. Each method consists of two
+components:
 
-Each method implements
-    • get_allocation_prob ─ adaptive randomisation for a new subject.
-    • estimate_treatment_effect ─ final analysis of the completed trial.
+1. **Adaptive Allocation Rule**: Computes Pr(Z = 1 | X, Data) for a new subject
+   with covariates X, given the accumulating trial data.
+
+2. **Final Analysis**: Estimates the treatment effect and produces inference
+   (point estimate, confidence interval, posterior probability).
+
+Implemented Methods:
+--------------------
+1. KBCD (Jiang et al., 2018):
+   - Kernel-based covariate-balancing randomization
+   - No historical borrowing (benchmark)
+   - Balances local covariate distribution across arms
+   
+2. CAHB (Jin et al., 2023):
+   - Covariate-adjusted historical borrowing
+   - Local borrowing via posterior precision inflation R_n(x)
+   - Compatibility-based borrowing weight via tau_n(x)
+
+3. CAHB-PP (Proposed):
+   - Extends CAHB with local power prior discount a(x)
+   - Data-driven borrowing: a(x) ∈ [0,1] learned from compatibility
+   - Beta(1,1) prior on a(x) with compatibility-based likelihood
+
+4. rMAP-KBCD (Schmidli et al., 2014):
+   - Robust meta-analytic-predictive prior
+   - Global borrowing (not covariate-adjusted)
+   - Mixture of informative and vague priors
+   - Combined with KBCD allocation
+
+Common Interface:
+-----------------
+All methods inherit from BaseMethod and implement:
+    - get_allocation_prob(X_curr, Y_curr, Z_curr, X_new) -> float
+    - estimate_treatment_effect(X, Y, Z) -> (delta_hat, ci_low, ci_high, prob_gt_0)
+
+References:
+-----------
+- CAHB-PP manuscript (Section 2-3): references/CAHB_PP.pdf
+- Jin et al. (2023): references/2023_SIM_CAHB.pdf
+- Jiang et al. (2018): references/KBCD.pdf  
+- Schmidli et al. (2014): references/MAP.pdf
 """
 
 from dataclasses import dataclass
@@ -247,7 +283,56 @@ class BorrowingMethod(BaseMethod):
 # ---------------------------------------------------------------------------
 
 class KBCD(BaseMethod):
-    """Kernel-Based Biased Coin Design (Jiang et al., 2018)."""
+    """
+    Kernel-Based Covariate-Balancing Biased Coin Design (Jiang et al., 2018).
+    
+    KBCD is a covariate-adaptive randomization method that balances the treatment
+    allocation locally around each subject's covariate value. It serves as the
+    NO BORROWING benchmark in our simulations.
+    
+    Key Principle:
+    --------------
+    For a new subject with covariates x, allocate to treatment vs control in a way
+    that balances the LOCAL (kernel-weighted) sample sizes in the two arms.
+    
+    Allocation Rule (Equation 2 in Jiang et al. 2018):
+    ---------------------------------------------------
+    pi_1(x) = (1/g_0(x) - 1) / (1/g_0(x) + 1/g_1(x) - 2)
+    
+    where:
+        g_0(x) = n_0(x) / n(x)    # Local proportion in control
+        g_1(x) = n_1(x) / n(x)    # Local proportion in treatment
+        n_0(x) = sum_i K(x, X_i) * I(Z_i = 0)  # Kernel-weighted control count
+        n_1(x) = sum_i K(x, X_i) * I(Z_i = 1)  # Kernel-weighted treatment count
+    
+    Kernel Function:
+    ----------------
+    Product Gaussian kernel:
+        K(x, x') = prod_j exp(-0.5 * [(x_j - x'_j) / h_j]^2)
+    
+    Bandwidth: Silverman's rule-of-thumb
+        h_j = (4 / (p + 2))^(1/(p+4)) * n^(-1/(p+4)) * sigma_j
+    
+    Final Analysis:
+    ---------------
+    Kernel regression estimates for each arm:
+        mu_0(x) = sum_i K(x, X_i) Y_i I(Z_i=0) / sum_i K(x, X_i) I(Z_i=0)
+        mu_1(x) = sum_i K(x, X_i) Y_i I(Z_i=1) / sum_i K(x, X_i) I(Z_i=1)
+    
+    Treatment effect: delta(x) = mu_1(x) - mu_0(x)
+    
+    Advantages:
+    -----------
+    - Achieves covariate balance without modeling assumptions
+    - Automatic bandwidth selection
+    - Works for continuous and discrete covariates
+    
+    Limitations:
+    ------------
+    - Does not use historical data
+    - May have low precision with small local sample sizes
+    - Bandwidth choice affects performance
+    """
 
     def __init__(self, historical_data: dict, scenario_params: dict, priors: dict):
         super().__init__(historical_data, scenario_params, priors)
@@ -282,12 +367,57 @@ class KBCD(BaseMethod):
 
 
 class CAHB(BorrowingMethod):
-    """Covariate-Adjusted Historical Borrowing (Jin et al., 2023)."""
+    """
+    Covariate-Adjusted Historical Borrowing (Jin et al., 2023).
+    
+    CAHB adaptively borrows from historical control data based on local
+    covariate-specific compatibility between historical and concurrent controls.
+    
+    Key Features:
+    -------------
+    1. Local compatibility assessment via kernel-weighted statistics
+    2. Borrowing strength controlled by tau_n(x) - posterior precision from 
+       historical data
+    3. Effective sample size inflation R_n(x) for allocation and analysis
+    
+    Allocation Rule (Equation 6 in Jin et al. 2023):
+    ------------------------------------------------
+    The allocation probability is computed via the biased coin design with
+    effective sample size inflation:
+    
+        pi_1(x) = f(n_0^eff(x), n_1(x))
+        
+    where:
+        n_0^eff(x) = R_n(x) * n_0(x)    # Inflated control sample size
+        R_n(x) = 1 + tau_n(x) * phi_0^2(x)  # Sample size inflation factor
+        
+    Borrowing Components (Section 3):
+    ----------------------------------
+    Compatibility measure:
+        tau_n(x) = n_h(x) / (gamma^2 + n_h(x) * [theta_h(x) - theta_0c(x)]^2)
+        
+    where:
+        - theta_h(x): Historical control mean at x
+        - theta_0c(x): Current control mean at x  
+        - gamma: Tuning parameter (gamma = sqrt(3))
+        - n_h(x): Effective historical sample size at x
+    
+    Final Analysis (Section 4):
+    ---------------------------
+    Posterior mean for control arm at x:
+        theta_0^*(x) = (w_c(x) * theta_0c(x) + w_h(x) * theta_h(x)) / (w_c + w_h)
+        
+    where:
+        w_c(x) = n_0c(x) / phi_0^2(x)      # Current control precision
+        w_h(x) = tau_n(x)                   # Historical precision contribution
+    """
 
     def __init__(self, historical_data: dict, scenario_params: dict, priors: dict):
         super().__init__(historical_data, scenario_params, priors)
         self.name = "CAHB"
-        self.gamma = np.sqrt(3.0)  # Section 4 tuning constant
+        # Tuning parameter gamma (Section 4 of Jin et al. 2023)
+        # Controls sensitivity to historical-current discrepancy
+        self.gamma = float(priors.get('cahb_gamma', np.sqrt(3.0)))
 
     # Internal helpers -----------------------------------------------------
     def _borrowing_components(
@@ -359,11 +489,69 @@ class CAHB(BorrowingMethod):
 
 
 class CAHB_PP(CAHB):
-    """Proposed CAHB with local power prior (Sec. 2.4–2.5 of CAHB_PP(2).pdf)."""
+    """
+    Proposed: Covariate-Adjusted Historical Borrowing with Power Prior (CAHB-PP).
+    
+    CAHB-PP extends CAHB by introducing a local, data-driven discount parameter
+    a(x) ∈ [0, 1] that controls borrowing strength based on covariate-specific
+    compatibility between historical and current control data.
+    
+    Key Innovation:
+    ---------------
+    Instead of borrowing all historical information at x (as CAHB does), CAHB-PP
+    discounts the historical data by a(x), where a(x) is learned from the data
+    via a power prior framework.
+    
+    Power Prior Framework (Section 2.4-2.5):
+    -----------------------------------------
+    Historical data contribution:
+        L(theta | D_h)^{a(x)}
+        
+    where a(x) ~ Beta(alpha_a, beta_a) is the discount parameter.
+    
+    Posterior for a(x) (Equation X in manuscript):
+        a(x) | D ~ Beta(alpha_a + n_h(x) * compatibility, 
+                        beta_a + n_h(x) * (1 - compatibility))
+        
+    Compatibility score:
+        compatibility(x) = exp(-0.5 * [theta_h(x) - theta_0c(x)]^2 / phi_0^2(x))
+        
+    This gives higher a(x) when historical and current controls are compatible.
+    
+    Effective Sample Size with Power Prior:
+    ----------------------------------------
+    R_n(x) = 1 + a(x) * [n_h(x) * sigma_c^2(x)] / [n_c(x) * sigma_h^2(x)]
+    
+    where:
+        - a(x): Local discount parameter (posterior mean)
+        - n_h(x), n_c(x): Local effective sample sizes
+        - sigma_h^2(x), sigma_c^2(x): Local variance estimates
+    
+    Advantages over CAHB:
+    ---------------------
+    1. Automatic discount when historical data are incompatible
+    2. Covariate-specific borrowing (local a(x) vs global)
+    3. Uncertainty quantification via Beta posterior on a(x)
+    4. Bounded borrowing: a(x) ∈ [0,1] ensures conservative borrowing
+    
+    Prior Specification:
+    --------------------
+    Beta(1, 1) = Uniform[0, 1] (non-informative):
+        - Allows data to fully determine borrowing strength
+        - a_alpha = 1, a_beta = 1
+    
+    Alternative: Beta(0.5, 0.5) (Jeffreys prior) for more conservatism
+    
+    References:
+        CAHB-PP manuscript Section 2.4-2.5 (Proposed Method)
+    """
 
     def __init__(self, historical_data: dict, scenario_params: dict, priors: dict):
         super().__init__(historical_data, scenario_params, priors)
         self.name = "CAHB-PP"
+        
+        # Beta prior hyperparameters for discount parameter a(x)
+        # a(x) ~ Beta(a_alpha, a_beta)
         self.a_alpha = float(self.priors.get("a_beta_a", 1.0))
         self.a_beta = float(self.priors.get("a_beta_b", 1.0))
 
@@ -372,15 +560,71 @@ class CAHB_PP(CAHB):
         control_stats: LocalStats,
         hist_stats: LocalStats,
     ) -> float:
+        """
+        Computes the local power prior discount parameter a(x).
+        
+        This is the core innovation of CAHB-PP: a data-driven, covariate-specific
+        discount that down-weights historical data when they are incompatible with
+        current controls at covariate value x.
+        
+        Power Prior Discount (Section 2.5):
+        ------------------------------------
+        Prior: a(x) ~ Beta(alpha_a, beta_a)
+        
+        Compatibility likelihood:
+            L(a | x) proportional to a^{n_h(x) * c(x)}
+            
+        where c(x) = compatibility score:
+            c(x) = exp(-0.5 * [theta_h(x) - theta_0c(x)]^2 / phi_0^2(x))
+        
+        Posterior (conjugate Beta update):
+            a(x) | Data ~ Beta(alpha_a + n_h(x)*c(x), beta_a + n_h(x)*(1-c(x)))
+        
+        We use the posterior mean E[a(x) | Data] as the point estimate.
+        
+        Interpretation of a(x):
+        -----------------------
+        - a(x) ≈ 1: Historical and current data highly compatible at x
+                    -> Borrow fully (close to CAHB behavior)
+        - a(x) ≈ 0.5: Moderate compatibility
+                      -> Partial borrowing  
+        - a(x) ≈ 0: Strong incompatibility at x
+                    -> Minimal borrowing (close to KBCD behavior)
+        
+        Args:
+            control_stats: Local statistics for current control arm at x
+            hist_stats: Local statistics for historical controls at x
+        
+        Returns:
+            Posterior mean of a(x), clipped to [0, 1]
+        
+        Notes:
+            - If no historical data at x (hist_stats.weight ≈ 0), return 0
+            - Compatibility uses current control variance as reference scale
+            - Gaussian compatibility measure: sensitive to mean differences
+        """
+        # No historical information at x -> no borrowing
         if hist_stats.weight <= 1e-6 or control_stats.weight <= 0:
             return 0.0
 
+        # Local variance of current control (reference scale for discrepancy)
         phi_sq = max(control_stats.variance, 1e-6)
+        
+        # Mean difference between historical and current controls
         delta_mu = hist_stats.mean - control_stats.mean
+        
+        # Compatibility score: high when means are similar
+        # c(x) ∈ [0, 1], with c(x)=1 when delta_mu=0
         compatibility = np.exp(-0.5 * (delta_mu ** 2) / phi_sq)
-        a_post = (self.a_alpha + compatibility * hist_stats.weight) / (
-            self.a_alpha + self.a_beta + hist_stats.weight
-        )
+        
+        # Posterior Beta parameters
+        # Effective: historical data "votes" for borrowing proportional to compatibility
+        alpha_post = self.a_alpha + compatibility * hist_stats.weight
+        beta_post = self.a_beta + (1.0 - compatibility) * hist_stats.weight
+        
+        # Posterior mean: E[a | Data] = alpha_post / (alpha_post + beta_post)
+        a_post = alpha_post / (alpha_post + beta_post)
+        
         return float(np.clip(a_post, 0.0, 1.0))
 
     def _borrowing_components(
@@ -448,18 +692,83 @@ class CAHB_PP(CAHB):
 
 
 class rMAP_KBCD(BaseMethod):
-    """Robust MAP prior applied to the control arm combined with KBCD allocation."""
+    """
+    Robust Meta-Analytic-Predictive (MAP) Prior + KBCD Allocation.
+    
+    Combines Schmidli et al. (2014) robust MAP prior for historical borrowing
+    with Jiang et al. (2018) KBCD allocation. This provides a GLOBAL BORROWING
+    benchmark (non-covariate-adjusted borrowing).
+    
+    Robust MAP Prior (Schmidli et al. 2014, Section 3):
+    ---------------------------------------------------
+    The control arm mean has a mixture prior:
+        
+        theta_0 ~ w * Vague(theta_0) + (1-w) * Informative(theta_0)
+    
+    Components:
+        - Informative: N(m_0, v_0)  based on historical data
+        - Vague: N(0, v_vague)       diffuse prior (v_vague >> v_0)
+        - Mixture weight: w = 0.1 (default)
+    
+    Hyperparameters from Historical Data:
+        m_0 = mean(Y_h)              # Historical control mean
+        v_0 = var(Y_h) / n_h         # Historical control variance / sample size
+        v_vague = 100 * v_0          # Vague component (large variance)
+    
+    Rationale:
+    ----------
+    - Vague component provides robustness to historical bias
+    - If current data conflict with historical, posterior shifts to vague component
+    - Automatic downweighting via Bayesian model averaging
+    
+    Allocation Rule:
+    ----------------
+    Uses KBCD allocation with inflated control effective sample size:
+        n_0^eff = n_0 + ESS_prior
+        
+    where ESS_prior is the effective sample size from the MAP prior.
+    
+    Final Analysis:
+    ---------------
+    Posterior for control mean (mixture of two Normals):
+        p(theta_0 | D) = w_post * N(m_post_vague, v_post_vague) 
+                         + (1 - w_post) * N(m_post_fitted, v_post_fitted)
+    
+    Posterior mixture weights updated via Bayes theorem using data likelihood.
+    
+    Comparison to CAHB/CAHB-PP:
+    ---------------------------
+    - Global borrowing (same for all covariates x)
+    - Robust to overall historical bias via mixture
+    - NOT adaptive to covariate-specific bias (e.g., Scenario S4)
+    - Simpler: no kernel smoothing for borrowing
+    
+    Limitations:
+    ------------
+    - Cannot detect or adapt to subgroup-specific historical bias
+    - Uniform borrowing across all covariate values
+    - Mixture weight w must be pre-specified
+    
+    References:
+        Schmidli et al. (2014), "Robust Meta-Analytic-Predictive Priors..."
+        Biometrics, Section 3-4
+    """
 
     def __init__(self, historical_data: dict, scenario_params: dict, priors: dict):
         super().__init__(historical_data, scenario_params, priors)
         self.name = "rMAP-KBCD"
 
+        # Robust MAP mixture weight (typically 0.1 = 10% on vague component)
         self.w_robust = float(self.priors.get("rmap_weight", 0.1))
-        self.m0 = float(np.mean(self.Y_h))
-        self.sq_sigma_h = max(np.var(self.Y_h, ddof=1), 1e-6)
-        self.v0 = self.sq_sigma_h / self.X_h.shape[0]
-        self.v_vague = 100.0  # diffuse component variance
+        
+        # Historical data summary statistics (global, not covariate-adjusted)
+        self.m0 = float(np.mean(self.Y_h))                         # Historical mean
+        self.sq_sigma_h = max(np.var(self.Y_h, ddof=1), 1e-6)     # Historical variance
+        self.v0 = self.sq_sigma_h / self.X_h.shape[0]             # Prior variance (informative)
+        self.v_vague = 100.0  # Vague component variance (large relative to v0)
 
+        # Effective sample size from MAP prior (for allocation)
+        # ESS = variance / prior_variance
         ess_fitted = self.sq_sigma_h / max(self.v0, 1e-6)
         ess_vague = self.sq_sigma_h / self.v_vague
         self.ess_prior = (1.0 - self.w_robust) * ess_fitted + self.w_robust * ess_vague
