@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Simulation artefacts
+results/
+.simulation_cache/
+
+# References and large assets
+references/
+
+# Environments
+.env/
+.venv/
+env/
+venv/
+
+# IDE / tooling
+.idea/
+.vscode/
+*.code-workspace

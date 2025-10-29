@@ -1,0 +1,209 @@
+"""
+analysis.py
+
+Handles processing of raw simulation results, calculation of
+evaluation metrics (Sec 3.5), and generation of publication-ready
+tables (.csv, .tex) and plots (.pdf).
+"""
+
+import os
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Pdf') # Use PDF backend for non-interactive saving
+import matplotlib.pyplot as plt
+
+import config # Import config for paths and true effect calc
+import data_generation # For true effect
+
+def _set_plot_style():
+    """Sets matplotlib rcParams for publication-quality plots."""
+    plt.rcParams.update({
+        'font.family': 'serif',
+        'font.serif': 'Times New Roman',
+        'font.size': 10,
+        'axes.labelsize': 10,
+        'axes.titlesize': 12,
+        'xtick.labelsize': 8,
+        'ytick.labelsize': 8,
+        'legend.fontsize': 9,
+        'figure.figsize': (6, 4),
+        'lines.linewidth': 1.5,
+        'savefig.dpi': 300,
+        'savefig.format': 'pdf',
+        'axes.grid': True,
+        'grid.linestyle': ':',
+        'grid.alpha': 0.6
+    })
+
+def get_true_delta(tau_0):
+    """
+    Calculates the true marginal ATE, E[tau(x)].
+    E[tau(x)] = E[tau_0 + 0.5*X1 - 0.5*1{X2=1}]
+              = tau_0 + 0.5*E[X1] - 0.5*E[1{X2=1}]
+              = tau_0 + 0.5*0 - 0.5*0.5
+              = tau_0 - 0.25
+    """
+    return tau_0 - 0.25
+
+def process_results(results_list):
+    """
+    Converts the raw list of result dicts into an aggregated DataFrame.
+    
+    Args:
+        results_list (list[dict]): List of dictionaries from main.py.
+        
+    Returns:
+        pd.DataFrame: A DataFrame with metrics aggregated by scenario and method.
+    """
+    if not results_list:
+        print("Warning: No results to process.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(results_list)
+    
+    # Calculate true delta for each row
+    df['true_delta'] = df['tau_0'].apply(get_true_delta)
+    
+    # Calculate performance metrics
+    df['error'] = df['delta_hat'] - df['true_delta']
+    df['sq_error'] = df['error']**2
+    df['coverage'] = (df['true_delta'] >= df['ci_low']) & (df['true_delta'] <= df['ci_high'])
+    df['is_success'] = df['prob_gt_0'] > config.DECISION_THRESHOLD
+    df['alloc_rate'] = df['n_treated'] / df['n_total']
+
+    # Aggregate
+    agg_funcs = {
+        'error': 'mean',          # Bias
+        'sq_error': lambda x: np.sqrt(np.mean(x)), # RMSE
+        'coverage': 'mean',
+        'alloc_rate': 'mean',
+        'n_total': 'mean' # Just to check
+    }
+    
+    # Group and aggregate
+    grouped = df.groupby(['scenario_name', 'method', 'tau_0', 'n', 'n_h'])
+    summary = grouped.agg(agg_funcs).reset_index()
+    summary = summary.rename(columns={'error': 'Bias', 'sq_error': 'RMSE', 'coverage': 'Coverage', 'alloc_rate': 'Alloc_Rate_Treated'})
+
+    # Calculate Type I Error and Power
+    # Type I Error: tau_0 == 0.0
+    type_1_error = df[df['tau_0'] == 0.0].groupby(['scenario_name', 'method'])['is_success'].mean().reset_index().rename(columns={'is_success': 'Type_I_Error'})
+    
+    # Power: tau_0 == 0.4
+    power = df[df['tau_0'] == 0.4].groupby(['scenario_name', 'method'])['is_success'].mean().reset_index().rename(columns={'is_success': 'Power'})
+
+    # Merge back
+    summary = pd.merge(summary, type_1_error, on=['scenario_name', 'method'], how='left')
+    summary = pd.merge(summary, power, on=['scenario_name', 'method'], how='left')
+    
+    # Fill NaNs for rows where tau_0 doesn't match
+    summary['Type_I_Error'] = summary.apply(lambda row: row['Type_I_Error'] if row['tau_0'] == 0.0 else np.nan, axis=1)
+    summary['Power'] = summary.apply(lambda row: row['Power'] if row['tau_0'] == 0.4 else np.nan, axis=1)
+    
+    # Pivot to get one row per scenario, collapsing tau_0
+    metrics = ['Bias', 'RMSE', 'Coverage', 'Alloc_Rate_Treated', 'Type_I_Error', 'Power']
+    final_summary = summary.groupby(['scenario_name', 'method', 'n', 'n_h']).agg(
+        {m: 'first' if m not in ['Type_I_Error', 'Power'] else 'sum' for m in metrics} # 'sum' works because one is NaN
+    ).reset_index()
+    
+    return final_summary
+
+def generate_tables(summary_df):
+    """
+    Saves the summary DataFrame to CSV and .tex formats.
+    """
+    if summary_df.empty:
+        return
+        
+    os.makedirs(config.TABLES_DIR, exist_ok=True)
+    
+    # --- CSV Output ---
+    csv_path = os.path.join(config.TABLES_DIR, 'simulation_summary.csv')
+    summary_df.to_csv(csv_path, index=False, float_format='%.4f')
+    print(f"Summary table saved to {csv_path}")
+    
+    # --- LaTeX Output ---
+    tex_path = os.path.join(config.TABLES_DIR, 'simulation_summary.tex')
+    # Make a prettier table for LaTeX
+    try:
+        tex_df = summary_df.pivot(index='scenario_name', columns='method', 
+                                  values=['Bias', 'RMSE', 'Coverage', 'Type_I_Error', 'Power', 'Alloc_Rate_Treated'])
+        # Reorder columns to group by method
+        tex_df = tex_df.reindex(columns=config.METHODS_TO_RUN, level='method')
+        tex_df.to_latex(tex_path, float_format='%.3f', na_rep='-', bold_rows=True, multicolumn_format='c')
+        print(f"LaTeX table saved to {tex_path}")
+    except Exception as e:
+        print(f"Could not pivot for LaTeX, saving flat table. Error: {e}")
+        summary_df.to_latex(tex_path, float_format='%.3f', index=False)
+
+def generate_plots(summary_df):
+    """
+    Generates publication-quality PDF plots of the results.
+    """
+    if summary_df.empty:
+        return
+        
+    os.makedirs(config.PLOTS_DIR, exist_ok=True)
+    _set_plot_style()
+    
+    # Plot RMSE, Power, and Alloc Rate vs. n, faceted by scenario
+    
+    # Get unique scenario base names (S1, S2, S3, S4)
+    summary_df['scenario_base'] = summary_df['scenario_name'].apply(lambda x: x.split('_')[-1])
+    scenarios = summary_df['scenario_base'].unique()
+    
+    metrics_to_plot = [
+        ('RMSE', 'RMSE'), 
+        ('Power', 'Power (for tau_0=0.4)'), 
+        ('Type_I_Error', 'Type I Error (for tau_0=0.0)'),
+        ('Alloc_Rate_Treated', 'Allocation Rate to Treatment')
+    ]
+    
+    colors = plt.cm.get_cmap('Dark2', len(config.METHODS_TO_RUN))
+    method_colors = {method: colors(i) for i, method in enumerate(config.METHODS_TO_RUN)}
+    
+    for metric, title in metrics_to_plot:
+        if metric not in summary_df.columns:
+            continue
+            
+        fig, axes = plt.subplots(1, len(scenarios), figsize=(5 * len(scenarios), 4), sharey=True)
+        if len(scenarios) == 1:
+            axes = [axes]
+            
+        for ax, s_name in zip(axes, scenarios):
+            df_s = summary_df[summary_df['scenario_base'] == s_name]
+            
+            # Filter for the relevant tau_0
+            if metric == 'Power':
+                df_s = df_s[df_s['tau_0'] == 0.4]
+            elif metric == 'Type_I_Error':
+                df_s = df_s[df_s['tau_0'] == 0.0]
+                
+            if df_s.empty:
+                continue
+
+            for method in config.METHODS_TO_RUN:
+                df_m = df_s[df_s['method'] == method].sort_values('n')
+                # Plot vs 'n', using different markers for 'n_h'
+                for n_h, marker in zip(sorted(df_m['n_h'].unique()), ['o', 's']):
+                    df_nh = df_m[df_m['n_h'] == n_h]
+                    ax.plot(df_nh['n'], df_nh[metric], label=f"{method} (n_h={n_h})", 
+                            color=method_colors[method], marker=marker, linestyle='-')
+
+            ax.set_title(f"Scenario {s_name}")
+            ax.set_xlabel("Current Sample Size (n)")
+            ax.set_xticks(summary_df['n'].unique())
+            if metric == 'Type_I_Error':
+                ax.axhline(y=config.ALPHA, color='red', linestyle='--', label=f'Alpha={config.ALPHA}')
+        
+        axes[0].set_ylabel(title)
+        handles, labels = axes[-1].get_legend_handles_labels()
+        fig.legend(handles, labels, loc='center right', bbox_to_anchor=(1.1, 0.5))
+        fig.suptitle(f"{title} vs. Sample Size", y=1.02)
+        fig.tight_layout(rect=[0, 0, 0.9, 1]) # Adjust for legend
+        
+        plot_path = os.path.join(config.PLOTS_DIR, f"plot_{metric}_vs_n.pdf")
+        fig.savefig(plot_path)
+        plt.close(fig)
+        print(f"Plot saved to {plot_path}")
