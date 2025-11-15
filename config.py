@@ -8,20 +8,24 @@ specifications, and file paths for the Covariate-Adjusted Historical Borrowing
 with Power Prior (CAHB-PP) simulation study as described in the manuscript.
 
 The simulation framework evaluates four covariate-adaptive randomization methods:
-    - CAHB-PP: Proposed method with local power prior discount
+    - CAHB-PP-IPD: Proposed method with local power prior discount (IPD access)
+    - CAHB-PP-SLD: Proposed method with summary-level discount
     - CAHB: Jin et al. (2023) - SIM paper
     - KBCD: Jiang et al. (2018) - kernel-based biased coin design
-    - rMAP-KBCD: Schmidli et al. (2014) robust MAP prior + KBCD allocation
 
 References:
     - CAHB-PP manuscript (references/CAHB_PP(2).pdf)
     - Jin et al. (2023): Statistics in Medicine (references/2023_SIM_CAHB.pdf)
     - Jiang et al. (2018): KBCD paper (references/KBCD.pdf)
-    - Schmidli et al. (2014): Robust MAP (references/MAP.pdf)
 """
 
 import os
 import numpy as np
+
+
+def _env_flag(var_name: str, default: str = "0") -> bool:
+    """Parses boolean-like environment variables (\"1\", \"true\", \"on\")."""
+    return os.environ.get(var_name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 # =============================================================================
 # Core Simulation Settings
@@ -29,7 +33,17 @@ import numpy as np
 
 # Number of Monte Carlo replicates per scenario (Section 3.5 of manuscript)
 # Recommended: 1000 for publication results, reduce for testing
-N_REPLICATES = 1000
+FULL_RUN_REPLICATES = 1000
+
+# Fast demonstration mode (smaller replication count, identical settings otherwise)
+FAST_DEMO = _env_flag("CAHB_FAST_DEMO", "0")
+FAST_DEMO_REPLICATES = int(os.environ.get("CAHB_FAST_DEMO_REPS", "50"))
+FAST_DEMO_REPLICATES = max(5, FAST_DEMO_REPLICATES)
+
+if FAST_DEMO:
+    N_REPLICATES = FAST_DEMO_REPLICATES
+else:
+    N_REPLICATES = FULL_RUN_REPLICATES
 
 # Parallel computation settings
 # N_JOBS controls joblib parallelization:
@@ -55,6 +69,10 @@ MAX_MEMORY_PER_JOB = 2000  # 2GB per worker
 # before adaptive randomization begins
 N_INIT = 40
 
+# Sequential allocation monitoring grid (for allocation diagnostics figure)
+SEQ_MONITOR_START = N_INIT
+SEQ_MONITOR_STEP = 20
+
 # Allocation probability during burn-in (0.5 = balanced 1:1 randomization)
 ALLOC_BURN_IN = 0.5
 
@@ -69,18 +87,18 @@ BATCH_SIZE = 100
 # Methods to evaluate in the simulation study
 # Each method name must correspond to a class in methods.py
 METHODS_TO_RUN = [
-    'CAHB_PP',      # Proposed method (Section 2 of manuscript)
+    'CAHB_PP_IPD',  # Proposed method with IPD-driven discounting
+    'CAHB_PP_SLD',  # Proposed method using summary-level historical borrowing
     'CAHB',         # Jin et al. (2023) - baseline borrowing method
     'KBCD',         # Jiang et al. (2018) - no borrowing benchmark
-    'rMAP_KBCD'     # Schmidli et al. (2014) - global borrowing benchmark
 ]
 
 # Method display names for tables and figures
 METHOD_LABELS = {
-    'CAHB_PP': 'CAHB-PP (Proposed)',
+    'CAHB_PP_IPD': 'CAHB-PP-IPD',
+    'CAHB_PP_SLD': 'CAHB-PP-SLD',
     'CAHB': 'CAHB (Jin et al. 2023)',
     'KBCD': 'KBCD (Jiang et al. 2018)',
-    'rMAP_KBCD': 'rMAP-KBCD (Schmidli et al. 2014)'
 }
 
 # =============================================================================
@@ -112,10 +130,11 @@ PRIORS = {
     # Beta(1,1) = Uniform[0,1] prior for CAHB-PP
     'a_beta_a': 1.0,          # Beta prior shape parameter (alpha)
     'a_beta_b': 1.0,          # Beta prior shape parameter (beta)
-    
-    # Robust MAP prior mixture weight (Schmidli et al. 2014)
-    # Weight for vague component: w * Vague + (1-w) * Informative
-    'rmap_weight': 0.1,       # w = 0.1 (10% weight on vague component)
+    'bridge_schedule': (0.0, 0.5, 1.0),
+    'bridge_samples': 64,
+    'bridge_burn_in': 32,
+    'bridge_thin': 1,
+    'bridge_step_size': 0.12,
     
     # CAHB tuning parameter (Jin et al. 2023, Section 4)
     # Controls borrowing strength via compatibility measure
@@ -132,6 +151,9 @@ ALPHA = 0.05
 # Posterior probability threshold for declaring treatment success
 # Trial deemed successful if Pr(delta > 0 | Data) > DECISION_THRESHOLD
 DECISION_THRESHOLD = 0.975
+
+# Calibration diagnostics: per-replicate subsample size for discount summaries
+CALIBRATION_MAX_SAMPLES = 32
 
 # Effective sample size constraints (for numerical stability)
 MIN_ESS = 1e-6      # Minimum effective sample size
@@ -294,9 +316,6 @@ def validate_config():
     # Validate prior parameters
     if PRIORS['a_beta_a'] <= 0 or PRIORS['a_beta_b'] <= 0:
         raise ValueError("Beta prior parameters must be positive")
-    
-    if not (0 <= PRIORS['rmap_weight'] <= 1):
-        raise ValueError("rMAP weight must be in [0, 1]")
     
     # Print configuration summary
     n_sims = get_total_simulations()

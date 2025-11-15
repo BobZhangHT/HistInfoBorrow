@@ -78,6 +78,8 @@ except ImportError as e:
     print("Ensure all .py files are in the same directory.")
     sys.exit(1)
 
+AllocationResult = getattr(methods, "AllocationResult", None)
+
 
 # =============================================================================
 # Single Simulation Function
@@ -205,26 +207,44 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
     # Remaining subjects receive adaptive allocation based on method
     
     n_adaptive = scenario['n'] - config.N_INIT
+    monitor_start = getattr(config, "SEQ_MONITOR_START", config.N_INIT)
+    monitor_step = max(1, int(getattr(config, "SEQ_MONITOR_STEP", 20)))
+    allocation_path = []
     
     for _ in range(n_adaptive):
         # Generate new subject's covariates
         X_new = data_generation.generate_covariates(n=1)
         
         # Get allocation probability from the method
-        # This is where methods differ (CAHB-PP vs CAHB vs KBCD vs rMAP)
+        # This is where methods differ (CAHB-PP variants vs CAHB vs KBCD)
         try:
-            pi_1 = method_instance.get_allocation_prob(
+            alloc_output = method_instance.get_allocation_prob(
                 X_curr=X_curr,
                 Y_curr=Y_curr,
                 Z_curr=Z_curr,
                 X_new=X_new
             )
-            # Clip to valid probability range
-            pi_1 = float(np.clip(pi_1, 0.0, 1.0))
+            diag = {}
+            if AllocationResult is not None and isinstance(alloc_output, AllocationResult):
+                pi_1 = float(np.clip(alloc_output.pi_treatment, 0.0, 1.0))
+                diag = dict(getattr(alloc_output, "diagnostics", {}) or {})
+            else:
+                pi_1 = float(np.clip(float(alloc_output), 0.0, 1.0))
         except Exception as e:
             # If allocation fails, default to balanced
             warnings.warn(f"Allocation failed for {method_name}, using balanced: {e}")
             pi_1 = 0.5
+            diag = {}
+        
+        # Guard diagnostics
+        if not np.isfinite(pi_1):
+            pi_1 = 0.5
+        diag_Rn = float(diag.get("R_n", 1.0)) if isinstance(diag, dict) else 1.0
+        
+        try:
+            diag_discount = float(diag.get("mean", np.nan)) if isinstance(diag, dict) else np.nan
+        except Exception as e:
+            diag_discount = np.nan
         
         # Randomize treatment assignment
         Z_new = np.random.binomial(1, pi_1)
@@ -241,6 +261,16 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
         X_curr = np.vstack([X_curr, X_new])
         Z_curr = np.append(Z_curr, Z_new)
         Y_curr = np.append(Y_curr, Y_new)
+        
+        total_enrolled = len(Z_curr)
+        if total_enrolled >= monitor_start and ((total_enrolled - monitor_start) % monitor_step == 0):
+            prop_treated = float(np.sum(Z_curr) / total_enrolled)
+            allocation_path.append({
+                "sample_size": int(total_enrolled),
+                "prop_treated": prop_treated,
+                "R_n": diag_Rn,
+                "a_mean": diag.get("mean") if isinstance(diag, dict) else np.nan,
+            })
     
     # ==== 5. Final Analysis ====
     
@@ -255,6 +285,13 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
         warnings.warn(f"Estimation failed for {scenario['name']}, method {method_name}, "
                      f"rep {replicate_id}: {e}")
         delta_hat, ci_low, ci_high, prob_gt_0 = np.nan, np.nan, np.nan, np.nan
+
+    try:
+        calibration_samples = method_instance.get_calibration_payload()
+        if calibration_samples is None:
+            calibration_samples = []
+    except Exception:
+        calibration_samples = []
     
     # ==== 6. Compile Results ====
     
@@ -281,7 +318,9 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
         # Allocation summary
         'n_total': scenario['n'],
         'n_treated': int(np.sum(Z_curr)),
-        'n_control': int(np.sum(1 - Z_curr))
+        'n_control': int(np.sum(1 - Z_curr)),
+        'allocation_path': allocation_path,
+        'calibration_samples': calibration_samples,
     }
     
     # ==== 7. Memory Cleanup ====
@@ -394,6 +433,8 @@ def main():
     for method in config.METHODS_TO_RUN:
         print(f"      - {method}")
     print(f"  ✓ Running {config.N_REPLICATES} replicates per (scenario × method)")
+    if getattr(config, "FAST_DEMO", False):
+        print(f"    → FAST_DEMO active (set CAHB_FAST_DEMO=0 for full {config.FULL_RUN_REPLICATES} replicates)")
     
     # Create task list: all (scenario, method, replicate) combinations
     print("\nStep 5: Creating task queue...")
@@ -493,8 +534,10 @@ def main():
     print("Step 7: Computing performance metrics...")
     
     try:
-        summary_df = analysis.process_results(results)
-        print(f"  ✓ Aggregated {len(summary_df)} (scenario × method) combinations")
+        analysis_outputs = analysis.process_results(results)
+        summary_df = analysis_outputs.get('summary')
+        n_summary = len(summary_df) if summary_df is not None else 0
+        print(f"  ✓ Aggregated {n_summary} (scenario × method) combinations")
         print(f"  ✓ Metrics computed: Bias, RMSE, Coverage, Type I Error, Power")
     except Exception as e:
         print(f"\n❌ ERROR during results processing: {e}")
@@ -507,7 +550,7 @@ def main():
     print("Step 8: Generating tables...")
     
     try:
-        analysis.generate_tables(summary_df)
+        analysis.generate_tables(analysis_outputs)
     except Exception as e:
         print(f"⚠ Warning: Table generation failed: {e}")
     
@@ -518,7 +561,7 @@ def main():
     print("Step 9: Generating plots...")
     
     try:
-        analysis.generate_plots(summary_df)
+        analysis.generate_plots(analysis_outputs)
     except Exception as e:
         print(f"⚠ Warning: Plot generation failed: {e}")
     

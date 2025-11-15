@@ -9,14 +9,14 @@ Simulation study code for **"Covariate-Adjusted Historical Borrowing with Power 
 
 This repository implements the simulation study evaluating four covariate-adaptive randomization methods:
 
-1. **CAHB-PP** (Proposed): Covariate-adjusted borrowing with local power prior discounting
-2. **CAHB**: Covariate-adjusted historical borrowing (Jin et al., 2023)
-3. **KBCD**: Kernel-based biased coin design - no borrowing benchmark (Jiang et al., 2018)
-4. **rMAP-KBCD**: Robust MAP prior with KBCD allocation (Schmidli et al., 2014)
+1. **CAHB-PP-IPD** *(Proposed)*: Bridge-sampled local power-prior discounting using individual-level historical data
+2. **CAHB-PP-SLD** *(Proposed)*: Summary-level discounting for sites without IPD access
+3. **CAHB**: Covariate-adjusted historical borrowing (Jin et al., 2023)
+4. **KBCD**: Kernel-based biased coin design - no borrowing benchmark (Jiang et al., 2018)
 
 ### Key Innovation
 
-CAHB-PP introduces a **local, data-driven discount parameter** `a(x) ∈ [0,1]` that adapts borrowing strength based on compatibility between historical and current control data at each covariate value `x`. This enables automatic downweighting of incompatible historical data and robustness to subgroup-specific bias.
+CAHB-PP introduces a **local, data-driven discount parameter** (x) ∈ [0,1] learned via bridge sampling + Metropolis–Hastings updates. The sampler adaptively tunes borrowing strength based on the compatibility between historical and current control data at each covariate value x, automatically down-weighting incompatible sources and preserving subgroup robustness.
 
 ## Installation
 
@@ -44,33 +44,43 @@ pip install -r requirements.txt
 
 ### Run Complete Simulation Study
 
-```bash
+`ash
 python main.py
-```
+`
 
 This will:
 - Run 1,000 replicates per (scenario × method) combination
 - Execute in parallel using all available CPU cores
 - Cache results for resumability
-- Generate tables and plots in `results/`
+- Generate tables and plots in 
+esults/
 
-### Quick Test
+### Fast Demo Mode
 
-For testing, reduce replicates in `config.py`:
-```python
-N_REPLICATES = 100  # Instead of 1000
-```
+Enable a lightweight run (default 50 replicates) without editing the code:
+
+`ash
+# Linux/macOS
+export CAHB_FAST_DEMO=1
+python main.py
+
+# Windows PowerShell
+ = 1
+python main.py
+`
+
+Override the replicate count via CAHB_FAST_DEMO_REPS (e.g., set to 10 for smoke tests).
 
 ### Resume Interrupted Run
 
 Simply rerun - the checkpoint system will skip completed replicates:
-```bash
+`ash
 python main.py
-```
+`
 
 ### Force Fresh Run
 
-```bash
+`ash
 # Linux/macOS
 rm -rf .simulation_cache/
 python main.py
@@ -78,7 +88,7 @@ python main.py
 # Windows PowerShell
 Remove-Item -Recurse -Force .simulation_cache
 python main.py
-```
+`
 
 ## Project Structure
 
@@ -110,30 +120,29 @@ The simulation evaluates **32 scenarios** from a full factorial design:
 
 ## Methods Implemented
 
-### CAHB-PP (Proposed)
-Local discount parameter `a(x)` learned from data via power prior framework. Automatically downweights incompatible historical data.
+### CAHB-PP-IPD (Proposed)
+Bridge sampling + Metropolis–Hastings draws (x) using the full historical individual patient data and the local compatibility likelihood. The sampled discounts feed both allocation (R_n(x)) and inference to provide fully adaptive borrowing.
+
+### CAHB-PP-SLD (Proposed)
+Uses the same bridge sampler but replaces the IPD likelihood with summary-level strata (defined by key covariates), enabling trials to borrow from partners that can share only aggregated information.
 
 ### CAHB (Jin et al., 2023)
-Sample size inflation `R_n(x)` based on posterior precision with compatibility measure `τ_n(x)`.
+Sample size inflation R_n(x) based on posterior precision with compatibility measure τ_n(x); no stochastic discounting.
 
 ### KBCD (Jiang et al., 2018)
 No-borrowing benchmark using kernel-based covariate-adaptive allocation.
 
-### rMAP-KBCD (Schmidli et al., 2014)
-Global borrowing benchmark using robust MAP prior with mixture of informative and vague components.
-
 ## Output Files
 
 ### Tables (`results/tables/`)
-- `simulation_summary.csv` - Full results table
-- `simulation_summary.tex` - LaTeX table for manuscript
-- `type_i_error_power.tex` - Type I error and power results
+- `simulation_summary.csv` – Full metric dump
+- `estimation_metrics.csv / .tex` – Publication-ready Bias/RMSE/Coverage/CI-width table
+- `type_i_error_power.tex` – Scenario-level decision summaries
 
 ### Plots (`results/plots/`)
-- `rmse_vs_n.pdf` - RMSE vs. sample size
-- `power_vs_n.pdf` - Power vs. sample size
-- `type_i_error.pdf` - Type I error comparison
-- `coverage.pdf` - Coverage probability
+- `type_power_curves.pdf` – Type I error & power vs. enrolled sample size (two subplots with 95% CIs)
+- `allocation_dynamics.pdf` – Average treatment allocation and `R_n(X)` trajectories under adaptive assignment
+- `calibration_discount.pdf` – Discount calibration (`a(x)`) vs. sample size across scenarios
 
 All plots are publication-ready (PDF, 300 DPI, Times New Roman font).
 

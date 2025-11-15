@@ -71,6 +71,7 @@ cache/
 # Reference PDFs should not be in version control (copyright)
 references/
 papers/
+R Codes/
 *.pdf
 
 # Large data files

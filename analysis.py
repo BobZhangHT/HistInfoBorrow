@@ -46,6 +46,7 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 import seaborn as sns
+from matplotlib.lines import Line2D
 
 # Import project configuration
 try:
@@ -120,10 +121,10 @@ def configure_plot_style():
     # Define colorblind-friendly palette
     # Based on Wong (2011) Nature Methods palette
     colors = {
-        'CAHB_PP': '#E69F00',      # Orange
-        'CAHB': '#56B4E9',          # Sky blue
         'KBCD': '#009E73',          # Bluish green
-        'rMAP_KBCD': '#CC79A7'      # Reddish purple
+        'CAHB': '#56B4E9',          # Sky blue
+        'CAHB_PP_IPD': '#E69F00',   # Orange
+        'CAHB_PP_SLD': '#D55E00',   # Vermilion
     }
     
     return colors
@@ -159,93 +160,62 @@ def get_true_delta(tau_0: float) -> float:
 # Results Processing
 # =============================================================================
 
-def process_results(results_list: list) -> pd.DataFrame:
+def process_results(results_list: list) -> dict:
     """
-    Processes raw simulation results into aggregated performance metrics.
-    
-    Takes the list of individual replicate results and computes:
-        - Bias, RMSE, coverage for each scenario × method combination
-        - Type I error rates (when tau_0 = 0)
-        - Power (when tau_0 = 0.4)
-        - Allocation rates
-    
-    Args:
-        results_list: List of dictionaries, one per simulation replicate
-                      Each dict contains: delta_hat, ci_low, ci_high, prob_gt_0, etc.
-    
-    Returns:
-        DataFrame with aggregated metrics indexed by (scenario, method)
-    
-    Notes:
-        - Filters out failed replicates (NaN results)
-        - Computes summary statistics across replicates
-        - Handles missing data gracefully
+    Processes raw simulation results into aggregated performance metrics and
+    supporting data structures required for downstream figures.
     """
-    if not results_list:
-        warnings.warn("No results to process. Returning empty DataFrame.")
-        return pd.DataFrame()
+    outputs = {
+        'summary': pd.DataFrame(),
+        'raw': pd.DataFrame(),
+        'allocation_path': pd.DataFrame(),
+        'calibration': pd.DataFrame(),
+    }
 
-    # Convert list of dicts to DataFrame
+    if not results_list:
+        warnings.warn("No results to process. Returning empty structures.")
+        return outputs
+
     df = pd.DataFrame(results_list)
-    
-    # Remove failed replicates
+    outputs['raw'] = df.copy()
+
     n_total = len(df)
     df = df[df['delta_hat'].notna()]
     n_valid = len(df)
     if n_valid < n_total:
         warnings.warn(f"Removed {n_total - n_valid} failed replicates ({100*(n_total-n_valid)/n_total:.1f}%)")
-    
+
     if df.empty:
         warnings.warn("All replicates failed. Cannot compute metrics.")
-        return pd.DataFrame()
-    
-    # Calculate true treatment effect for each row
+        return outputs
+
     df['true_delta'] = df['tau_0'].apply(get_true_delta)
-    
-    # ==== Performance Metrics ====
-    
-    # Bias: E[delta_hat - delta_true]
     df['error'] = df['delta_hat'] - df['true_delta']
     df['abs_error'] = np.abs(df['error'])
     df['sq_error'] = df['error'] ** 2
-    
-    # Coverage: I(delta_true in CI)
-    df['coverage'] = ((df['true_delta'] >= df['ci_low']) & 
+    df['coverage'] = ((df['true_delta'] >= df['ci_low']) &
                       (df['true_delta'] <= df['ci_high']))
-    
-    # CI Width
     df['ci_width'] = df['ci_high'] - df['ci_low']
-    
-    # Decision: Success if P(delta > 0 | Data) > threshold
     threshold = config.DECISION_THRESHOLD
     df['is_success'] = df['prob_gt_0'] > threshold
-    
-    # Allocation rate to treatment
     df['alloc_rate_treatment'] = df['n_treated'] / df['n_total']
-    
-    # ==== Aggregate by Scenario and Method ====
-    
+
     groupby_cols = ['scenario_name', 'method', 'tau_0', 'n', 'n_h', 'scenario_type']
-    
-    # Remove scenario_type if not present (for backwards compatibility)
     groupby_cols = [col for col in groupby_cols if col in df.columns]
-    
+
     agg_funcs = {
-        'error': 'mean',                           # Bias
-        'abs_error': 'mean',                       # MAE
-        'sq_error': lambda x: np.sqrt(np.mean(x)), # RMSE
-        'coverage': 'mean',                        # Coverage probability
-        'ci_width': 'mean',                        # Average CI width
-        'alloc_rate_treatment': 'mean',            # Average allocation rate
-        'is_success': 'mean',                      # Success rate
-        'n_total': 'mean',                         # Verify sample size
-        'replicate_id': 'count'                    # Number of replicates
+        'error': 'mean',
+        'abs_error': 'mean',
+        'sq_error': lambda x: np.sqrt(np.mean(x)),
+        'coverage': 'mean',
+        'ci_width': 'mean',
+        'alloc_rate_treatment': 'mean',
+        'is_success': 'mean',
+        'n_total': 'mean',
+        'replicate_id': 'count'
     }
-    
-    summary = df.groupby(groupby_cols, as_index=False).agg(agg_funcs)
-    
-    # Rename columns for clarity
-    summary = summary.rename(columns={
+
+    summary = df.groupby(groupby_cols, as_index=False).agg(agg_funcs).rename(columns={
         'error': 'Bias',
         'abs_error': 'MAE',
         'sq_error': 'RMSE',
@@ -255,50 +225,101 @@ def process_results(results_list: list) -> pd.DataFrame:
         'is_success': 'Success_Rate',
         'replicate_id': 'N_Replicates'
     })
-    
-    # ==== Compute Type I Error and Power ====
-    
-    # Type I Error: tau_0 = 0 (null hypothesis true)
-    type_i_df = df[df['tau_0'] == 0.0].groupby(['scenario_name', 'method'], as_index=False)['is_success'].mean()
-    type_i_df = type_i_df.rename(columns={'is_success': 'Type_I_Error'})
-    
-    # Power: tau_0 = 0.4 (alternative hypothesis true)
-    power_df = df[df['tau_0'] == 0.4].groupby(['scenario_name', 'method'], as_index=False)['is_success'].mean()
-    power_df = power_df.rename(columns={'is_success': 'Power'})
-    
-    # Merge Type I Error and Power into summary
+
+    type_i_df = (
+        df[df['tau_0'] == 0.0]
+        .groupby(['scenario_name', 'method'], as_index=False)['is_success']
+        .mean()
+        .rename(columns={'is_success': 'Type_I_Error'})
+    )
+    power_df = (
+        df[df['tau_0'] == 0.4]
+        .groupby(['scenario_name', 'method'], as_index=False)['is_success']
+        .mean()
+        .rename(columns={'is_success': 'Power'})
+    )
     summary = pd.merge(summary, type_i_df, on=['scenario_name', 'method'], how='left')
     summary = pd.merge(summary, power_df, on=['scenario_name', 'method'], how='left')
-    
-    # ==== Final Cleanup ====
-    
-    # Sort by scenario and method
     summary = summary.sort_values(['scenario_name', 'method']).reset_index(drop=True)
-    
-    return summary
+    outputs['summary'] = summary
+
+    # Allocation trajectories -------------------------------------------------
+    allocation_records = []
+    for row in results_list:
+        path = row.get('allocation_path') or []
+        for point in path:
+            sample_size = point.get('sample_size')
+            if sample_size is None:
+                continue
+            allocation_records.append({
+                'scenario_id': row.get('scenario_id'),
+                'scenario_name': row.get('scenario_name'),
+                'scenario_type': row.get('scenario_type', 'Unknown'),
+                'method': row.get('method'),
+                'tau_0': row.get('tau_0'),
+                'n': row.get('n'),
+                'replicate_id': row.get('replicate_id'),
+                'sample_size': sample_size,
+                'prop_treated': point.get('prop_treated'),
+                'R_n': point.get('R_n'),
+                'a_mean': point.get('a_mean'),
+            })
+
+    if allocation_records:
+        outputs['allocation_path'] = pd.DataFrame(allocation_records)
+
+    # Calibration payload -----------------------------------------------------
+    calibration_records = []
+    for row in results_list:
+        calib = row.get('calibration_samples') or []
+        for entry in calib:
+            calibration_records.append({
+                'scenario_id': row.get('scenario_id'),
+                'scenario_name': row.get('scenario_name'),
+                'scenario_type': row.get('scenario_type', 'Unknown'),
+                'method': row.get('method'),
+                'tau_0': row.get('tau_0'),
+                'n': row.get('n'),
+                'replicate_id': row.get('replicate_id'),
+                'sample_size': row.get('n'),
+                'x1': entry.get('x1'),
+                'x2': entry.get('x2'),
+                'a_mean': entry.get('a_mean'),
+                'a_ci_low': entry.get('a_ci_low'),
+                'a_ci_high': entry.get('a_ci_high'),
+                'compatibility': entry.get('compatibility'),
+            })
+
+    if calibration_records:
+        outputs['calibration'] = pd.DataFrame(calibration_records)
+
+    return outputs
 
 
 # =============================================================================
 # Table Generation
 # =============================================================================
 
-def generate_tables(summary_df: pd.DataFrame):
+def generate_tables(results_obj: dict):
     """
     Generates publication-ready tables in CSV and LaTeX formats.
     
     Creates:
         1. simulation_summary.csv: Full results table
-        2. simulation_summary.tex: LaTeX table for manuscript
+        2. estimation_metrics.(csv|tex): Publication-ready estimation summaries
         3. type_i_error_power.tex: Focused table for error/power results
     
     Args:
-        summary_df: Aggregated results DataFrame from process_results()
+        results_obj: Output dictionary returned by process_results()
     
     Output Files:
         - results/tables/simulation_summary.csv
-        - results/tables/simulation_summary.tex
+        - results/tables/estimation_metrics.csv
+        - results/tables/estimation_metrics.tex
         - results/tables/type_i_error_power.tex
     """
+    summary_df = results_obj.get('summary', pd.DataFrame())
+
     if summary_df.empty:
         warnings.warn("Empty summary DataFrame. No tables generated.")
         return
@@ -310,58 +331,41 @@ def generate_tables(summary_df: pd.DataFrame):
     summary_df.to_csv(csv_path, index=False, float_format='%.4f')
     print(f"✓ Full summary table saved: {csv_path}")
     
-    # ==== LaTeX Output (Main Results) ====
-    
-    # Select key columns for main table
-    main_cols = ['scenario_name', 'method', 'tau_0', 'Bias', 'RMSE', 
-                 'Coverage', 'Type_I_Error', 'Power', 'Alloc_Rate_Treatment']
-    
-    # Filter to existing columns
-    main_cols = [col for col in main_cols if col in summary_df.columns]
-    
-    tex_df = summary_df[main_cols].copy()
-    
-    # Create multi-index for better LaTeX formatting
+    estimation_cols = ['scenario_name', 'scenario_type', 'n', 'n_h', 'tau_0', 'method',
+                       'Bias', 'RMSE', 'Coverage', 'CI_Width']
+    estimation_cols = [c for c in estimation_cols if c in summary_df.columns]
+    estimation_df = summary_df[estimation_cols].copy()
+    est_csv = os.path.join(config.TABLES_DIR, 'estimation_metrics.csv')
+    estimation_df.to_csv(est_csv, index=False, float_format='%.4f')
+    print(f"✓ Estimation metrics table saved: {est_csv}")
+
+    # Publication-ready LaTeX table
+    display_df = estimation_df.copy()
+    if hasattr(config, 'METHOD_LABELS'):
+        display_df['method_label'] = display_df['method'].map(config.METHOD_LABELS).fillna(display_df['method'])
+    else:
+        display_df['method_label'] = display_df['method']
+
     try:
-        # Pivot to get methods as columns
-        tex_pivot = tex_df.pivot_table(
+        tex_pivot = display_df.pivot_table(
             index=['scenario_name', 'tau_0'],
-            columns='method',
-            values=['Bias', 'RMSE', 'Coverage', 'Type_I_Error', 'Power']
+            columns='method_label',
+            values=['Bias', 'RMSE', 'Coverage', 'CI_Width']
         )
-        
-        # Reorder method columns according to config
-        if hasattr(config, 'METHODS_TO_RUN'):
-            tex_pivot = tex_pivot.reindex(columns=config.METHODS_TO_RUN, level='method')
-        
-        # Save LaTeX table
-        tex_path = os.path.join(config.TABLES_DIR, 'simulation_summary.tex')
+        tex_path = os.path.join(config.TABLES_DIR, 'estimation_metrics.tex')
         with open(tex_path, 'w') as f:
-            f.write("% LaTeX table for CAHB-PP simulation results\n")
-            f.write("% Generated automatically by analysis.py\n\n")
+            f.write("% Estimation metrics table (Bias/RMSE/Coverage/CI Width)\n")
             tex_pivot.to_latex(
-                f, 
+                f,
                 float_format='%.3f',
                 na_rep='-',
                 bold_rows=True,
                 multicolumn_format='c',
-                escape=False,
-                column_format='ll' + 'r' * (len(tex_pivot.columns))
+                escape=False
             )
-        print(f"✓ LaTeX summary table saved: {tex_path}")
-        
+        print(f"✓ LaTeX estimation table saved: {tex_path}")
     except Exception as e:
-        # Fallback: save flat table if pivot fails
-        warnings.warn(f"Could not create pivot table for LaTeX: {e}. Saving flat table.")
-        tex_path = os.path.join(config.TABLES_DIR, 'simulation_summary.tex')
-        tex_df.to_latex(
-            tex_path, 
-            index=False, 
-            float_format='%.3f',
-            na_rep='-',
-            escape=False
-        )
-        print(f"✓ LaTeX summary table (flat) saved: {tex_path}")
+        warnings.warn(f"Failed to build LaTeX estimation table: {e}")
     
     # ==== Type I Error and Power Table (Focused) ====
     
@@ -408,244 +412,206 @@ def generate_tables(summary_df: pd.DataFrame):
 # Plot Generation
 # =============================================================================
 
-def generate_plots(summary_df: pd.DataFrame):
-    """
-    Generates publication-quality PDF plots for manuscript.
-    
-    Creates the following plots:
-        1. RMSE vs sample size (by scenario)
-        2. Power vs sample size (by scenario)
-        3. Type I Error comparison (bar plot)
-        4. Coverage probability (by scenario)
-        5. Allocation rate to treatment (by method)
-    
-    All plots use:
-        - Colorblind-friendly palettes
-        - 300 DPI resolution
-        - PDF vector format
-        - Times New Roman font
-    
-    Args:
-        summary_df: Aggregated results DataFrame
-    
-    Output Files:
-        - results/plots/rmse_vs_n.pdf
-        - results/plots/power_vs_n.pdf
-        - results/plots/type_i_error.pdf
-        - results/plots/coverage.pdf
-        - results/plots/allocation_rate.pdf
-    """
+def generate_plots(results_obj: dict):
+    """Generate required publication-quality figures."""
+    summary_df = results_obj.get('summary', pd.DataFrame())
     if summary_df.empty:
         warnings.warn("Empty summary DataFrame. No plots generated.")
         return
-        
+
     os.makedirs(config.PLOTS_DIR, exist_ok=True)
-    
-    # Configure plot style
     colors = configure_plot_style()
-    
-    # Extract scenario type if available
-    if 'scenario_type' in summary_df.columns:
-        summary_df['scenario_base'] = summary_df['scenario_type']
+
+    available_methods = summary_df['method'].unique().tolist()
+    if hasattr(config, 'METHODS_TO_RUN'):
+        methods = [m for m in config.METHODS_TO_RUN if m in available_methods]
     else:
-        summary_df['scenario_base'] = summary_df['scenario_name'].str.extract(r'(S\d+)$')[0]
-    
-    scenarios = sorted(summary_df['scenario_base'].dropna().unique())
-    methods = config.METHODS_TO_RUN if hasattr(config, 'METHODS_TO_RUN') else summary_df['method'].unique()
-    
-    # ==== Plot 1: RMSE vs Sample Size ====
-    
-    fig, axes = plt.subplots(1, len(scenarios), figsize=(4*len(scenarios), 4), sharey=True)
-    if len(scenarios) == 1:
-        axes = [axes]
-    
-    for ax, scenario in zip(axes, scenarios):
-        df_s = summary_df[summary_df['scenario_base'] == scenario]
-        
-        for method in methods:
-            df_m = df_s[df_s['method'] == method].sort_values('n')
-            
-            if df_m.empty:
-                continue
-            
-            for n_h in sorted(df_m['n_h'].unique()):
-                df_nh = df_m[df_m['n_h'] == n_h]
-                
-                label = f"{method} (n_h={n_h})"
-                marker = 'o' if n_h == min(df_m['n_h'].unique()) else 's'
-                
-                ax.plot(
-                    df_nh['n'], df_nh['RMSE'],
-                    label=label,
-                    color=colors.get(method, 'gray'),
-                    marker=marker,
-                    linestyle='-',
-                    linewidth=1.5
-                )
-        
-        ax.set_title(f"Scenario {scenario}", fontweight='bold')
-        ax.set_xlabel("Current Sample Size (n)")
-        if ax == axes[0]:
-            ax.set_ylabel("RMSE")
-        ax.grid(True, linestyle=':', alpha=0.6)
-    
-    # Add legend outside plot area
-    handles, labels = axes[-1].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='center right', bbox_to_anchor=(1.15, 0.5), 
-               frameon=True, edgecolor='gray')
-    fig.suptitle("Root Mean Squared Error vs. Sample Size", fontsize=14, fontweight='bold', y=1.02)
-    fig.tight_layout(rect=[0, 0, 0.85, 1])
-    
-    rmse_path = os.path.join(config.PLOTS_DIR, 'rmse_vs_n.pdf')
-    fig.savefig(rmse_path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
-    print(f"✓ RMSE plot saved: {rmse_path}")
-    
-    # ==== Plot 2: Power vs Sample Size ====
-    
-    power_df = summary_df[summary_df['tau_0'] == 0.4].copy()
-    
-    if not power_df.empty and 'Power' in power_df.columns:
-        fig, axes = plt.subplots(1, len(scenarios), figsize=(4*len(scenarios), 4), sharey=True)
-        if len(scenarios) == 1:
-            axes = [axes]
-        
-        for ax, scenario in zip(axes, scenarios):
-            df_s = power_df[power_df['scenario_base'] == scenario]
-            
-            for method in methods:
-                df_m = df_s[df_s['method'] == method].sort_values('n')
-                
-                if df_m.empty:
-                    continue
-                
-                for n_h in sorted(df_m['n_h'].unique()):
-                    df_nh = df_m[df_m['n_h'] == n_h]
-                    
-                    label = f"{method} (n_h={n_h})"
-                    marker = 'o' if n_h == min(df_m['n_h'].unique()) else 's'
-                    
-                    ax.plot(
-                        df_nh['n'], df_nh['Power'],
-                        label=label,
-                        color=colors.get(method, 'gray'),
-                        marker=marker,
-                        linestyle='-',
-                        linewidth=1.5
-                    )
-            
-            ax.set_title(f"Scenario {scenario}", fontweight='bold')
-            ax.set_xlabel("Current Sample Size (n)")
-            if ax == axes[0]:
-                ax.set_ylabel("Power")
-            ax.set_ylim([0, 1.05])
-            ax.axhline(y=0.8, color='red', linestyle='--', linewidth=1, alpha=0.5, label='Target (0.8)')
-            ax.grid(True, linestyle=':', alpha=0.6)
-        
-        handles, labels = axes[-1].get_legend_handles_labels()
-        fig.legend(handles, labels, loc='center right', bbox_to_anchor=(1.15, 0.5),
-                   frameon=True, edgecolor='gray')
-        fig.suptitle("Statistical Power vs. Sample Size (tau_0 = 0.4)", fontsize=14, fontweight='bold', y=1.02)
-        fig.tight_layout(rect=[0, 0, 0.85, 1])
-        
-        power_path = os.path.join(config.PLOTS_DIR, 'power_vs_n.pdf')
-        fig.savefig(power_path, dpi=300, bbox_inches='tight')
-        plt.close(fig)
-        print(f"✓ Power plot saved: {power_path}")
-    
-    # ==== Plot 3: Type I Error ====
-    
-    type_i_df = summary_df[summary_df['tau_0'] == 0.0].copy()
-    
-    if not type_i_df.empty and 'Type_I_Error' in type_i_df.columns:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        
-        # Prepare data for grouped bar plot
-        plot_df = type_i_df.groupby(['scenario_base', 'method'])['Type_I_Error'].mean().reset_index()
-        
-        # Pivot for easier plotting
-        plot_pivot = plot_df.pivot(index='scenario_base', columns='method', values='Type_I_Error')
-        
-        # Reorder methods
-        plot_pivot = plot_pivot[methods] if all(m in plot_pivot.columns for m in methods) else plot_pivot
-        
-        # Create grouped bar plot
-        plot_pivot.plot(
-            kind='bar',
-            ax=ax,
-            color=[colors.get(m, 'gray') for m in plot_pivot.columns],
-            edgecolor='black',
-            linewidth=0.5,
-            width=0.8
+        methods = available_methods
+    if not methods:
+        methods = available_methods
+
+    def _label(method: str) -> str:
+        if hasattr(config, 'METHOD_LABELS'):
+            return config.METHOD_LABELS.get(method, method)
+        return method
+
+    def _aggregate_rate(df: pd.DataFrame, rate_col: str) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame()
+        grouped = (
+            df.groupby(['n', 'method'])
+            .apply(lambda g: pd.Series({
+                'value': np.average(g[rate_col], weights=g['N_Replicates']),
+                'N_total': g['N_Replicates'].sum()
+            }))
+            .reset_index()
         )
-        
-        # Add nominal alpha line
-        ax.axhline(y=config.ALPHA, color='red', linestyle='--', linewidth=2, label=f'Nominal α = {config.ALPHA}')
-        
-        ax.set_title("Type I Error Control by Scenario", fontsize=14, fontweight='bold')
-        ax.set_xlabel("Scenario", fontweight='bold')
-        ax.set_ylabel("Type I Error Rate", fontweight='bold')
-        ax.set_ylim([0, max(config.ALPHA * 2, plot_pivot.max().max() * 1.2)])
-        ax.legend(title='Method', frameon=True, edgecolor='gray')
-        ax.grid(axis='y', linestyle=':', alpha=0.6)
-        plt.xticks(rotation=0)
-        
-        fig.tight_layout()
-        
-        type_i_path = os.path.join(config.PLOTS_DIR, 'type_i_error.pdf')
-        fig.savefig(type_i_path, dpi=300, bbox_inches='tight')
-        plt.close(fig)
-        print(f"✓ Type I Error plot saved: {type_i_path}")
-    
-    # ==== Plot 4: Coverage Probability ====
-    
-    if 'Coverage' in summary_df.columns:
-        fig, axes = plt.subplots(1, len(scenarios), figsize=(4*len(scenarios), 4), sharey=True)
-        if len(scenarios) == 1:
-            axes = [axes]
-        
-        for ax, scenario in zip(axes, scenarios):
-            df_s = summary_df[summary_df['scenario_base'] == scenario]
-            
+        grouped['ci'] = 1.96 * np.sqrt(
+            np.clip(grouped['value'] * (1 - grouped['value']) / np.maximum(grouped['N_total'], 1), 0, 1)
+        )
+        grouped['lower'] = np.clip(grouped['value'] - grouped['ci'], 0.0, 1.0)
+        grouped['upper'] = np.clip(grouped['value'] + grouped['ci'], 0.0, 1.0)
+        return grouped
+
+    type_df = _aggregate_rate(summary_df[summary_df['tau_0'] == 0.0], 'Type_I_Error')
+    power_df = _aggregate_rate(summary_df[summary_df['tau_0'] == 0.4], 'Power')
+
+    if not type_df.empty or not power_df.empty:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+        panels = [
+            (type_df, "Type I Error vs Sample Size", "Type I Error", 0.05),
+            (power_df, "Power vs Sample Size", "Power", 0.8),
+        ]
+        for ax, (df_rate, title, ylabel, ref_line) in zip(axes, panels):
+            if df_rate.empty:
+                ax.set_visible(False)
+                continue
             for method in methods:
-                df_m = df_s[df_s['method'] == method].sort_values('n')
-                
-                if df_m.empty:
+                data = df_rate[df_rate['method'] == method].sort_values('n')
+                if data.empty:
                     continue
-                
-                # Average over n_h for clarity
-                df_avg = df_m.groupby('n')['Coverage'].mean().reset_index()
-                
                 ax.plot(
-                    df_avg['n'], df_avg['Coverage'],
-                    label=method,
+                    data['n'], data['value'],
                     color=colors.get(method, 'gray'),
                     marker='o',
-                    linestyle='-',
-                    linewidth=1.5
+                    label=_label(method)
                 )
-            
-            ax.axhline(y=0.95, color='red', linestyle='--', linewidth=1, alpha=0.5)
-            ax.set_title(f"Scenario {scenario}", fontweight='bold')
-            ax.set_xlabel("Current Sample Size (n)")
-            if ax == axes[0]:
-                ax.set_ylabel("Coverage Probability")
-            ax.set_ylim([0.85, 1.0])
-            ax.grid(True, linestyle=':', alpha=0.6)
-        
-        handles, labels = axes[-1].get_legend_handles_labels()
-        fig.legend(handles, labels, loc='center right', bbox_to_anchor=(1.12, 0.5),
-                   frameon=True, edgecolor='gray')
-        fig.suptitle("95% Confidence Interval Coverage", fontsize=14, fontweight='bold', y=1.02)
-        fig.tight_layout(rect=[0, 0, 0.88, 1])
-        
-        coverage_path = os.path.join(config.PLOTS_DIR, 'coverage.pdf')
-        fig.savefig(coverage_path, dpi=300, bbox_inches='tight')
+                ax.fill_between(
+                    data['n'], data['lower'], data['upper'],
+                    color=colors.get(method, 'gray'), alpha=0.2
+                )
+            ax.set_xlabel('Enrolled Sample Size (n)')
+            ax.set_ylabel(ylabel)
+            ax.set_ylim(0, 1)
+            ax.set_title(title)
+            ax.axhline(ref_line, color='gray', linestyle='--', linewidth=1)
+        handles, labels = [], []
+        for axis in axes:
+            h, l = axis.get_legend_handles_labels()
+            handles.extend(h)
+            labels.extend(l)
+        if handles:
+            fig.legend(handles, labels, loc='lower center', ncol=min(len(handles), 4), frameon=False)
+        fig.tight_layout(rect=(0, 0.08, 1, 1))
+        path_type = os.path.join(config.PLOTS_DIR, 'type_power_curves.pdf')
+        fig.savefig(path_type)
         plt.close(fig)
-        print(f"✓ Coverage plot saved: {coverage_path}")
-    
-    print(f"✓ All plots saved to: {config.PLOTS_DIR}")
+        print(f"? Type I/Power curves saved: {path_type}")
 
+    alloc_df = results_obj.get('allocation_path', pd.DataFrame())
+    if not alloc_df.empty:
+        alloc_group = (
+            alloc_df.groupby(['method', 'sample_size'])
+            .agg(
+                prop_mean=('prop_treated', 'mean'),
+                prop_sd=('prop_treated', 'std'),
+                rn_mean=('R_n', 'mean'),
+                rn_sd=('R_n', 'std'),
+                count=('replicate_id', 'nunique')
+            )
+            .reset_index()
+        )
+        alloc_group['prop_sd'] = alloc_group['prop_sd'].fillna(0.0)
+        alloc_group['rn_sd'] = alloc_group['rn_sd'].fillna(0.0)
+        alloc_group['prop_ci'] = 1.96 * alloc_group['prop_sd'] / np.sqrt(np.maximum(alloc_group['count'], 1))
+        alloc_group['rn_ci'] = 1.96 * alloc_group['rn_sd'] / np.sqrt(np.maximum(alloc_group['count'], 1))
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharex=True)
+        for method in methods:
+            data = alloc_group[alloc_group['method'] == method].sort_values('sample_size')
+            if data.empty:
+                continue
+            label = _label(method)
+            color = colors.get(method, 'gray')
+            axes[0].plot(data['sample_size'], data['prop_mean'], color=color, label=label)
+            axes[0].fill_between(
+                data['sample_size'],
+                np.clip(data['prop_mean'] - data['prop_ci'], 0.0, 1.0),
+                np.clip(data['prop_mean'] + data['prop_ci'], 0.0, 1.0),
+                color=color, alpha=0.2
+            )
+            axes[1].plot(data['sample_size'], data['rn_mean'], color=color, label=label)
+            axes[1].fill_between(
+                data['sample_size'],
+                np.maximum(data['rn_mean'] - data['rn_ci'], 0.0),
+                data['rn_mean'] + data['rn_ci'],
+                color=color, alpha=0.2
+            )
+        axes[0].set_xlabel('Enrolled Sample Size (n)')
+        axes[0].set_ylabel('Avg. treatment proportion')
+        axes[0].set_ylim(0, 1)
+        axes[0].set_title('(a) Allocation proportion')
+        axes[1].set_xlabel('Enrolled Sample Size (n)')
+        axes[1].set_ylabel('Avg. R_n(X)')
+        axes[1].set_title('(b) Effective sample size multiplier')
+        handles, labels = axes[0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc='lower center', ncol=min(len(handles), 4), frameon=False)
+        fig.tight_layout(rect=(0, 0.08, 1, 1))
+        alloc_path = os.path.join(config.PLOTS_DIR, 'allocation_dynamics.pdf')
+        fig.savefig(alloc_path)
+        plt.close(fig)
+        print(f"? Allocation dynamics plot saved: {alloc_path}")
+
+    calib_df = results_obj.get('calibration', pd.DataFrame())
+    if not calib_df.empty:
+        scenario_types = sorted(calib_df['scenario_type'].dropna().unique())
+        if not scenario_types:
+            scenario_types = ['All']
+            calib_df['scenario_type'] = 'All'
+        n_types = len(scenario_types)
+        ncols = 2
+        nrows = int(np.ceil(n_types / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.8 * nrows), sharex=True, sharey=True)
+        axes = np.array(axes).reshape(nrows, ncols)
+
+        for idx, scenario in enumerate(scenario_types):
+            ax = axes.flat[idx]
+            subset = calib_df[calib_df['scenario_type'] == scenario]
+            if subset.empty:
+                ax.set_visible(False)
+                continue
+            agg = subset.groupby(['method', 'sample_size'], as_index=False).agg({
+                'a_mean': 'mean',
+                'a_ci_low': 'mean',
+                'a_ci_high': 'mean'
+            })
+            for method in methods:
+                data = agg[agg['method'] == method].sort_values('sample_size')
+                if data.empty:
+                    continue
+                label = _label(method)
+                color = colors.get(method, 'gray')
+                yerr = np.vstack([
+                    np.clip(data['a_mean'] - data['a_ci_low'], 0.0, 1.0),
+                    np.clip(data['a_ci_high'] - data['a_mean'], 0.0, 1.0)
+                ])
+                ax.errorbar(
+                    data['sample_size'], data['a_mean'],
+                    yerr=yerr,
+                    fmt='o-', color=color, label=label
+                )
+            ax.set_title(scenario)
+            ax.set_xlabel('Enrolled Sample Size (n)')
+            ax.set_ylabel('Average a(x)')
+            ax.set_ylim(0, 1)
+        total_axes = nrows * ncols
+        for idx in range(len(scenario_types), total_axes):
+            axes.flat[idx].set_visible(False)
+        handles = []
+        labels = []
+        for method in methods:
+            handles.append(Line2D([0], [0], color=colors.get(method, 'gray'), marker='o', label=_label(method)))
+            labels.append(_label(method))
+        if handles:
+            fig.legend(handles, labels, loc='lower center', ncol=min(len(handles), 4), frameon=False)
+        fig.tight_layout(rect=(0, 0.08, 1, 1))
+        calib_path = os.path.join(config.PLOTS_DIR, 'calibration_discount.pdf')
+        fig.savefig(calib_path)
+        plt.close(fig)
+        print(f"? Calibration plot saved: {calib_path}")
+
+    print(f"? All plots saved to: {config.PLOTS_DIR}")
 
 # =============================================================================
 # Main Entry Point (for testing)
