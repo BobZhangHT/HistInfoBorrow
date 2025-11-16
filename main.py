@@ -1,3 +1,4 @@
+import argparse
 """
 main.py
 
@@ -51,14 +52,17 @@ References:
     CAHB-PP manuscript Section 3 (Simulation Study Design)
 """
 
+import argparse
 import os
 import sys
 import gc
 import warnings
+from contextlib import contextmanager
 from typing import Dict, List, Optional
 
 import numpy as np
 import joblib
+from joblib import parallel
 from tqdm import tqdm
 
 # =============================================================================
@@ -79,6 +83,29 @@ except ImportError as e:
     sys.exit(1)
 
 AllocationResult = getattr(methods, "AllocationResult", None)
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+@contextmanager
+def tqdm_joblib(tqdm_object: tqdm):
+    """
+    Context manager to patch joblib to report into a tqdm progress bar.
+    """
+    class TqdmBatchCompletionCallback(parallel.BatchCompletionCallBack):
+        def __call__(self, *args, **kwargs):
+            tqdm_object.update(n=self.batch_size)
+            return super().__call__(*args, **kwargs)
+
+    old_callback = parallel.BatchCompletionCallBack
+    parallel.BatchCompletionCallBack = TqdmBatchCompletionCallback
+    try:
+        yield tqdm_object
+    finally:
+        parallel.BatchCompletionCallBack = old_callback
+        tqdm_object.close()
 
 
 # =============================================================================
@@ -336,7 +363,7 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
 # Main Orchestration Function
 # =============================================================================
 
-def main():
+def main(demo_override: Optional[bool] = None, clear_cache: bool = False):
     """
     Main entry point for the simulation study.
     
@@ -365,9 +392,19 @@ def main():
         - Continue with valid results even if some tasks fail
     """
     
+    # Determine run mode (full vs fast demo)
+    demo_mode = config.FAST_DEMO if demo_override is None else bool(demo_override)
+    config.FAST_DEMO = demo_mode
+    config.N_REPLICATES = config.FAST_DEMO_REPLICATES if demo_mode else config.FULL_RUN_REPLICATES
+
+    if clear_cache and os.path.isdir(config.CACHE_DIR):
+        print(f"Clearing cache directory for fresh run: {config.CACHE_DIR}")
+        shutil.rmtree(config.CACHE_DIR, ignore_errors=True)
+
     print("=" * 80)
     print("CAHB-PP SIMULATION STUDY".center(80))
     print("=" * 80)
+    print(f"Mode: {'FAST-DEMO' if demo_mode else 'FULL'} (N_REPLICATES={config.N_REPLICATES})")
     print()
     
     # ==== 1. Validate Configuration ====
@@ -396,7 +433,7 @@ def main():
     
     for directory in directories:
         os.makedirs(directory, exist_ok=True)
-        print(f"  ✓ {directory}")
+        print(f"  √ {directory}")
     
     print()
     
@@ -414,12 +451,12 @@ def main():
     # Wrap simulation function with caching if enabled
     if config.USE_CACHE:
         cached_run_single = memory.cache(run_single_simulation)
-        print(f"  ✓ Checkpointing enabled (cache: {config.CACHE_DIR})")
-        print("    → Completed replicates will be cached")
-        print("    → Interrupted runs can resume from checkpoint")
+        print(f"  √ Checkpointing enabled (cache: {config.CACHE_DIR})")
+        print("    √ Completed replicates will be cached")
+        print("    √ Interrupted runs can resume from checkpoint")
     else:
         cached_run_single = run_single_simulation
-        print("  ⚠ Checkpointing DISABLED (set USE_CACHE=True to enable)")
+        print("  √ Checkpointing DISABLED (set USE_CACHE=True to enable)")
     
     print()
     
@@ -428,13 +465,13 @@ def main():
     print("Step 4: Loading simulation scenarios...")
     scenarios = config.get_scenario_definitions()
     
-    print(f"  ✓ Loaded {len(scenarios)} scenarios")
-    print(f"  ✓ Comparing {len(config.METHODS_TO_RUN)} methods:")
+    print(f"  √ Loaded {len(scenarios)} scenarios")
+    print(f"  √ Comparing {len(config.METHODS_TO_RUN)} methods:")
     for method in config.METHODS_TO_RUN:
         print(f"      - {method}")
-    print(f"  ✓ Running {config.N_REPLICATES} replicates per (scenario × method)")
+    print(f"  √ Running {config.N_REPLICATES} replicates per (scenario ?? method)")
     if getattr(config, "FAST_DEMO", False):
-        print(f"    → FAST_DEMO active (set CAHB_FAST_DEMO=0 for full {config.FULL_RUN_REPLICATES} replicates)")
+        print(f"    √ FAST_DEMO active (use '--full' or unset flag for {config.FULL_RUN_REPLICATES} replicates)")
     
     # Create task list: all (scenario, method, replicate) combinations
     print("\nStep 5: Creating task queue...")
@@ -448,10 +485,10 @@ def main():
                 tasks.append(task)
     
     n_tasks = len(tasks)
-    print(f"  ✓ Created {n_tasks:,} tasks")
-    print(f"  ✓ Using {config.N_JOBS} parallel workers")
+    print(f"  √ Created {n_tasks:,} tasks")
+    print(f"  √ Using {config.N_JOBS} parallel workers")
     if hasattr(config, 'MAX_MEMORY_PER_JOB') and config.MAX_MEMORY_PER_JOB:
-        print(f"  ✓ Memory limit: {config.MAX_MEMORY_PER_JOB} MB per worker")
+        print(f"  √ Memory limit: {config.MAX_MEMORY_PER_JOB} MB per worker")
     
     print()
     
@@ -477,15 +514,17 @@ def main():
         # Note: joblib's max_nbytes applies per worker
         parallel_kwargs['max_nbytes'] = max_memory_bytes
     
+    progress_bar = tqdm(
+        total=n_tasks,
+        desc="Simulating",
+        unit="task",
+        ncols=100,
+        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+    )
+
     try:
-        # Run tasks with progress bar
-        results = joblib.Parallel(**parallel_kwargs)(
-            tqdm(tasks, 
-                 desc="Simulating",
-                 unit="task",
-                 ncols=100,
-                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
-        )
+        with tqdm_joblib(progress_bar):
+            results = joblib.Parallel(**parallel_kwargs)(tasks)
     except KeyboardInterrupt:
         print("\n\nSimulation interrupted by user (Ctrl+C).")
         print("Partial results may be cached. Rerun to resume from checkpoint.")
@@ -508,11 +547,11 @@ def main():
     n_valid = len(results)
     n_failed = n_total - n_valid
     
-    print(f"  ✓ Total tasks: {n_total:,}")
-    print(f"  ✓ Successful: {n_valid:,} ({100*n_valid/n_total:.1f}%)")
+    print(f"  √ Total tasks: {n_total:,}")
+    print(f"  √ Successful: {n_valid:,} ({100*n_valid/n_total:.1f}%)")
     
     if n_failed > 0:
-        print(f"  ⚠ Failed: {n_failed:,} ({100*n_failed/n_total:.1f}%)")
+        print(f"  √ Failed: {n_failed:,} ({100*n_failed/n_total:.1f}%)")
         
         # Warn if failure rate is high
         if n_failed / n_total > 0.1:
@@ -523,7 +562,7 @@ def main():
             )
     
     if n_valid == 0:
-        print("\n❌ ERROR: All simulations failed. Cannot generate results.")
+        print("\n ERROR: All simulations failed. Cannot generate results.")
         print("Check configuration and error messages.")
         sys.exit(1)
     
@@ -537,10 +576,10 @@ def main():
         analysis_outputs = analysis.process_results(results)
         summary_df = analysis_outputs.get('summary')
         n_summary = len(summary_df) if summary_df is not None else 0
-        print(f"  ✓ Aggregated {n_summary} (scenario × method) combinations")
-        print(f"  ✓ Metrics computed: Bias, RMSE, Coverage, Type I Error, Power")
+        print(f"  √ Aggregated {n_summary} (scenario ?? method) combinations")
+        print(f"  √ Metrics computed: Bias, RMSE, Coverage, Type I Error, Power")
     except Exception as e:
-        print(f"\n❌ ERROR during results processing: {e}")
+        print(f"\n ERROR during results processing: {e}")
         sys.exit(1)
     
     print()
@@ -552,7 +591,7 @@ def main():
     try:
         analysis.generate_tables(analysis_outputs)
     except Exception as e:
-        print(f"⚠ Warning: Table generation failed: {e}")
+        print(f" Warning: Table generation failed: {e}")
     
     print()
     
@@ -563,7 +602,7 @@ def main():
     try:
         analysis.generate_plots(analysis_outputs)
     except Exception as e:
-        print(f"⚠ Warning: Plot generation failed: {e}")
+        print(f" Warning: Plot generation failed: {e}")
     
     print()
     
@@ -574,9 +613,9 @@ def main():
     print("=" * 80)
     print()
     print("Results saved to:")
-    print(f"  📊 Tables: {config.TABLES_DIR}")
-    print(f"  📈 Plots:  {config.PLOTS_DIR}")
-    print(f"  💾 Cache:  {config.CACHE_DIR} (for resumability)")
+    print(f"  √ Tables: {config.TABLES_DIR}")
+    print(f"  √ Plots:  {config.PLOTS_DIR}")
+    print(f"  √ Cache:  {config.CACHE_DIR} (for resumability)")
     print()
     print("Next steps:")
     print("  1. Review tables in results/tables/")
@@ -587,7 +626,7 @@ def main():
     print(f"  rm -rf {config.CACHE_DIR}")
     print(f"  python main.py")
     print()
-    print("✓ Done!")
+    print(" Done!")
     print("=" * 80)
 
 
@@ -596,5 +635,29 @@ def main():
 # =============================================================================
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run the CAHB-PP simulation study")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run in fast demonstration mode (small number of replicates)",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Delete the cache directory before running (applies to demo and full modes)",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Force full run even if FAST_DEMO env/config is enabled",
+    )
+    args = parser.parse_args()
+    if args.demo and args.full:
+        parser.error("Cannot specify both --demo and --full")
+    override = True if args.demo else False if args.full else None
+    main(demo_override=override, clear_cache=args.reset)
+
+
+
+
 

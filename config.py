@@ -36,8 +36,8 @@ def _env_flag(var_name: str, default: str = "0") -> bool:
 FULL_RUN_REPLICATES = 1000
 
 # Fast demonstration mode (smaller replication count, identical settings otherwise)
-FAST_DEMO = _env_flag("CAHB_FAST_DEMO", "0")
-FAST_DEMO_REPLICATES = int(os.environ.get("CAHB_FAST_DEMO_REPS", "50"))
+FAST_DEMO = 1#_env_flag("CAHB_FAST_DEMO", "0")
+FAST_DEMO_REPLICATES = 10#int(os.environ.get("CAHB_FAST_DEMO_REPS", "50"))
 FAST_DEMO_REPLICATES = max(5, FAST_DEMO_REPLICATES)
 
 if FAST_DEMO:
@@ -108,7 +108,7 @@ METHOD_LABELS = {
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Cache directory for checkpointing simulation replicates
-CACHE_DIR = os.path.join(BASE_DIR, '.simulation_cache')
+CACHE_DIR = os.path.join(BASE_DIR, 'simulation_cache')
 
 # Results directory structure
 RESULTS_DIR = os.path.join(BASE_DIR, 'results')
@@ -162,6 +162,24 @@ MAX_ESS = 1e6       # Maximum effective sample size (clip to prevent overflow)
 # =============================================================================
 # Simulation Scenario Definitions (Sections 3.1-3.2)
 # =============================================================================
+
+def delta0_no_bias(_: np.ndarray) -> float:
+    """Scenario bias function: perfectly compatible historical data."""
+    return 0.0
+
+
+def delta0_constant_bias(_: np.ndarray) -> float:
+    """Scenario bias function: fixed 0.4 mean shift across all covariates."""
+    return 0.4
+
+
+def delta0_subgroup_bias(x: np.ndarray) -> float:
+    """Scenario bias function: 0.6 mean shift when the 4th covariate equals 2."""
+    x_arr = np.asarray(x).ravel()
+    if x_arr.size <= 3:
+        return 0.0
+    return 0.6 if x_arr[3] == 2 else 0.0
+
 
 def get_scenario_definitions():
     """
@@ -221,22 +239,22 @@ def get_scenario_definitions():
     # Data-generating mechanism specifications (Section 3.2)
     scenario_params = {
         'S1': {
-            'Delta_0_func': lambda x: 0.0,           # No historical bias
+            'Delta_0_func': delta0_no_bias,           # No historical bias
             'kappa': 1.0,                             # Homoscedastic variance
             'description': 'Ideal: no bias, homoscedastic'
         },
         'S2': {
-            'Delta_0_func': lambda x: 0.0,           # No historical bias
+            'Delta_0_func': delta0_no_bias,           # No historical bias
             'kappa': 1.3,                             # Variance heterogeneity
             'description': 'Variance mismatch only'
         },
         'S3': {
-            'Delta_0_func': lambda x: 0.4,           # Constant mean shift
+            'Delta_0_func': delta0_constant_bias,     # Constant mean shift
             'kappa': 1.3,                             # Variance heterogeneity
             'description': 'Constant bias + variance mismatch'
         },
         'S4': {
-            'Delta_0_func': lambda x: 0.6 * (x[3] == 2),  # Subgroup-specific bias
+            'Delta_0_func': delta0_subgroup_bias,     # Subgroup-specific bias
             'kappa': 1.3,                                   # Variance heterogeneity
             'description': 'Local bias (X4=2 subgroup)'
         }

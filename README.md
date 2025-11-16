@@ -59,17 +59,30 @@ esults/
 
 Enable a lightweight run (default 50 replicates) without editing the code:
 
-`ash
+```bash
+python main.py --demo
+```
+
+Add `--reset` to delete `.simulation_cache/` before running (works for both demo and full modes):
+
+```bash
+python main.py --demo --reset   # fast mode, starting fresh
+python main.py --reset          # full run from scratch
+```
+
+Alternatively, set an environment variable before running:
+
+```bash
 # Linux/macOS
 export CAHB_FAST_DEMO=1
 python main.py
 
 # Windows PowerShell
- = 1
+$env:CAHB_FAST_DEMO = 1
 python main.py
-`
+```
 
-Override the replicate count via CAHB_FAST_DEMO_REPS (e.g., set to 10 for smoke tests).
+Override the replicate count via `CAHB_FAST_DEMO_REPS` (e.g., set to 10 for smoke tests). Use `python main.py --full` to force the publication-size run even if a demo flag/environment variable is set.
 
 ### Resume Interrupted Run
 

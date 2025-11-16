@@ -9,6 +9,7 @@ implementation (`utils.R`).
 
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence, Tuple
+import warnings
 
 import numpy as np
 from scipy.stats import norm
@@ -727,6 +728,15 @@ class CAHB(BorrowingMethod):
 
     # Kernel helpers ------------------------------------------------------
     @staticmethod
+    def _kernel_bandwidth(X: np.ndarray) -> np.ndarray:
+        return _silverman_bandwidth(_as_2d(X))
+
+    @staticmethod
+    def _gaussian_kernel(x_eval: np.ndarray, X_ref: np.ndarray, h: np.ndarray) -> np.ndarray:
+        return _gaussian_kernel_weights(x_eval, X_ref, h)
+
+    # Kernel helpers ------------------------------------------------------
+    @staticmethod
     def _kernel_covariance(X: np.ndarray) -> np.ndarray:
         bandwidth = _silverman_bandwidth(X)
         variances = np.maximum(bandwidth, 1e-3) ** 2
@@ -1073,6 +1083,13 @@ class CAHB(BorrowingMethod):
             variances[idx] = max(local_var / max(w_sum, 1e-8), 1e-8)
         return means, variances
 
+    @staticmethod
+    def _kernel_bandwidth(X: np.ndarray) -> np.ndarray:
+        """Helper for local kernel regressions (shared with CAHB-PP variants)."""
+        if X.size == 0:
+            return np.ones(X.shape[1] if X.ndim > 1 else 1)
+        return _silverman_bandwidth(_as_2d(X))
+
     # Public interface ----------------------------------------------------
     def get_allocation_prob(self, X_curr, Y_curr, Z_curr, X_new) -> AllocationResult:
         if len(X_curr) < 2:
@@ -1291,7 +1308,8 @@ class CAHBPowerPrior(BaseMethod):
         
         # Historical sufficient statistics
         hist_weights = self._gaussian_kernel(x_eval, self.X_h, self.h_hist)
-        Wh = hist_weights.sum()
+        hist_weights = np.asarray(hist_weights, dtype=float)
+        Wh = float(hist_weights.sum())
         Yh_bar = np.dot(hist_weights, self.Y_h) / Wh if Wh > 1e-8 else 0.0
         
         # Treatment sufficient statistics (if available)
@@ -1518,22 +1536,20 @@ class CAHBPowerPrior(BaseMethod):
         # θ = [μ, log(σ²)] for unconstrained optimization
         def f_value(theta_vec: np.ndarray) -> float:
             """Compute f(θ; a) = a·log L_h(θ) + log π₀(θ)."""
+            theta_vec = np.asarray(theta_vec, dtype=float)
             mu = theta_vec[0]
             log_sigma2 = theta_vec[1]
-            sigma2 = np.exp(log_sigma2)
-            
-            if sigma2 <= 0 or not np.isfinite(sigma2):
+            sigma2 = float(np.exp(log_sigma2))
+            if not np.isfinite(sigma2):
                 return 1e10
-            
-            # Powered log-likelihood: a · log L_h(μ, σ²)
+            sigma2 = float(np.clip(sigma2, 1e-6, 1e8))
+
             SS = np.dot(hist_weights, (Y_h - mu) ** 2)
             log_lik = -0.5 * Wh * np.log(2.0 * np.pi * sigma2) - 0.5 * SS / sigma2
-            
-            # Log prior: π(μ, σ²) = π(μ) × π(σ²)
-            # π(μ) ∝ 1 (flat), π(σ²) = IG(α₀, β₀)
             log_prior = -(alpha0 + 1.0) * log_sigma2 - beta0 / sigma2
-            
+
             return float(a * log_lik + log_prior)
+
         
         def neg_log_integrand(theta_vec: np.ndarray) -> float:
             """Negative of f(θ; a) for minimization (L-BFGS-B)."""
@@ -1543,6 +1559,8 @@ class CAHBPowerPrior(BaseMethod):
         theta_init = np.array([mu0_init, np.log(max(sigma2_init, 1e-4))])
         
         # Optimize to find mode using L-BFGS-B
+        opt_result = None
+
         try:
             result = minimize(
                 neg_log_integrand,
@@ -1554,6 +1572,7 @@ class CAHBPowerPrior(BaseMethod):
             if result.success or result.fun < 1e8:
                 theta_mode = result.x
                 f_at_mode = -result.fun
+                opt_result = result
             else:
                 # Fallback to initial value
                 theta_mode = theta_init
@@ -1562,8 +1581,8 @@ class CAHBPowerPrior(BaseMethod):
             theta_mode = theta_init
             f_at_mode = -neg_log_integrand(theta_init)
         
-        # Compute Hessian at mode using finite differences
-        log_det_hessian = self._compute_log_det_hessian(theta_mode, f_value)
+        # Compute Hessian at mode using optimizer information (fallback to finite diff)
+        log_det_hessian = self._compute_log_det_hessian(theta_mode, f_value, opt_result=opt_result)
         
         return {
             'theta_mode': theta_mode,
@@ -1575,49 +1594,97 @@ class CAHBPowerPrior(BaseMethod):
         self,
         theta_mode: np.ndarray,
         f_func: Callable[[np.ndarray], float],
-        step_size: float = 1e-4,
+        opt_result: Optional[object] = None,
+        abs_step: float = 1e-4,
+        rel_step: float = 1e-3,
     ) -> float:
         """
-        Compute log determinant of Hessian matrix at mode.
+        Compute log determinant of Hessian matrix at the mode.
         
-        Uses central finite differences to numerically approximate Hessian.
-        
-        Returns:
-            log|H(a)| where H is the Hessian of f(θ; a)
+        Prefer using optimizer-provided curvature (L-BFGS inverse Hessian) and
+        fall back to stabilized finite differences when necessary.
         """
+        # Attempt to use optimizer-provided inverse Hessian
+        if opt_result is not None:
+            hess_inv = getattr(opt_result, "hess_inv", None)
+            if hess_inv is not None:
+                try:
+                    if hasattr(hess_inv, "todense"):
+                        hess_inv_mat = np.asarray(hess_inv.todense(), dtype=float)
+                    else:
+                        hess_inv_mat = np.asarray(hess_inv, dtype=float)
+                    if hess_inv_mat.size > 0:
+                        # Hessian of objective = H_{-f}; convert inverse to Hessian
+                        H_neg = np.linalg.pinv(hess_inv_mat)
+                        H = -0.5 * (H_neg + H_neg.T)
+                        eigvals = np.linalg.eigvalsh(H)
+                        min_eig = float(np.min(eigvals))
+                        if min_eig <= 0:
+                            H += np.eye(H.shape[0]) * (1e-8 - min_eig + 1e-10)
+                        sign, log_det = np.linalg.slogdet(H)
+                        if sign > 0:
+                            return float(log_det)
+                except Exception:
+                    warnings.warn(
+                        "Optimizer Hessian inversion failed; using finite differences.",
+                        RuntimeWarning,
+                    )
+
         theta_mode = np.asarray(theta_mode, dtype=float)
         dim = theta_mode.size
+        if dim == 0:
+            return 0.0
+
+        # Adaptive step per coordinate
+        steps = np.clip(np.abs(theta_mode) * rel_step, abs_step, 1.0)
+        base_val = float(f_func(theta_mode))
+
+        def safe_eval(theta_vec: np.ndarray) -> float:
+            try:
+                val = float(f_func(theta_vec))
+                if not np.isfinite(val):
+                    raise ValueError
+                return val
+            except Exception:
+                return base_val
+
         hessian = np.zeros((dim, dim), dtype=float)
-        base_val = f_func(theta_mode)
-        step = step_size
-        
-        # Precompute directional unit vectors
         eye = np.eye(dim)
-        
+
         for i in range(dim):
+            hi = steps[i]
             e_i = eye[i]
-            f_plus = f_func(theta_mode + step * e_i)
-            f_minus = f_func(theta_mode - step * e_i)
-            hessian[i, i] = (f_plus - 2.0 * base_val + f_minus) / (step ** 2)
-            
+            f_plus = safe_eval(theta_mode + hi * e_i)
+            f_minus = safe_eval(theta_mode - hi * e_i)
+            hessian[i, i] = (f_plus - 2.0 * base_val + f_minus) / (hi ** 2)
+
             for j in range(i + 1, dim):
+                hj = steps[j]
                 e_j = eye[j]
-                f_pp = f_func(theta_mode + step * e_i + step * e_j)
-                f_pm = f_func(theta_mode + step * e_i - step * e_j)
-                f_mp = f_func(theta_mode - step * e_i + step * e_j)
-                f_mm = f_func(theta_mode - step * e_i - step * e_j)
-                mixed = (f_pp - f_pm - f_mp + f_mm) / (4.0 * step ** 2)
+                f_pp = safe_eval(theta_mode + hi * e_i + hj * e_j)
+                f_pm = safe_eval(theta_mode + hi * e_i - hj * e_j)
+                f_mp = safe_eval(theta_mode - hi * e_i + hj * e_j)
+                f_mm = safe_eval(theta_mode - hi * e_i - hj * e_j)
+                mixed = (f_pp - f_pm - f_mp + f_mm) / (4.0 * hi * hj)
                 hessian[i, j] = mixed
                 hessian[j, i] = mixed
-        
-        # Laplace uses H(a) = -∇² f(θ̂; a), which should be positive definite
+
+        # Symmetrize and enforce positive definiteness
+        hessian = 0.5 * (hessian + hessian.T)
         H = -hessian
-        H += np.eye(dim) * 1e-8  # regularization for numerical stability
-        
+        eigvals, eigvecs = np.linalg.eigh(H)
+        min_eig = float(np.min(eigvals))
+        if not np.isfinite(min_eig):
+            raise RuntimeError("Numerical Hessian produced non-finite eigenvalues.")
+        if min_eig < 1e-8:
+            shift = 1e-8 - min_eig + 1e-10
+            H += np.eye(dim) * shift
+
         sign, log_det = np.linalg.slogdet(H)
         if sign <= 0:
-            # Further regularization fallback
-            H += np.eye(dim) * 1e-6
+            # Final safeguard: add jitter proportional to trace
+            jitter = max(np.trace(H), 1.0) * 1e-8
+            H += np.eye(dim) * jitter
             sign, log_det = np.linalg.slogdet(H)
             if sign <= 0:
                 raise RuntimeError("Numerical Hessian not positive definite at mode.")
