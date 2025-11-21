@@ -1,10 +1,10 @@
 """
 data_generation.py
 
-Data Generating Mechanisms (DGMs) for CAHB-PP Simulation Study
+Data Generating Mechanisms (DGMs) for CAHB-UIP Simulation Study
 
 This module implements the covariate and outcome generation processes described
-in Section 3.1 of the CAHB-PP manuscript. It supports both:
+in Section 3.1 of the CAHB-UIP manuscript. It supports both:
     1. Historical data generation (control-only, single-arm trials)
     2. Current trial data generation (adaptive two-arm randomized trials)
 
@@ -22,13 +22,13 @@ Outcome Model:
     where z = 0 (control) or z = 1 (treatment)
 
 Control arm mean (current trial):
-    mu_0(x) = b(x)^T * beta_0 + 0.75 * X1 * X3
+    mu_0(x) = b(x)^T * beta_0
     
-    b(x) = (1, X1, X2, X3, I(X4=1), I(X4=2))^T
-    beta_0 = (0, 0.8, 0.5, -0.5, 0.3, -0.2)^T
+    b(x) = (1, X1, X2, X3, X4)^T
+    beta_0 = (0, 0.8, 0.5, -0.5, 0.3)^T
 
 Treatment effect (heterogeneous):
-    tau(x) = tau_0 + 0.5 * X1 - 0.5 * I(X2=1)
+    tau(x) = tau_0 + 0.5 * X1 - 0.5 * X3
     
     where tau_0 is the base treatment effect (0 or 0.4 in simulations)
 
@@ -36,9 +36,9 @@ Treatment arm mean:
     mu_1(x) = mu_0(x) + tau(x)
 
 Variance functions:
-    sigma^2_0c(x) = exp(0.2 + 0.4*X2 + 0.3*I(X4=2))  # Current control
-    sigma^2_1(x) = exp(0.2 + 0.2*X1)                  # Treatment arm
-    sigma^2_0h(x) = kappa * exp(0.2 + 0.2*X2)        # Historical control
+    sigma^2_0c(x) = 1.0                              # Current control
+    sigma^2_1(x) = 0.65                              # Treatment arm
+    sigma^2_0h(x) = kappa * sigma^2_0c(x)           # Historical control
 
 Historical data model:
     Y_0h | X ~ N(mu_0(X) + Delta_0(X), sigma^2_0h(X))
@@ -46,7 +46,7 @@ Historical data model:
     where Delta_0(X) represents historical bias (scenario-dependent)
 
 References:
-    CAHB-PP manuscript Section 3.1 (references/CAHB_PP(2).pdf)
+    CAHB-UIP manuscript Section 3.1 (references/CAHB_UIP.pdf)
 """
 
 import numpy as np
@@ -60,10 +60,7 @@ def generate_covariates(n: int, p: int = 4) -> np.ndarray:
         X1 ~ Normal(0, 1)           - Continuous, symmetric
         X2 ~ Bernoulli(0.5)         - Binary indicator
         X3 ~ Uniform(-1, 1)         - Continuous, bounded
-        X4 ~ Categorical{0,1,2}     - Multi-level factor
-             P(X4=0) = 0.4
-             P(X4=1) = 0.4
-             P(X4=2) = 0.2
+        X4 ~ Exp(1)                  - Positive continuous covariate
     
     These covariates are used to construct the design vector b(x) and appear in
     both the outcome mean and variance functions.
@@ -87,10 +84,10 @@ def generate_covariates(n: int, p: int = 4) -> np.ndarray:
         (5, 4)
     """
     X = np.zeros((n, p))
-    X[:, 0] = np.random.normal(0, 1, n)                      # X1: Standard normal
-    X[:, 1] = np.random.binomial(1, 0.5, n)                  # X2: Binary
-    X[:, 2] = np.random.uniform(-1, 1, n)                    # X3: Uniform
-    X[:, 3] = np.random.choice([0, 1, 2], n, p=[0.4, 0.4, 0.2])  # X4: Categorical
+    X[:, 0] = np.random.normal(0, 1, n)               # X1: Standard normal
+    X[:, 1] = np.random.binomial(1, 0.5, n)           # X2: Binary
+    X[:, 2] = np.random.uniform(-1, 1, n)             # X3: Uniform
+    X[:, 3] = np.random.exponential(scale=1.0, size=n)  # X4: Exponential(1)
     return X
 
 def _get_b_x(X: np.ndarray) -> np.ndarray:
@@ -116,12 +113,11 @@ def _get_b_x(X: np.ndarray) -> np.ndarray:
         - Used in computing mu_0(x) = b(x)^T * beta_0 + interaction term
     """
     n = X.shape[0]
-    b_x = np.ones((n, 6))
-    b_x[:, 1] = X[:, 0]                         # X1
-    b_x[:, 2] = X[:, 1]                         # X2
-    b_x[:, 3] = X[:, 2]                         # X3
-    b_x[:, 4] = (X[:, 3] == 1).astype(float)    # Indicator: X4=1
-    b_x[:, 5] = (X[:, 3] == 2).astype(float)    # Indicator: X4=2
+    b_x = np.ones((n, 5))
+    b_x[:, 1] = X[:, 0]  # X1
+    b_x[:, 2] = X[:, 1]  # X2
+    b_x[:, 3] = X[:, 2]  # X3
+    b_x[:, 4] = X[:, 3]  # X4 (Exponential)
     return b_x
 
 def get_true_means(X: np.ndarray, tau_0: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -164,15 +160,14 @@ def get_true_means(X: np.ndarray, tau_0: float) -> Tuple[np.ndarray, np.ndarray,
         - Treatment effect heterogeneity ensures different subjects benefit differently
         - Both positive (X1) and negative (X2) treatment effect modifiers included
     """
-    # Regression coefficients for control mean (chosen to create realistic structure)
-    beta_0 = np.array([0, 0.8, 0.5, -0.5, 0.3, -0.2])
+    beta_0 = np.array([0.0, 0.8, 0.5, -0.5, 0.3])
     b_x = _get_b_x(X)
-    
-    # Control arm mean: linear predictor + interaction
-    mu_0 = b_x @ beta_0 + 0.75 * X[:, 0] * X[:, 2]
-    
-    # Conditional treatment effect (heterogeneous)
-    tau = tau_0 + 0.5 * X[:, 0] - 0.5 * (X[:, 1] == 1).astype(float)
+
+    # Control arm mean: linear predictor
+    mu_0 = b_x @ beta_0
+
+    # Conditional treatment effect (heterogeneous in continuous covariates)
+    tau = tau_0 + 0.5 * X[:, 0] - 0.5 * X[:, 2]
     
     # Treatment arm mean
     mu_1 = mu_0 + tau
@@ -222,15 +217,10 @@ def get_true_variances(X: np.ndarray, kappa: float) -> Tuple[np.ndarray, np.ndar
         - Different covariate dependencies in each arm creates complexity
         - Variance heterogeneity motivates covariate-adaptive methods
     """
-    # Current trial control arm variance
-    sigma_0_c_sq = np.exp(0.2 + 0.4 * X[:, 1] + 0.3 * (X[:, 3] == 2).astype(float))
-    
-    # Current trial treatment arm variance
-    sigma_1_sq = np.exp(0.2 + 0.2 * X[:, 0])
-    
-    # Historical trial control arm variance (scaled by kappa)
-    sigma_0_h_sq = kappa * np.exp(0.2 + 0.2 * X[:, 1])
-    
+    sigma_0_c_sq = np.full(X.shape[0], 1.0)
+    sigma_1_sq = np.full(X.shape[0], 0.65)
+    sigma_0_h_sq = kappa * sigma_0_c_sq
+
     return sigma_0_c_sq, sigma_1_sq, sigma_0_h_sq
 
 def generate_historical_data(n_h: int, scenario_params: dict) -> dict:

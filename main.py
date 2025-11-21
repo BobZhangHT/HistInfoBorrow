@@ -2,7 +2,7 @@ import argparse
 """
 main.py
 
-Main Orchestration Script for CAHB-PP Simulation Study
+Main Orchestration Script for CAHB-UIP Simulation Study
 
 This script coordinates the complete simulation workflow:
     1. Configuration loading and validation
@@ -49,11 +49,12 @@ Output:
 - .simulation_cache/: Cached simulation results (for resumability)
 
 References:
-    CAHB-PP manuscript Section 3 (Simulation Study Design)
+    CAHB-UIP manuscript Section 3 (Simulation Study Design)
 """
 
 import argparse
 import os
+import shutil
 import sys
 import gc
 import warnings
@@ -243,7 +244,7 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
         X_new = data_generation.generate_covariates(n=1)
         
         # Get allocation probability from the method
-        # This is where methods differ (CAHB-PP variants vs CAHB vs KBCD)
+        # This is where methods differ (CAHB-UIP variants vs CAHB vs KBCD)
         try:
             alloc_output = method_instance.get_allocation_prob(
                 X_curr=X_curr,
@@ -267,11 +268,16 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
         if not np.isfinite(pi_1):
             pi_1 = 0.5
         diag_Rn = float(diag.get("R_n", 1.0)) if isinstance(diag, dict) else 1.0
-        
-        try:
-            diag_discount = float(diag.get("mean", np.nan)) if isinstance(diag, dict) else np.nan
-        except Exception as e:
-            diag_discount = np.nan
+        diag_discount = np.nan
+        if isinstance(diag, dict):
+            if "M" in diag and np.isfinite(diag["M"]):
+                diag_discount = float(diag["M"])
+            elif "mean" in diag and np.isfinite(diag["mean"]):
+                diag_discount = float(diag["mean"])
+        max_rn_allowed = float(getattr(config, "MAX_ESS", 1e6))
+        if not np.isfinite(diag_Rn):
+            diag_Rn = 1.0
+        diag_Rn = float(np.clip(diag_Rn, 0.0, max_rn_allowed))
         
         # Randomize treatment assignment
         Z_new = np.random.binomial(1, pi_1)
@@ -292,11 +298,16 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
         total_enrolled = len(Z_curr)
         if total_enrolled >= monitor_start and ((total_enrolled - monitor_start) % monitor_step == 0):
             prop_treated = float(np.sum(Z_curr) / total_enrolled)
+            x_vals = X_new.reshape(-1)
             allocation_path.append({
                 "sample_size": int(total_enrolled),
                 "prop_treated": prop_treated,
                 "R_n": diag_Rn,
-                "a_mean": diag.get("mean") if isinstance(diag, dict) else np.nan,
+                "M": diag_discount,
+                "x1": float(x_vals[0]),
+                "x2": float(x_vals[1]),
+                "x3": float(x_vals[2]),
+                "x4": float(x_vals[3]),
             })
     
     # ==== 5. Final Analysis ====
@@ -402,7 +413,7 @@ def main(demo_override: Optional[bool] = None, clear_cache: bool = False):
         shutil.rmtree(config.CACHE_DIR, ignore_errors=True)
 
     print("=" * 80)
-    print("CAHB-PP SIMULATION STUDY".center(80))
+    print("CAHB-UIP SIMULATION STUDY".center(80))
     print("=" * 80)
     print(f"Mode: {'FAST-DEMO' if demo_mode else 'FULL'} (N_REPLICATES={config.N_REPLICATES})")
     print()
@@ -442,11 +453,17 @@ def main(demo_override: Optional[bool] = None, clear_cache: bool = False):
     print("Step 3: Initializing checkpoint system...")
     
     # Create memory-mapped cache with size limits
-    memory = joblib.Memory(
-        location=config.CACHE_DIR,
-        verbose=0,
-        bytes_limit=None  # No automatic cleanup (manual control)
-    )
+    try:
+        memory = joblib.Memory(
+            location=config.CACHE_DIR,
+            verbose=0,
+            bytes_limit=None  # Supported in newer joblib
+        )
+    except TypeError:
+        memory = joblib.Memory(
+            location=config.CACHE_DIR,
+            verbose=0
+        )
     
     # Wrap simulation function with caching if enabled
     if config.USE_CACHE:
@@ -469,7 +486,7 @@ def main(demo_override: Optional[bool] = None, clear_cache: bool = False):
     print(f"  √ Comparing {len(config.METHODS_TO_RUN)} methods:")
     for method in config.METHODS_TO_RUN:
         print(f"      - {method}")
-    print(f"  √ Running {config.N_REPLICATES} replicates per (scenario ?? method)")
+    print(f"  √ Running {config.N_REPLICATES} replicates per (scenario x method)")
     if getattr(config, "FAST_DEMO", False):
         print(f"    √ FAST_DEMO active (use '--full' or unset flag for {config.FULL_RUN_REPLICATES} replicates)")
     
@@ -500,11 +517,15 @@ def main(demo_override: Optional[bool] = None, clear_cache: bool = False):
     print()
     
     # Configure joblib Parallel with memory management
+    # Limit BLAS threads in workers to avoid oversubscription/memory spikes
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
     parallel_kwargs = {
         'n_jobs': config.N_JOBS,
         'verbose': 0,  # Suppress joblib's own progress (we use tqdm)
         'backend': 'loky',  # Use loky backend for better memory management
-        'batch_size': 'auto',
+        'batch_size': 1,    # Small batches to cap per-worker memory
+        'pre_dispatch': 'n_jobs',  # Do not queue more than workers
     }
     
     # Add memory limit if specified
@@ -576,7 +597,7 @@ def main(demo_override: Optional[bool] = None, clear_cache: bool = False):
         analysis_outputs = analysis.process_results(results)
         summary_df = analysis_outputs.get('summary')
         n_summary = len(summary_df) if summary_df is not None else 0
-        print(f"  √ Aggregated {n_summary} (scenario ?? method) combinations")
+        print(f"  √ Aggregated {n_summary} (scenario x method) combinations")
         print(f"  √ Metrics computed: Bias, RMSE, Coverage, Type I Error, Power")
     except Exception as e:
         print(f"\n ERROR during results processing: {e}")
@@ -635,7 +656,7 @@ def main(demo_override: Optional[bool] = None, clear_cache: bool = False):
 # =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the CAHB-PP simulation study")
+    parser = argparse.ArgumentParser(description="Run the CAHB-UIP simulation study")
     parser.add_argument(
         "--demo",
         action="store_true",

@@ -1,7 +1,7 @@
 """
 analysis.py
 
-Results Analysis and Visualization for CAHB-PP Simulation Study
+Results Analysis and Visualization for CAHB-UIP Simulation Study
 
 This module processes raw simulation results and generates publication-ready
 outputs including:
@@ -33,11 +33,12 @@ Output Specifications:
 - Follows Statistics in Medicine figure/table guidelines
 
 References:
-    CAHB-PP manuscript Section 3.5 (Evaluation Metrics)
+    CAHB-UIP manuscript Section 3.5 (Evaluation Metrics)
 """
 
 import os
 import warnings
+from typing import List
 import pandas as pd
 import numpy as np
 
@@ -123,8 +124,8 @@ def configure_plot_style():
     colors = {
         'KBCD': '#009E73',          # Bluish green
         'CAHB': '#56B4E9',          # Sky blue
-        'CAHB_PP_IPD': '#E69F00',   # Orange
-        'CAHB_PP_SLD': '#D55E00',   # Vermilion
+        'CAHB_UIP_IPD': '#E69F00',  # Orange
+        'CAHB_UIP_SLD': '#D55E00',  # Vermilion
     }
     
     return colors
@@ -153,7 +154,7 @@ def get_true_delta(tau_0: float) -> float:
     Returns:
         True marginal average treatment effect
     """
-    return tau_0 - 0.25
+    return tau_0
 
 
 # =============================================================================
@@ -200,8 +201,11 @@ def process_results(results_list: list) -> dict:
     df['is_success'] = df['prob_gt_0'] > threshold
     df['alloc_rate_treatment'] = df['n_treated'] / df['n_total']
 
-    groupby_cols = ['scenario_name', 'method', 'tau_0', 'n', 'n_h', 'scenario_type']
-    groupby_cols = [col for col in groupby_cols if col in df.columns]
+    key_cols = ['method', 'tau_0', 'n', 'n_h', 'scenario_type', 'kappa']
+    key_cols = [col for col in key_cols if col in df.columns]
+    groupby_cols = key_cols.copy()
+    if 'scenario_name' in df.columns:
+        groupby_cols = ['scenario_name'] + groupby_cols
 
     agg_funcs = {
         'error': 'mean',
@@ -226,20 +230,23 @@ def process_results(results_list: list) -> dict:
         'replicate_id': 'N_Replicates'
     })
 
+    type_key = key_cols.copy()
     type_i_df = (
         df[df['tau_0'] == 0.0]
-        .groupby(['scenario_name', 'method'], as_index=False)['is_success']
+        .groupby(type_key, as_index=False)['is_success']
         .mean()
         .rename(columns={'is_success': 'Type_I_Error'})
-    )
+    ) if type_key else pd.DataFrame()
     power_df = (
         df[df['tau_0'] == 0.4]
-        .groupby(['scenario_name', 'method'], as_index=False)['is_success']
+        .groupby(type_key, as_index=False)['is_success']
         .mean()
         .rename(columns={'is_success': 'Power'})
-    )
-    summary = pd.merge(summary, type_i_df, on=['scenario_name', 'method'], how='left')
-    summary = pd.merge(summary, power_df, on=['scenario_name', 'method'], how='left')
+    ) if type_key else pd.DataFrame()
+    if not type_i_df.empty:
+        summary = pd.merge(summary, type_i_df, on=type_key, how='left')
+    if not power_df.empty:
+        summary = pd.merge(summary, power_df, on=type_key, how='left')
     summary = summary.sort_values(['scenario_name', 'method']).reset_index(drop=True)
     outputs['summary'] = summary
 
@@ -255,14 +262,20 @@ def process_results(results_list: list) -> dict:
                 'scenario_id': row.get('scenario_id'),
                 'scenario_name': row.get('scenario_name'),
                 'scenario_type': row.get('scenario_type', 'Unknown'),
+                'kappa': row.get('kappa', np.nan),
                 'method': row.get('method'),
                 'tau_0': row.get('tau_0'),
                 'n': row.get('n'),
+                'n_h': row.get('n_h'),
                 'replicate_id': row.get('replicate_id'),
                 'sample_size': sample_size,
                 'prop_treated': point.get('prop_treated'),
                 'R_n': point.get('R_n'),
-                'a_mean': point.get('a_mean'),
+                'M': point.get('M'),
+                'x1': point.get('x1'),
+                'x2': point.get('x2'),
+                'x3': point.get('x3'),
+                'x4': point.get('x4'),
             })
 
     if allocation_records:
@@ -277,17 +290,21 @@ def process_results(results_list: list) -> dict:
                 'scenario_id': row.get('scenario_id'),
                 'scenario_name': row.get('scenario_name'),
                 'scenario_type': row.get('scenario_type', 'Unknown'),
+                'kappa': row.get('kappa', np.nan),
                 'method': row.get('method'),
                 'tau_0': row.get('tau_0'),
                 'n': row.get('n'),
+                'n_h': row.get('n_h'),
                 'replicate_id': row.get('replicate_id'),
                 'sample_size': row.get('n'),
                 'x1': entry.get('x1'),
                 'x2': entry.get('x2'),
-                'a_mean': entry.get('a_mean'),
-                'a_ci_low': entry.get('a_ci_low'),
-                'a_ci_high': entry.get('a_ci_high'),
-                'compatibility': entry.get('compatibility'),
+                'x3': entry.get('x3'),
+                'x4': entry.get('x4'),
+                'M_mean': entry.get('M_mean'),
+                'M_ci_low': entry.get('M_ci_low'),
+                'M_ci_high': entry.get('M_ci_high'),
+                'R_n': entry.get('R_n'),
             })
 
     if calibration_records:
@@ -305,15 +322,13 @@ def generate_tables(results_obj: dict):
     Generates publication-ready tables in CSV and LaTeX formats.
     
     Creates:
-        1. simulation_summary.csv: Full results table
-        2. estimation_metrics.(csv|tex): Publication-ready estimation summaries
-        3. type_i_error_power.tex: Focused table for error/power results
+        1. estimation_metrics.(csv|tex): Publication-ready estimation summaries
+        2. type_i_error_power.tex: Focused table for error/power results
     
     Args:
         results_obj: Output dictionary returned by process_results()
     
     Output Files:
-        - results/tables/simulation_summary.csv
         - results/tables/estimation_metrics.csv
         - results/tables/estimation_metrics.tex
         - results/tables/type_i_error_power.tex
@@ -326,18 +341,16 @@ def generate_tables(results_obj: dict):
         
     os.makedirs(config.TABLES_DIR, exist_ok=True)
     
-    # ==== CSV Output (Full Table) ====
-    csv_path = os.path.join(config.TABLES_DIR, 'simulation_summary.csv')
-    summary_df.to_csv(csv_path, index=False, float_format='%.4f')
-    print(f"✓ Full summary table saved: {csv_path}")
-    
-    estimation_cols = ['scenario_name', 'scenario_type', 'n', 'n_h', 'tau_0', 'method',
-                       'Bias', 'RMSE', 'Coverage', 'CI_Width']
+    estimation_cols = [
+        'scenario_name', 'method', 'tau_0', 'n', 'n_h', 'scenario_type', 'kappa',
+        'Bias', 'RMSE', 'Coverage', 'CI_Width', 'Alloc_Rate_Treatment',
+        'Type_I_Error', 'Power'
+    ]
     estimation_cols = [c for c in estimation_cols if c in summary_df.columns]
     estimation_df = summary_df[estimation_cols].copy()
     est_csv = os.path.join(config.TABLES_DIR, 'estimation_metrics.csv')
     estimation_df.to_csv(est_csv, index=False, float_format='%.4f')
-    print(f"✓ Estimation metrics table saved: {est_csv}")
+    print(f"[+] Estimation metrics table saved: {est_csv}")
 
     # Publication-ready LaTeX table
     display_df = estimation_df.copy()
@@ -363,7 +376,7 @@ def generate_tables(results_obj: dict):
                 multicolumn_format='c',
                 escape=False
             )
-        print(f"✓ LaTeX estimation table saved: {tex_path}")
+        print(f"[+] LaTeX estimation table saved: {tex_path}")
     except Exception as e:
         warnings.warn(f"Failed to build LaTeX estimation table: {e}")
     
@@ -400,12 +413,12 @@ def generate_tables(results_obj: dict):
                     multicolumn_format='c',
                     escape=False
                 )
-            print(f"✓ Type I Error/Power table saved: {ep_tex_path}")
+            print(f"[+] Type I Error/Power table saved: {ep_tex_path}")
             
         except Exception as e:
             warnings.warn(f"Could not create Type I Error/Power pivot table: {e}")
     
-    print(f"✓ All tables saved to: {config.TABLES_DIR}")
+    print(f"[+] All tables saved to: {config.TABLES_DIR}")
 
 
 # =============================================================================
@@ -413,205 +426,167 @@ def generate_tables(results_obj: dict):
 # =============================================================================
 
 def generate_plots(results_obj: dict):
-    """Generate required publication-quality figures."""
-    summary_df = results_obj.get('summary', pd.DataFrame())
-    if summary_df.empty:
-        warnings.warn("Empty summary DataFrame. No plots generated.")
+    """Generate 2x2 grid boxplots for R_n(X) and M(X) diagnostics."""
+    alloc_df = results_obj.get('allocation_path', pd.DataFrame())
+    if alloc_df.empty:
+        warnings.warn("Empty allocation diagnostics. No plots generated.")
         return
 
     os.makedirs(config.PLOTS_DIR, exist_ok=True)
     colors = configure_plot_style()
+    method_labels = getattr(config, 'METHOD_LABELS', {})
 
-    available_methods = summary_df['method'].unique().tolist()
-    if hasattr(config, 'METHODS_TO_RUN'):
-        methods = [m for m in config.METHODS_TO_RUN if m in available_methods]
-    else:
-        methods = available_methods
-    if not methods:
-        methods = available_methods
+    scenario_order = [
+        ('S1', 1.0, r'S1 $\\kappa$=1.0'),
+        ('S2', 0.7, r'S2 $\\kappa$=0.7'),
+        ('S2', 1.3, r'S2 $\\kappa$=1.3'),
+        ('S3', 0.7, r'S3 $\\kappa$=0.7'),
+        ('S3', 1.3, r'S3 $\\kappa$=1.3'),
+        ('S4', 1.3, r'S4 $\\kappa$=1.3'),
+    ]
+    label_order = [s[2] for s in scenario_order]
+    label_map = {(stype, float(kappa)): label for stype, kappa, label in scenario_order}
 
     def _label(method: str) -> str:
-        if hasattr(config, 'METHOD_LABELS'):
-            return config.METHOD_LABELS.get(method, method)
-        return method
+        return method_labels.get(method, method)
 
-    def _aggregate_rate(df: pd.DataFrame, rate_col: str) -> pd.DataFrame:
-        if df.empty:
-            return pd.DataFrame()
-        grouped = (
-            df.groupby(['n', 'method'])
-            .apply(lambda g: pd.Series({
-                'value': np.average(g[rate_col], weights=g['N_Replicates']),
-                'N_total': g['N_Replicates'].sum()
-            }))
-            .reset_index()
-        )
-        grouped['ci'] = 1.96 * np.sqrt(
-            np.clip(grouped['value'] * (1 - grouped['value']) / np.maximum(grouped['N_total'], 1), 0, 1)
-        )
-        grouped['lower'] = np.clip(grouped['value'] - grouped['ci'], 0.0, 1.0)
-        grouped['upper'] = np.clip(grouped['value'] + grouped['ci'], 0.0, 1.0)
-        return grouped
+    def _scenario_label(row: pd.Series) -> str:
+        stype = row.get('scenario_type')
+        kappa_val = row.get('kappa')
+        try:
+            kappa_key = float(kappa_val)
+        except Exception:
+            kappa_key = kappa_val
+        return label_map.get((stype, kappa_key), f"{stype} $\\kappa$={kappa_val}")
 
-    type_df = _aggregate_rate(summary_df[summary_df['tau_0'] == 0.0], 'Type_I_Error')
-    power_df = _aggregate_rate(summary_df[summary_df['tau_0'] == 0.4], 'Power')
+    alloc_df = alloc_df.copy()
+    # Backfill n_h if missing
+    if 'n_h' not in alloc_df.columns or alloc_df['n_h'].isna().all():
+        raw_df = results_obj.get('raw', pd.DataFrame())
+        if not raw_df.empty and 'scenario_id' in alloc_df.columns:
+            nh_map = raw_df[['scenario_id', 'n_h']].drop_duplicates()
+            alloc_df = alloc_df.merge(nh_map, on='scenario_id', how='left', suffixes=('', '_raw'))
+            alloc_df['n_h'] = alloc_df['n_h'].fillna(alloc_df.get('n_h_raw'))
+            if 'n_h_raw' in alloc_df.columns:
+                alloc_df = alloc_df.drop(columns=['n_h_raw'])
+        if alloc_df['n_h'].isna().any() and 'scenario_name' in alloc_df.columns:
+            extracted = alloc_df['scenario_name'].str.extract(r'nh=([0-9]+)')[0]
+            alloc_df['n_h'] = alloc_df['n_h'].fillna(pd.to_numeric(extracted, errors='coerce'))
 
-    if not type_df.empty or not power_df.empty:
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
-        panels = [
-            (type_df, "Type I Error vs Sample Size", "Type I Error", 0.05),
-            (power_df, "Power vs Sample Size", "Power", 0.8),
-        ]
-        for ax, (df_rate, title, ylabel, ref_line) in zip(axes, panels):
-            if df_rate.empty:
-                ax.set_visible(False)
-                continue
-            for method in methods:
-                data = df_rate[df_rate['method'] == method].sort_values('n')
-                if data.empty:
-                    continue
-                ax.plot(
-                    data['n'], data['value'],
-                    color=colors.get(method, 'gray'),
-                    marker='o',
-                    label=_label(method)
-                )
-                ax.fill_between(
-                    data['n'], data['lower'], data['upper'],
-                    color=colors.get(method, 'gray'), alpha=0.2
-                )
-            ax.set_xlabel('Enrolled Sample Size (n)')
-            ax.set_ylabel(ylabel)
-            ax.set_ylim(0, 1)
-            ax.set_title(title)
-            ax.axhline(ref_line, color='gray', linestyle='--', linewidth=1)
-        handles, labels = [], []
-        for axis in axes:
-            h, l = axis.get_legend_handles_labels()
-            handles.extend(h)
-            labels.extend(l)
-        if handles:
-            fig.legend(handles, labels, loc='lower center', ncol=min(len(handles), 4), frameon=False)
-        fig.tight_layout(rect=(0, 0.08, 1, 1))
-        path_type = os.path.join(config.PLOTS_DIR, 'type_power_curves.pdf')
-        fig.savefig(path_type)
-        plt.close(fig)
-        print(f"? Type I/Power curves saved: {path_type}")
+    alloc_df['scenario_label'] = alloc_df.apply(_scenario_label, axis=1)
+    alloc_df = alloc_df[alloc_df['scenario_label'].isin(label_order)]
 
-    alloc_df = results_obj.get('allocation_path', pd.DataFrame())
-    if not alloc_df.empty:
-        alloc_group = (
-            alloc_df.groupby(['method', 'sample_size'])
-            .agg(
-                prop_mean=('prop_treated', 'mean'),
-                prop_sd=('prop_treated', 'std'),
-                rn_mean=('R_n', 'mean'),
-                rn_sd=('R_n', 'std'),
-                count=('replicate_id', 'nunique')
-            )
-            .reset_index()
-        )
-        alloc_group['prop_sd'] = alloc_group['prop_sd'].fillna(0.0)
-        alloc_group['rn_sd'] = alloc_group['rn_sd'].fillna(0.0)
-        alloc_group['prop_ci'] = 1.96 * alloc_group['prop_sd'] / np.sqrt(np.maximum(alloc_group['count'], 1))
-        alloc_group['rn_ci'] = 1.96 * alloc_group['rn_sd'] / np.sqrt(np.maximum(alloc_group['count'], 1))
+    def _prepare_metric(metric_col: str, method_pool: List[str]) -> pd.DataFrame:
+        metric_df = alloc_df.dropna(subset=[metric_col]).copy()
+        if metric_df.empty:
+            return metric_df
+        group_cols = ['n', 'n_h', 'scenario_type', 'kappa', 'tau_0', 'method', 'replicate_id', 'scenario_label']
+        metric_df = metric_df.groupby(group_cols, as_index=False)[metric_col].median()
+        metric_df['scenario_label'] = pd.Categorical(metric_df['scenario_label'], categories=label_order, ordered=True)
+        metric_df = metric_df[metric_df['method'].isin(method_pool)]
+        return metric_df
 
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharex=True)
-        for method in methods:
-            data = alloc_group[alloc_group['method'] == method].sort_values('sample_size')
-            if data.empty:
-                continue
-            label = _label(method)
-            color = colors.get(method, 'gray')
-            axes[0].plot(data['sample_size'], data['prop_mean'], color=color, label=label)
-            axes[0].fill_between(
-                data['sample_size'],
-                np.clip(data['prop_mean'] - data['prop_ci'], 0.0, 1.0),
-                np.clip(data['prop_mean'] + data['prop_ci'], 0.0, 1.0),
-                color=color, alpha=0.2
-            )
-            axes[1].plot(data['sample_size'], data['rn_mean'], color=color, label=label)
-            axes[1].fill_between(
-                data['sample_size'],
-                np.maximum(data['rn_mean'] - data['rn_ci'], 0.0),
-                data['rn_mean'] + data['rn_ci'],
-                color=color, alpha=0.2
-            )
-        axes[0].set_xlabel('Enrolled Sample Size (n)')
-        axes[0].set_ylabel('Avg. treatment proportion')
-        axes[0].set_ylim(0, 1)
-        axes[0].set_title('(a) Allocation proportion')
-        axes[1].set_xlabel('Enrolled Sample Size (n)')
-        axes[1].set_ylabel('Avg. R_n(X)')
-        axes[1].set_title('(b) Effective sample size multiplier')
-        handles, labels = axes[0].get_legend_handles_labels()
-        if handles:
-            fig.legend(handles, labels, loc='lower center', ncol=min(len(handles), 4), frameon=False)
-        fig.tight_layout(rect=(0, 0.08, 1, 1))
-        alloc_path = os.path.join(config.PLOTS_DIR, 'allocation_dynamics.pdf')
-        fig.savefig(alloc_path)
-        plt.close(fig)
-        print(f"? Allocation dynamics plot saved: {alloc_path}")
-
-    calib_df = results_obj.get('calibration', pd.DataFrame())
-    if not calib_df.empty:
-        scenario_types = sorted(calib_df['scenario_type'].dropna().unique())
-        if not scenario_types:
-            scenario_types = ['All']
-            calib_df['scenario_type'] = 'All'
-        n_types = len(scenario_types)
-        ncols = 2
-        nrows = int(np.ceil(n_types / ncols))
-        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.8 * nrows), sharex=True, sharey=True)
-        axes = np.array(axes).reshape(nrows, ncols)
-
-        for idx, scenario in enumerate(scenario_types):
-            ax = axes.flat[idx]
-            subset = calib_df[calib_df['scenario_type'] == scenario]
-            if subset.empty:
-                ax.set_visible(False)
-                continue
-            agg = subset.groupby(['method', 'sample_size'], as_index=False).agg({
-                'a_mean': 'mean',
-                'a_ci_low': 'mean',
-                'a_ci_high': 'mean'
-            })
-            for method in methods:
-                data = agg[agg['method'] == method].sort_values('sample_size')
-                if data.empty:
-                    continue
-                label = _label(method)
-                color = colors.get(method, 'gray')
-                yerr = np.vstack([
-                    np.clip(data['a_mean'] - data['a_ci_low'], 0.0, 1.0),
-                    np.clip(data['a_ci_high'] - data['a_mean'], 0.0, 1.0)
-                ])
-                ax.errorbar(
-                    data['sample_size'], data['a_mean'],
-                    yerr=yerr,
-                    fmt='o-', color=color, label=label
-                )
-            ax.set_title(scenario)
-            ax.set_xlabel('Enrolled Sample Size (n)')
-            ax.set_ylabel('Average a(x)')
-            ax.set_ylim(0, 1)
-        total_axes = nrows * ncols
-        for idx in range(len(scenario_types), total_axes):
-            axes.flat[idx].set_visible(False)
+    def _method_handles(methods_for_plot: List[str]) -> List[Line2D]:
         handles = []
-        labels = []
-        for method in methods:
-            handles.append(Line2D([0], [0], color=colors.get(method, 'gray'), marker='o', label=_label(method)))
-            labels.append(_label(method))
-        if handles:
-            fig.legend(handles, labels, loc='lower center', ncol=min(len(handles), 4), frameon=False)
-        fig.tight_layout(rect=(0, 0.08, 1, 1))
-        calib_path = os.path.join(config.PLOTS_DIR, 'calibration_discount.pdf')
-        fig.savefig(calib_path)
-        plt.close(fig)
-        print(f"? Calibration plot saved: {calib_path}")
+        for m in methods_for_plot:
+            handles.append(
+                Line2D([0], [0], color=colors.get(m, 'gray'), marker='s', linestyle='', label=_label(m))
+            )
+        return handles
 
-    print(f"? All plots saved to: {config.PLOTS_DIR}")
+    def _draw_box(ax, data: pd.DataFrame, metric_col: str, methods_for_plot: List[str], ylabel: str):
+        if data.empty:
+            ax.set_visible(False)
+            return []
+        method_order = [m for m in methods_for_plot if m in data['method'].unique()]
+        if not method_order:
+            ax.set_visible(False)
+            return []
+        palette = {m: colors.get(m, 'gray') for m in method_order}
+        sns.boxplot(
+            data=data,
+            x='scenario_label',
+            y=metric_col,
+            hue='method',
+            order=label_order,
+            hue_order=method_order,
+            palette=palette,
+            ax=ax,
+            linewidth=0.8,
+            fliersize=2.5,
+        )
+        ax.set_xlabel('Simulation scenario')
+        ax.set_ylabel(ylabel)
+        ax.tick_params(axis='x', labelrotation=25)
+        if ax.legend_:
+            ax.legend_.remove()
+        return method_order
+
+    def _combination_order(df: pd.DataFrame) -> List[tuple]:
+        preferred = [(200, 400), (200, 800), (400, 400), (400, 800)]
+        observed = list({(int(row.n), int(row.n_h)) for row in df[['n', 'n_h']].dropna().itertuples(index=False)})
+        combos = [c for c in preferred if c in observed]
+        for combo in sorted(observed):
+            if combo not in combos:
+                combos.append(combo)
+        return combos
+
+    def _plot_metric(metric_df: pd.DataFrame, methods_for_plot: List[str], metric_col: str, ylabel: str, prefix: str):
+        if metric_df.empty:
+            warnings.warn(f"No data available for {metric_col} plotting.")
+            return
+
+        combos = _combination_order(metric_df)
+        if not combos:
+            warnings.warn(f"No (n, n_h) combinations found for {metric_col}.")
+            return
+
+        n_panels = len(combos)
+        ncols = 2
+        nrows = int(np.ceil(n_panels / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), sharey=True)
+        axes = np.atleast_2d(axes)
+        axes_flat = axes.flatten()
+        legend_methods = [m for m in methods_for_plot if m in metric_df['method'].unique()]
+        for ax, (n_val, nh_val) in zip(axes_flat, combos):
+            subset = metric_df[(metric_df['n'] == n_val) & (metric_df['n_h'] == nh_val)]
+            _draw_box(ax, subset, metric_col, methods_for_plot, ylabel)
+            ax.set_title(rf"n={int(n_val)}, $n_h$={int(nh_val)}")
+        for ax in axes_flat[len(combos):]:
+            ax.set_visible(False)
+        if legend_methods:
+            handles = _method_handles(legend_methods)
+            fig.legend(handles, [_label(m) for m in legend_methods], loc='lower center', ncol=min(len(handles), 4), frameon=False)
+        fig.tight_layout(rect=(0, 0.08, 1, 1))
+        grid_path = os.path.join(config.PLOTS_DIR, f"{prefix}_grid.pdf")
+        fig.savefig(grid_path)
+        plt.close(fig)
+        print(f"[+] Saved {prefix} grid: {grid_path}")
+
+        for n_val, nh_val in combos:
+            subset = metric_df[(metric_df['n'] == n_val) & (metric_df['n_h'] == nh_val)]
+            fig_single, ax_single = plt.subplots(figsize=(7, 5))
+            used_methods = _draw_box(ax_single, subset, metric_col, methods_for_plot, ylabel)
+            if used_methods:
+                handles = _method_handles(used_methods)
+                fig_single.legend(handles, [_label(m) for m in used_methods], loc='upper right', frameon=False)
+            fig_single.tight_layout()
+            sub_path = os.path.join(config.PLOTS_DIR, f"{prefix}_n{int(n_val)}_nh{int(nh_val)}.pdf")
+            fig_single.savefig(sub_path)
+            plt.close(fig_single)
+            print(f"[+] Saved subplot: {sub_path}")
+
+    all_methods = getattr(config, 'METHODS_TO_RUN', [])
+    rn_methods = [m for m in all_methods if m in alloc_df['method'].unique()]
+    m_methods = [m for m in all_methods if m.startswith('CAHB_UIP') and m in alloc_df['method'].unique()]
+
+    rn_df = _prepare_metric('R_n', rn_methods)
+    m_df = _prepare_metric('M', m_methods)
+
+    _plot_metric(rn_df, rn_methods, 'R_n', r'Median $R_n(\\mathbf{X})$', 'rn_box')
+    _plot_metric(m_df, m_methods, 'M', r'Median $M(\\mathbf{X})$', 'm_box')
+
+    print(f"[+] All plots saved to: {config.PLOTS_DIR}")
 
 # =============================================================================
 # Main Entry Point (for testing)

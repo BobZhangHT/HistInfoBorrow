@@ -338,9 +338,12 @@ class CAHB(BorrowingMethod):
         self.name = "CAHB"
         self.gamma = float(priors.get("cahb_gamma", np.sqrt(3.0)))
         self.max_iter = int(priors.get("cahb_max_iter", 50))
-        self.lambda_proj = float(priors.get("cahb_lambda", np.inf))
-        self.lambda_trunc = float(priors.get("cahb_lambda_trunc", 0.0))
-        self.invgam2 = float(priors.get("cahb_invgam2", 0.0))
+        # λ2 baseline (paper: 300 log n)
+        self.lambda_proj = float(priors.get("cahb_lambda", 300.0))
+        self.lambda_quantile = float(priors.get("cahb_lambda_quantile", 0.10))
+        self.lambda_trunc_default = float(priors.get("cahb_lambda_trunc", 0.0))
+        # 1/γ^2 with default γ = √3 ⇒ ~0.333
+        self.invgam2 = float(priors.get("cahb_invgam2", 1.0 / max(self.gamma ** 2, 1e-8)))
 
     # Kernel helpers ------------------------------------------------------
     @staticmethod
@@ -409,15 +412,25 @@ class CAHB(BorrowingMethod):
 
     @staticmethod
     def _project_nonnegative_l1(v: np.ndarray, radius: float) -> np.ndarray:
+        """
+        Euclidean projection onto the nonnegative L1-ball of radius `radius`.
+
+        Ported from R Codes/simplex.py (Duchi et al., 2008).
+        """
+        v = np.asarray(v, dtype=float)
         v = np.maximum(v, 0.0)
         if not np.isfinite(radius) or radius <= 0.0:
             return v
-        if v.sum() <= radius:
+        n = v.shape[0]
+        if v.sum() <= radius or n == 0:
             return v
         u = np.sort(v)[::-1]
         cssv = np.cumsum(u)
-        rho = np.nonzero(u * np.arange(1, len(u) + 1) > (cssv - radius))[0][-1]
-        theta = (cssv[rho] - radius) / (rho + 1)
+        rho_idx = np.nonzero(u * np.arange(1, n + 1) > (cssv - radius))[0]
+        if rho_idx.size == 0:
+            return np.zeros_like(v)
+        rho = rho_idx[-1]
+        theta = (cssv[rho] - radius) / (rho + 1.0)
         return np.maximum(v - theta, 0.0)
 
     @staticmethod
@@ -483,7 +496,10 @@ class CAHB(BorrowingMethod):
         Z: np.ndarray,
         mu0: np.ndarray,
         theta0: np.ndarray,
-    ) -> np.ndarray:
+        lambda_proj: Optional[float] = None,
+        lambda_trunc: Optional[float] = None,
+        return_raw: bool = False,
+    ):
         """
         Optimize tau^2(x) at each observation location.
         
@@ -516,15 +532,116 @@ class CAHB(BorrowingMethod):
         tau_raw = numerator / np.maximum(denominator, 1e-8)
         tau_raw = np.maximum(tau_raw, 0.0)
         
-        # Truncation: set small values to 0 (R code line 473)
-        tau_raw[tau_raw <= self.lambda_trunc] = 0.0
+        # Allow caller to override lambda settings (used for Algorithm 2 tuning)
+        lam_trunc_val = self.lambda_trunc_default if lambda_trunc is None else float(lambda_trunc)
+        tau_thresholded = tau_raw.copy()
+        tau_thresholded[tau_thresholded <= lam_trunc_val] = 0.0
         
-        # L1 projection for sparsity (R code line 474)
-        # Radius scaled by log(m) as in R implementation
-        radius = self.lambda_proj
+        n = kernel_matrix.shape[1]
+        lam_proj_val = self.lambda_proj if lambda_proj is None else float(lambda_proj)
+        radius = lam_proj_val
         if np.isfinite(radius):
-            radius = radius * max(np.log(kernel_matrix.shape[1]), 1.0)
-        return self._project_nonnegative_l1(tau_raw, radius)
+            radius = radius * max(np.log(max(n, 1)), 1.0)
+        tau_projected = self._project_nonnegative_l1(tau_thresholded, radius)
+        if return_raw:
+            return tau_projected, tau_raw
+        return tau_projected
+
+    def _mu0_no_borrow(
+        self,
+        kernel_matrix: np.ndarray,
+        Y: np.ndarray,
+        Z: np.ndarray,
+    ) -> np.ndarray:
+        """Replicates mu0.no.est.fn for Algorithm 2 (λ1 tuning)."""
+        n = len(Y)
+        zeros = np.zeros(n)
+        phi0_init = 1.0
+        mu0 = self._m_opt_mu0(kernel_matrix, Y, Z, zeros, phi0_init, zeros)
+        return mu0
+
+    def _coordinate_updates(
+        self,
+        kernel_matrix: np.ndarray,
+        Y: np.ndarray,
+        Z: np.ndarray,
+        theta0: np.ndarray,
+        lambda_proj: float,
+        lambda_trunc: float,
+    ) -> Optional[dict]:
+        if (1.0 - Z).sum() < 2:
+            return None
+        n = len(Y)
+        tau = np.zeros(n)
+        phi0 = max(np.std(Y[Z == 0], ddof=1), 1.0)
+        mu0_prev = None
+        phi0_prev = None
+        tau_prev = None
+        tau_raw_latest = np.zeros(n)
+        for iter_idx in range(self.max_iter):
+            mu0 = self._m_opt_mu0(kernel_matrix, Y, Z, tau, phi0, theta0)
+            phi0 = self._opt_phi0(Y, Z, mu0)
+            tau_new, tau_raw = self._m_opt_tau(
+                kernel_matrix,
+                Y,
+                Z,
+                mu0,
+                theta0,
+                lambda_proj=lambda_proj,
+                lambda_trunc=lambda_trunc,
+                return_raw=True,
+            )
+            if mu0_prev is not None and phi0_prev is not None and tau_prev is not None:
+                err_mu = np.mean((mu0 - mu0_prev) ** 2)
+                err_tau = np.mean((tau_new - tau_prev) ** 2)
+                err_phi0 = (phi0 - phi0_prev) ** 2
+                if max(err_mu, err_tau, err_phi0) < 1e-5:
+                    tau = tau_new
+                    tau_raw_latest = tau_raw
+                    break
+            mu0_prev = mu0
+            phi0_prev = phi0
+            tau_prev = tau
+            tau = tau_new
+            tau_raw_latest = tau_raw
+        return {
+            "mu0": mu0,
+            "tau": tau,
+            "tau_raw": tau_raw_latest,
+            "phi0": phi0,
+        }
+
+    def _select_lambda_trunc(
+        self,
+        kernel_matrix: np.ndarray,
+        Y: np.ndarray,
+        Z: np.ndarray,
+    ) -> float:
+        """Implements Algorithm 2 (Table 1) to choose λ1."""
+        if self.lambda_quantile <= 0.0 or not np.isfinite(self.lambda_quantile):
+            return self.lambda_trunc_default
+        if (1.0 - Z).sum() < 3:
+            return self.lambda_trunc_default
+        theta0_true = self._mu0_no_borrow(kernel_matrix, Y, Z)
+        tuning_fit = self._coordinate_updates(
+            kernel_matrix,
+            Y,
+            Z,
+            theta0_true,
+            lambda_proj=self.lambda_proj,
+            lambda_trunc=0.0,
+        )
+        if tuning_fit is None or tuning_fit.get("tau_raw") is None:
+            return self.lambda_trunc_default
+        tau_raw = tuning_fit["tau_raw"]
+        tau_raw = tau_raw[np.isfinite(tau_raw)]
+        if tau_raw.size == 0:
+            return self.lambda_trunc_default
+        try:
+            lam_val = float(np.quantile(tau_raw, self.lambda_quantile))
+        except ValueError:
+            lam_val = self.lambda_trunc_default
+        return max(lam_val, self.lambda_trunc_default)
 
     def _fit_cahb_model(
         self,
@@ -570,37 +687,21 @@ class CAHB(BorrowingMethod):
         # Get historical predictions theta_0(X_i) (R code line 453)
         theta0 = self._kernel_mean(self.X_h, self.Y_h, self.h_hist, X_curr)
 
-        # Initialize parameters (R code line 614-624)
-        tau = np.zeros(X_curr.shape[0])
-        phi0 = max(np.std(Y_curr[Z_curr == 0], ddof=1), 1.0)
-        mu0_prev = None
-        phi0_prev = None
-
-        # Coordinate-wise optimization loop (R code line 626-653)
-        for iter_idx in range(self.max_iter):
-            # Update mu_0 (R code line 628)
-            mu0 = self._m_opt_mu0(kernel_matrix, Y_curr, Z_curr, tau, phi0, theta0)
-            
-            # Update phi_0 (R code line 631-632)
-            phi0 = self._opt_phi0(Y_curr, Z_curr, mu0)
-            
-            # Update tau^2 (R code line 635-637)
-            tau_new = self._m_opt_tau(kernel_matrix, Y_curr, Z_curr, mu0, theta0)
-            
-            # Check convergence (R code line 643-651)
-            if mu0_prev is not None and phi0_prev is not None:
-                err_mu = np.mean((mu0 - mu0_prev) ** 2)
-                err_tau = np.mean((tau_new - tau) ** 2)
-                err_phi0 = (phi0 - phi0_prev) ** 2
-                
-                err_all = max(err_mu, err_tau, err_phi0)
-                if err_all < 1e-5:
-                    tau = tau_new
-                    break
-            
-            mu0_prev = mu0
-            phi0_prev = phi0
-            tau = tau_new
+        lambda_trunc = self._select_lambda_trunc(kernel_matrix, Y_curr, Z_curr)
+        coord_updates = self._coordinate_updates(
+            kernel_matrix,
+            Y_curr,
+            Z_curr,
+            theta0,
+            lambda_proj=self.lambda_proj,
+            lambda_trunc=lambda_trunc,
+        )
+        if coord_updates is None:
+            return None
+        mu0 = coord_updates["mu0"]
+        tau = coord_updates["tau"]
+        phi0 = coord_updates["phi0"]
+        tau_raw = coord_updates["tau_raw"]
 
         # Prepare return dictionary with fitted parameters (R code line 657-661)
         diff_sq = (mu0 - theta0) ** 2
@@ -616,9 +717,11 @@ class CAHB(BorrowingMethod):
             "theta0": theta0,
             "mu0": mu0,
             "tau": tau,
+            "tau_raw": tau_raw,
             "phi0": phi0,
             "phi0_sq": phi0_sq,
             "diff_sq": diff_sq,
+            "lambda_trunc": lambda_trunc,
         }
 
     def _tau_at_x(self, context: dict, x_eval: np.ndarray) -> float:
@@ -626,17 +729,12 @@ class CAHB(BorrowingMethod):
         numerator = np.dot(context["sZs"], weights)
         if numerator <= 1e-8:
             return 0.0
-        denominator = np.dot(context["sZs"] * context["diff_sq"], weights) + self.gamma ** 2
+        denominator = np.dot(context["sZs"] * context["diff_sq"], weights) + self.invgam2
         return float(np.clip(numerator / max(denominator, 1e-8), 0.0, 1e6))
 
     def _R_n_at_x(self, context: dict, x_eval: np.ndarray) -> float:
-        weights = self._kernel_vector(x_eval, context["X"], context["cov_inv"], context["log_norm"])
-        denominator = np.dot(context["sZs"], weights)
-        if denominator <= 1e-8:
-            return 1.0
-        contributions = 1.0 + np.clip(context["phi0_sq"] * context["tau"], 0.0, 10.0)
-        numerator = np.dot(context["sZs"] * contributions, weights)
-        return float(np.clip(numerator / denominator, 1.0, 1e2))
+        tau_val = self._tau_at_x(context, x_eval)
+        return float(np.clip(1.0 + tau_val, 1.0, 1e4))
 
     def _posterior_mu0(self, context: dict, x_eval: np.ndarray) -> float:
         weights = self._kernel_vector(x_eval, context["X"], context["cov_inv"], context["log_norm"])
@@ -902,6 +1000,7 @@ class CAHBUIPBase(BorrowingMethod):
 
         ridge = 1e-8 * np.eye(feature_dim)
         prior_reg = np.eye(feature_dim) / max(self.beta1_prior_scale, 1e-8)
+        prior_reg[0, 0] = 0.0  # leave intercept noninformative (centered covariates)
 
         kept_beta0 = []
         kept_beta1 = []
@@ -1015,7 +1114,14 @@ class CAHBUIPBase(BorrowingMethod):
         if W0 <= 1e-8 or Wh <= 1e-8 or amount <= 1e-10:
             return 1.0
         denom = max(W0 * max(sigma2_hist, 1e-8), 1e-8)
-        return float(1.0 + amount * max(sigma2_ctrl, 1e-8) / denom)
+        try:
+            import config as _cfg
+
+            max_rn = float(getattr(_cfg, "MAX_ESS", 1e4))
+        except Exception:
+            max_rn = 1e4
+        gain = 1.0 + amount * max(sigma2_ctrl, 1e-8) / denom
+        return float(np.clip(gain, 1.0, max_rn))
 
     # ------------------------------------------------------------------
     # Local MAP approximation and Gibbs sampler
@@ -1295,5 +1401,3 @@ class CAHB_UIP_SLD(CAHBUIPBase):
 
 
 __all__ = ["AllocationResult", "KBCD", "CAHB", "CAHB_UIP_IPD", "CAHB_UIP_SLD"]
-
-

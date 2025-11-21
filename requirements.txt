@@ -1,4 +1,4 @@
-# Requirements for CAHB-PP Simulation Study
+# Requirements for CAHB-UIP Simulation Study
 # ==========================================
 #
 # Core computational libraries for adaptive randomization simulation,
@@ -30,7 +30,7 @@ seaborn>=0.11.0,<1.0.0        # Statistical visualization and color palettes
 # --------------------------------
 joblib>=1.0.0,<2.0.0          # Parallel execution and checkpointing
 tqdm>=4.62.0,<5.0.0           # Progress bars for monitoring simulations
-numba>=0.56.0                 # Accelerate CAHB-PP sampling kernels
+numba>=0.56.0                 # Accelerate CAHB-UIP sampling kernels
 
 # Optional: Performance and Development
 # ---------------------------------------

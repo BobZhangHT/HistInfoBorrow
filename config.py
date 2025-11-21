@@ -1,20 +1,20 @@
 """
 config.py
 
-Configuration file for the CAHB-PP simulation study.
+Configuration file for the CAHB-UIP simulation study.
 
 This module centralizes all simulation parameters, scenario definitions, prior
 specifications, and file paths for the Covariate-Adjusted Historical Borrowing
-with Power Prior (CAHB-PP) simulation study as described in the manuscript.
+with Unit Information Prior (CAHB-UIP) simulation study as described in the manuscript.
 
 The simulation framework evaluates four covariate-adaptive randomization methods:
-    - CAHB-PP-IPD: Proposed method with local power prior discount (IPD access)
-    - CAHB-PP-SLD: Proposed method with summary-level discount
+    - CAHB-UIP-IPD: Proposed method with individual-patient historical data
+    - CAHB-UIP-SLD: Proposed method for summary-level historical borrowing
     - CAHB: Jin et al. (2023) - SIM paper
     - KBCD: Jiang et al. (2018) - kernel-based biased coin design
 
 References:
-    - CAHB-PP manuscript (references/CAHB_PP(2).pdf)
+    - CAHB-UIP manuscript (references/CAHB_UIP.pdf)
     - Jin et al. (2023): Statistics in Medicine (references/2023_SIM_CAHB.pdf)
     - Jiang et al. (2018): KBCD paper (references/KBCD.pdf)
 """
@@ -87,18 +87,18 @@ BATCH_SIZE = 100
 # Methods to evaluate in the simulation study
 # Each method name must correspond to a class in methods.py
 METHODS_TO_RUN = [
-    'CAHB_PP_IPD',  # Proposed method with IPD-driven discounting
-    'CAHB_PP_SLD',  # Proposed method using summary-level historical borrowing
-    'CAHB',         # Jin et al. (2023) - baseline borrowing method
-    'KBCD',         # Jiang et al. (2018) - no borrowing benchmark
+    'CAHB_UIP_IPD',  # Proposed method with IPD-driven borrowing
+    'CAHB_UIP_SLD',  # Proposed method using summary-level historical borrowing
+    'CAHB',          # Jin et al. (2023) - baseline borrowing method
+    'KBCD',          # Jiang et al. (2018) - no borrowing benchmark
 ]
 
 # Method display names for tables and figures
 METHOD_LABELS = {
-    'CAHB_PP_IPD': 'CAHB-PP-IPD',
-    'CAHB_PP_SLD': 'CAHB-PP-SLD',
-    'CAHB': 'CAHB (Jin et al. 2023)',
-    'KBCD': 'KBCD (Jiang et al. 2018)',
+    'CAHB_UIP_IPD': 'CAHB-UIP-IPD',
+    'CAHB_UIP_SLD': 'CAHB-UIP-SLD',
+    'CAHB': 'CAHB',
+    'KBCD': 'KBCD',
 }
 
 # =============================================================================
@@ -121,24 +121,23 @@ RAW_DATA_DIR = os.path.join(RESULTS_DIR, 'raw_data')
 # =============================================================================
 
 PRIORS = {
-    # Inverse-Gamma priors for variance parameters
-    # Chosen to be weakly informative
-    'variance_ig_a': 2.0,     # IG shape parameter (alpha)
-    'variance_ig_b': 1.0,     # IG scale parameter (beta)
-    
-    # Power prior discount parameter a(x) ~ Beta(a_beta_a, a_beta_b)
-    # Beta(1,1) = Uniform[0,1] prior for CAHB-PP
-    'a_beta_a': 1.0,          # Beta prior shape parameter (alpha)
-    'a_beta_b': 1.0,          # Beta prior shape parameter (beta)
-    'bridge_schedule': (0.0, 0.5, 1.0),
-    'bridge_samples': 64,
-    'bridge_burn_in': 32,
-    'bridge_thin': 1,
-    'bridge_step_size': 0.12,
-    
+    # Inverse-Gamma priors for variance parameters (weakly informative)
+    'variance_ig_a': 1e-3,     # IG shape parameter (alpha)
+    'variance_ig_b': 1e-3,     # IG scale parameter (beta)
+
+    # CAHB-UIP hyperparameters
+    'uip_gamma_alpha': 2.0,    # Prior shape for the amount parameter M(x)
+    'uip_coord_iter': 100,      # Max coordinate-ascent iterations
+    'uip_coord_tol': 1e-4,     # Convergence tolerance for coordinate-ascent
+    'post_gibbs_iter': 1500,    # Gibbs iterations per evaluation point
+    'post_gibbs_burn': 500,    # Burn-in draws per evaluation point
+
     # CAHB tuning parameter (Jin et al. 2023, Section 4)
     # Controls borrowing strength via compatibility measure
-    'cahb_gamma': np.sqrt(3.0)  # gamma = sqrt(3)
+    'cahb_gamma': np.sqrt(3.0),  # gamma = sqrt(3)
+    'cahb_lambda': 300.0,         # lambda_2 baseline (use 300*log n)
+    'cahb_lambda_quantile': 0.10,  # lambda_1 quantile (Algorithm 2)
+    'cahb_invgam2': 1.0/3.0,        # 1/gamma^2 term in Eq. (9), gamma=sqrt(3)
 }
 
 # =============================================================================
@@ -174,20 +173,20 @@ def delta0_constant_bias(_: np.ndarray) -> float:
 
 
 def delta0_subgroup_bias(x: np.ndarray) -> float:
-    """Scenario bias function: 0.6 mean shift when the 4th covariate equals 2."""
+    """Scenario bias: 0.6 shift for the high-risk region (X4 > 1)."""
     x_arr = np.asarray(x).ravel()
     if x_arr.size <= 3:
         return 0.0
-    return 0.6 if x_arr[3] == 2 else 0.0
+    return 0.6 if x_arr[3] > 1.0 else 0.0
 
 
 def get_scenario_definitions():
     """
     Generates the full factorial grid of simulation scenarios.
     
-    The simulation study evaluates 32 scenarios resulting from the factorial
+    The simulation study evaluates 16 scenarios resulting from the factorial
     combination of:
-        - Current trial sample sizes: n ∈ {200, 400}
+        - Current trial sample sizes: n ∈ {200}
         - Historical trial sample sizes: n_h ∈ {400, 800}
         - Base treatment effects: tau_0 ∈ {0.0, 0.4}
         - Data generating mechanisms: S1, S2, S3, S4
@@ -216,7 +215,7 @@ def get_scenario_definitions():
     
     Returns:
         list[dict]: List of scenario dictionaries, each containing:
-            - id: Unique scenario identifier (0 to 31)
+            - id: Unique scenario identifier (0 to 15)
             - name: Human-readable scenario name
             - n: Current trial sample size
             - n_h: Historical trial sample size
@@ -232,31 +231,31 @@ def get_scenario_definitions():
     """
     
     # Factorial design grid
-    n_list = [200, 400]              # Current trial sample sizes
+    n_list = [200]                   # Current trial sample sizes
     n_h_list = [400, 800]            # Historical trial sample sizes  
     tau_0_list = [0.0, 0.4]          # Base treatment effects
     
     # Data-generating mechanism specifications (Section 3.2)
     scenario_params = {
         'S1': {
-            'Delta_0_func': delta0_no_bias,           # No historical bias
-            'kappa': 1.0,                             # Homoscedastic variance
+            'Delta_0_func': delta0_no_bias,
+            'kappa_values': [1.0],
             'description': 'Ideal: no bias, homoscedastic'
         },
         'S2': {
-            'Delta_0_func': delta0_no_bias,           # No historical bias
-            'kappa': 1.3,                             # Variance heterogeneity
+            'Delta_0_func': delta0_no_bias,
+            'kappa_values': [0.7, 1.3],
             'description': 'Variance mismatch only'
         },
         'S3': {
-            'Delta_0_func': delta0_constant_bias,     # Constant mean shift
-            'kappa': 1.3,                             # Variance heterogeneity
+            'Delta_0_func': delta0_constant_bias,
+            'kappa_values': [0.7, 1.3],
             'description': 'Constant bias + variance mismatch'
         },
         'S4': {
-            'Delta_0_func': delta0_subgroup_bias,     # Subgroup-specific bias
-            'kappa': 1.3,                                   # Variance heterogeneity
-            'description': 'Local bias (X4=2 subgroup)'
+            'Delta_0_func': delta0_subgroup_bias,
+            'kappa_values': [1.3],
+            'description': 'Local bias (X4>1 region)'
         }
     }
     
@@ -269,19 +268,19 @@ def get_scenario_definitions():
             for tau_0 in tau_0_list:
                 for s_name in ['S1', 'S2', 'S3', 'S4']:  # Ordered for consistency
                     s_params = scenario_params[s_name]
-                    
-                    scenarios.append({
-                        'id': scenario_id,
-                        'name': f"n={n}_nh={n_h}_tau0={tau_0}_{s_name}",
-                        'n': n,
-                        'n_h': n_h,
-                        'tau_0': tau_0,
-                        'kappa': s_params['kappa'],
-                        'Delta_0_func': s_params['Delta_0_func'],
-                        'scenario_type': s_name,
-                        'description': s_params['description']
-                    })
-                    scenario_id += 1
+                    for kappa in s_params['kappa_values']:
+                        scenarios.append({
+                            'id': scenario_id,
+                            'name': f"n={n}_nh={n_h}_tau0={tau_0}_{s_name}_kappa={kappa}",
+                            'n': n,
+                            'n_h': n_h,
+                            'tau_0': tau_0,
+                            'kappa': kappa,
+                            'Delta_0_func': s_params['Delta_0_func'],
+                            'scenario_type': s_name,
+                            'description': s_params['description']
+                        })
+                        scenario_id += 1
     
     return scenarios
 
@@ -330,10 +329,6 @@ def validate_config():
         os.makedirs(RESULTS_DIR, exist_ok=True)
     except OSError as e:
         warnings.warn(f"Cannot create results directory: {e}", UserWarning)
-    
-    # Validate prior parameters
-    if PRIORS['a_beta_a'] <= 0 or PRIORS['a_beta_b'] <= 0:
-        raise ValueError("Beta prior parameters must be positive")
     
     # Print configuration summary
     n_sims = get_total_simulations()

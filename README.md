@@ -1,22 +1,28 @@
-# CAHB-PP: Covariate-Adjusted Historical Borrowing with Power Prior
+# CAHB-UIP: Covariate-Adjusted Historical Borrowing with Unit Information Prior
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Simulation study code for **"Covariate-Adjusted Historical Borrowing with Power Prior (CAHB-PP)"** - a novel adaptive randomization method for clinical trials with historical control data.
+Simulation study code for **"Covariate-Adjusted Historical Borrowing with Unit Information Prior (CAHB-UIP)"** — a variance-aware adaptive randomization method for clinical trials with historical control information.
 
 ## Overview
 
-This repository implements the simulation study evaluating four covariate-adaptive randomization methods:
+This repository implements the sequential design described in the CAHB-UIP manuscript. Four covariate-adaptive allocation rules are compared:
 
-1. **CAHB-PP-IPD** *(Proposed)*: Bridge-sampled local power-prior discounting using individual-level historical data
-2. **CAHB-PP-SLD** *(Proposed)*: Summary-level discounting for sites without IPD access
-3. **CAHB**: Covariate-adjusted historical borrowing (Jin et al., 2023)
-4. **KBCD**: Kernel-based biased coin design - no borrowing benchmark (Jiang et al., 2018)
+1. **CAHB-UIP-IPD** *(Proposed)* — Variance-aware borrowing that uses individual-patient historical data and the variance-aware unit information prior.
+2. **CAHB-UIP-SLD** *(Proposed)* — Same framework but consuming only study-level summaries of the historical controls.
+3. **CAHB (Jin et al., 2023)** — Baseline covariate-adjusted borrowing with commensurability priors.
+4. **KBCD (Jiang et al., 2018)** — Kernel-based biased coin design with no historical borrowing.
 
 ### Key Innovation
 
-CAHB-PP introduces a **local, data-driven discount parameter** (x) ∈ [0,1] learned via bridge sampling + Metropolis–Hastings updates. The sampler adaptively tunes borrowing strength based on the compatibility between historical and current control data at each covariate value x, automatically down-weighting incompatible sources and preserving subgroup robustness.
+CAHB-UIP decouples the concurrent-control variance from the historical-control variance and introduces a **Gamma-distributed amount parameter** \(M(x)\) that measures how many *units of normalized Fisher information* can be borrowed at covariate profile \(x\). The framework:
+
+- Updates \( \mu_0(x), \sigma^2_{0,c}(x), \sigma^2_{0,h}(x), M(x) \) via the variance-aware coordinate-ascent Algorithm 1.
+- Computes the local CECCS gain \(R_n(x) = 1 + M(x)\sigma^2_{0,c}(x)/(W_0(x)\sigma^2_{0,h}(x))\) and drives adaptive allocation through Algorithm 2.
+- Runs a Gibbs sampler (Algorithm 3) for final inference, providing posterior draws of the individualized treatment effect functions.
+
+The SLD variant swaps the IPD kernel-weighted quantities \(W_h, \bar{Y}_h, SS_h\) with the global summary triple \((n_h, \hat{\mu}_h, V_h)\) while retaining the same conjugate updates.
 
 ## Installation
 
@@ -29,12 +35,12 @@ CAHB-PP introduces a **local, data-driven discount parameter** (x) ∈ [0,1] le
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/CAHB-PP.git
-cd CAHB-PP
+git clone https://github.com/yourusername/CAHB-UIP.git
+cd CAHB-UIP
 
 # Create virtual environment (recommended)
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
@@ -44,136 +50,108 @@ pip install -r requirements.txt
 
 ### Run Complete Simulation Study
 
-`ash
+```bash
 python main.py
-`
+```
 
-This will:
-- Run 1,000 replicates per (scenario × method) combination
-- Execute in parallel using all available CPU cores
-- Cache results for resumability
-- Generate tables and plots in 
-esults/
+This runs 1,000 replicates per (scenario × method) combination, executes in parallel with all available CPU cores, checkpoints intermediate results, and creates publication-ready tables/plots under `results/`.
 
 ### Fast Demo Mode
 
-Enable a lightweight run (default 50 replicates) without editing the code:
-
 ```bash
 python main.py --demo
+python main.py --demo --reset  # delete cache first
 ```
 
-Add `--reset` to delete `.simulation_cache/` before running (works for both demo and full modes):
+Environment variables `CAHB_FAST_DEMO=1` and `CAHB_FAST_DEMO_REPS=<N>` provide the same switches. Use `python main.py --full` to force the publication-sized run even when demo flags are set.
 
-```bash
-python main.py --demo --reset   # fast mode, starting fresh
-python main.py --reset          # full run from scratch
-```
+### Resume / Reset
 
-Alternatively, set an environment variable before running:
-
-```bash
-# Linux/macOS
-export CAHB_FAST_DEMO=1
-python main.py
-
-# Windows PowerShell
-$env:CAHB_FAST_DEMO = 1
-python main.py
-```
-
-Override the replicate count via `CAHB_FAST_DEMO_REPS` (e.g., set to 10 for smoke tests). Use `python main.py --full` to force the publication-size run even if a demo flag/environment variable is set.
-
-### Resume Interrupted Run
-
-Simply rerun - the checkpoint system will skip completed replicates:
-`ash
-python main.py
-`
-
-### Force Fresh Run
-
-`ash
-# Linux/macOS
-rm -rf .simulation_cache/
-python main.py
-
-# Windows PowerShell
-Remove-Item -Recurse -Force .simulation_cache
-python main.py
-`
+- Rerun `python main.py` to resume from cached replicates.
+- Remove `.simulation_cache/` (or use `--reset`) to start from scratch.
 
 ## Project Structure
 
 ```
-CAHB-PP/
+CAHB-UIP/
 ├── config.py               # Simulation configuration and scenarios
 ├── data_generation.py      # Data generating mechanisms (DGMs)
-├── methods.py              # Implementation of all methods
+├── methods.py              # Implementation of CAHB-UIP, CAHB, KBCD
 ├── analysis.py             # Results processing and visualization
 ├── main.py                 # Main orchestration script
+├── single_test.py          # Deterministic single-replication harness
 ├── requirements.txt        # Python dependencies
-├── LICENSE                 # MIT License
 └── README.md               # This file
 ```
 
 ## Simulation Design
 
-The simulation evaluates **32 scenarios** from a full factorial design:
-- **Current sample size** (`n`): 200, 400
-- **Historical sample size** (`n_h`): 400, 800
-- **Base treatment effect** (`tau_0`): 0.0 (Type I error), 0.4 (Power)
-- **Data generating mechanisms**: S1 (ideal), S2 (variance mismatch), S3 (constant bias), S4 (subgroup-specific bias)
+The simulation evaluates **32 scenarios** produced by the factorial combination:
+
+- Current sample size (`n`): 200, 400
+- Historical sample size (`n_h`): 400, 800
+- Base treatment effect (`tau_0`): 0.0 (Type I error) or 0.4 (Power)
+- Generating mechanisms: S1 (ideal), S2 (variance mismatch), S3 (constant bias), S4 (subgroup bias)
 
 ### Evaluation Metrics
 
 - **Estimation**: Bias, RMSE, Coverage, CI Width
-- **Decision**: Type I Error (`tau_0 = 0`), Power (`tau_0 = 0.4`)
-- **Allocation**: Treatment allocation rate
+- **Decision**: Type I error (`tau_0 = 0`), Power (`tau_0 = 0.4`)
+- **Allocation**: Treatment allocation rate and CECCS trajectories
 
 ## Methods Implemented
 
-### CAHB-PP-IPD (Proposed)
-Bridge sampling + Metropolis–Hastings draws (x) using the full historical individual patient data and the local compatibility likelihood. The sampled discounts feed both allocation (R_n(x)) and inference to provide fully adaptive borrowing.
+### CAHB-UIP-IPD (Proposed)
 
-### CAHB-PP-SLD (Proposed)
-Uses the same bridge sampler but replaces the IPD likelihood with summary-level strata (defined by key covariates), enabling trials to borrow from partners that can share only aggregated information.
+Implements Algorithms 1–3 from the CAHB-UIP paper. The method:
+
+- Fits local kernel statistics for \(W_0, \bar{Y}_0, W_h, \bar{Y}_h, SS\) at each covariate profile.
+- Runs the variance-aware coordinate-ascent updates for \(\mu_0, \sigma^2_{0,c}, \sigma^2_{0,h}, M\) until convergence.
+- Computes the CECCS gain \(R_n(x)\) to bias future assignments toward the informationally weaker arm.
+- Performs a local Gibbs sampler for \(\{\mu_0(x), \mu_1(x)\}\) to obtain posterior draws for inference.
+
+### CAHB-UIP-SLD (Proposed)
+
+Applies the same UIP machinery when only study-level historical summaries are available. The kernel-based historical sufficient statistics are replaced with the global triple \((n_h, \hat{\mu}_h, V_h)\), yielding a conjugate Gaussian/Gamma update without IPD access.
 
 ### CAHB (Jin et al., 2023)
-Sample size inflation R_n(x) based on posterior precision with compatibility measure τ_n(x); no stochastic discounting.
+
+Baseline covariate-adjusted borrowing with commensurability priors that operate on the concurrent control precision.
 
 ### KBCD (Jiang et al., 2018)
-No-borrowing benchmark using kernel-based covariate-adaptive allocation.
+
+Kernel-based biased coin design that balances local sample sizes without borrowing historical data.
 
 ## Output Files
 
 ### Tables (`results/tables/`)
-- `simulation_summary.csv` – Full metric dump
-- `estimation_metrics.csv / .tex` – Publication-ready Bias/RMSE/Coverage/CI-width table
-- `type_i_error_power.tex` – Scenario-level decision summaries
+
+- `simulation_summary.csv` — Full metric dump.
+- `estimation_metrics.csv/.tex` — Bias/RMSE/Coverage summaries.
+- `type_i_error_power.tex` — Scenario-level decision summaries.
 
 ### Plots (`results/plots/`)
-- `type_power_curves.pdf` – Type I error & power vs. enrolled sample size (two subplots with 95% CIs)
-- `allocation_dynamics.pdf` – Average treatment allocation and `R_n(X)` trajectories under adaptive assignment
-- `calibration_discount.pdf` – Discount calibration (`a(x)`) vs. sample size across scenarios
 
-All plots are publication-ready (PDF, 300 DPI, Times New Roman font).
+- `type_power_curves.pdf` — Type I error & power trajectories.
+- `allocation_dynamics.pdf` — Average treatment allocation and CECCS gain trajectories.
+- `calibration_discount.pdf` — Posterior summaries of the UIP amount parameter \(M(x)\) across covariates.
 
-## Configuration
+All figures are PDF (300 DPI, Times New Roman) and ready for publication.
 
-Key parameters in `config.py`:
-- `N_REPLICATES = 1000` - Number of replicates per scenario
-- `N_JOBS = -1` - CPU cores (-1 = all available)
-- `USE_CACHE = True` - Enable checkpointing
-- `METHODS_TO_RUN` - List of methods to compare
+## Configuration Highlights
+
+Key parameters live in `config.py`:
+
+- `N_REPLICATES`, `N_JOBS`, `USE_CACHE`
+- `METHODS_TO_RUN` and `METHOD_LABELS`
+- `PRIORS` (variance IG hyperparameters, UIP Gamma prior, Gibbs settings)
+- Scenario definitions and bias functions (`delta0_*`)
 
 ## Citation
 
-If you use this code in your research, please cite:
-
 ```bibtex
-@article{cahb-pp2024,
-  title={Covariate-Adjusted Historical Borrowing with Power Prior for Adaptive Randomization},
+@article{cahb-uip2024,
+  title={Covariate-Adjusted Historical Borrowing with Unit Information Prior},
   author={[Authors]},
   journal={[Journal]},
   year={2024}
@@ -182,7 +160,4 @@ If you use this code in your research, please cite:
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-**Last Updated**: October 2025
+This project is licensed under the MIT License — see [LICENSE](LICENSE).
