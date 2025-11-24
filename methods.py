@@ -112,6 +112,8 @@ def _compute_local_stats(
     bandwidth: np.ndarray,
 ) -> LocalStats:
     weights = _gaussian_kernel_weights(x_eval, X_ref, bandwidth)
+    # Guard against NaN/inf in kernel weights to avoid invalid reductions
+    weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
     weight_sum = weights.sum()
     if weight_sum <= 1e-8 or values is None:
         return LocalStats(weight=float(weight_sum), mean=np.nan, variance=np.nan)
@@ -132,18 +134,81 @@ def _delta_summary(delta_samples: np.ndarray, alpha: float) -> Tuple[float, floa
     """
     Summarize posterior samples of the treatment effect.
     
-    Uses empirical quantiles for credible intervals and empirical probability.
+    Following R Codes/util_ana.R CI.fn (lines 1-10):
+    Uses standard error method for credible intervals:
+    - mean = mean(samples)
+    - se = sd(samples) / sqrt(n)
+    - CI = [mean - 1.96*se, mean + 1.96*se]
+    
+    NOTE: This function is currently not used. All methods (CAHB, KBCD, CAHB-UIP)
+    now use _delta_summary_quantile instead. Kept for reference.
     """
     delta_samples = np.asarray(delta_samples, dtype=float)
     mask = np.isfinite(delta_samples)
     draws = delta_samples[mask]
     if draws.size == 0:
         return np.nan, np.nan, np.nan, 0.5
+    
+    # Compute mean (R code line 2: m.v <- mean(errs))
     mean = float(np.mean(draws))
+    
     if draws.size < 2:
         return mean, np.nan, np.nan, float(np.mean(draws > 0.0))
-    ci_low, ci_high = np.quantile(draws, [alpha / 2.0, 1.0 - alpha / 2.0])
+    
+    # Compute standard deviation (R code line 3: sd.v <- sd(errs))
+    sd_v = float(np.std(draws, ddof=1))  # Use ddof=1 to match R's sd() function
+    
+    # Compute standard error (R code line 4: se <- sd.v/sqrt(length(errs)))
+    n = len(draws)
+    se = sd_v / np.sqrt(n)
+    
+    # Compute 95% confidence interval using 1.96 (R code lines 5-6)
+    # Note: R code uses 1.96 for 95% CI, which corresponds to alpha=0.05
+    # For general alpha, we use z = norm.ppf(1 - alpha/2)
+    if alpha == 0.05:
+        z = 1.96  # Match R code exactly
+    else:
+        z = norm.ppf(1.0 - alpha / 2.0)
+    
+    ci_low = mean - z * se  # R code line 5: low <- m.v - 1.96*se
+    ci_high = mean + z * se  # R code line 6: up <- m.v + 1.96*se
+    
+    # Compute posterior probability (R code util_ana.R post.fn: prob <- mean(trts > dlt0))
+    # Here we use dlt0=0 to compute P(delta > 0)
     prob = float(np.mean(draws > 0.0))
+    
+    return mean, float(ci_low), float(ci_high), prob
+
+
+def _delta_summary_quantile(delta_samples: np.ndarray, alpha: float) -> Tuple[float, float, float, float]:
+    """
+    Summarize posterior samples of the treatment effect using quantile method.
+    
+    Uses empirical quantiles for credible intervals:
+    - mean = mean(samples)
+    - CI = [quantile(samples, alpha/2), quantile(samples, 1-alpha/2)]
+    - prob = P(delta > 0)
+    
+    This method is used for CAHB-UIP methods.
+    """
+    delta_samples = np.asarray(delta_samples, dtype=float)
+    mask = np.isfinite(delta_samples)
+    draws = delta_samples[mask]
+    if draws.size == 0:
+        return np.nan, np.nan, np.nan, 0.5
+    
+    # Compute mean
+    mean = float(np.mean(draws))
+    
+    if draws.size < 2:
+        return mean, np.nan, np.nan, float(np.mean(draws > 0.0))
+    
+    # Compute credible interval using empirical quantiles
+    ci_low, ci_high = np.quantile(draws, [alpha / 2.0, 1.0 - alpha / 2.0])
+    
+    # Compute posterior probability P(delta > 0)
+    prob = float(np.mean(draws > 0.0))
+    
     return mean, float(ci_low), float(ci_high), prob
 
 
@@ -327,7 +392,8 @@ class KBCD(BaseMethod):
         draws_arr = draws_arr[np.isfinite(draws_arr)]
         if draws_arr.size == 0:
             return np.nan, np.nan, np.nan, 0.5
-        return _delta_summary(draws_arr, self.alpha)
+        # KBCD uses bootstrap method, so use quantile for summary
+        return _delta_summary_quantile(draws_arr, self.alpha)
 
 
 class CAHB(BorrowingMethod):
@@ -444,6 +510,18 @@ class CAHB(BorrowingMethod):
         value = numerator / max(denominator, 1e-8)
         return float(np.sqrt(max(value, 1e-8)))
 
+    @staticmethod
+    def _opt_phi1(Y: np.ndarray, Z: np.ndarray, mu1: np.ndarray) -> float:
+        """Optimize phi1 (treatment group variance parameter)."""
+        Zs = Z
+        residuals = Y - mu1
+        a_hyper = 0.01
+        b_hyper = 0.01
+        numerator = 0.5 * np.dot(Zs, residuals ** 2) + b_hyper
+        denominator = 1.0 + a_hyper + 0.5 * np.sum(Zs)
+        value = numerator / max(denominator, 1e-8)
+        return float(np.sqrt(max(value, 1e-8)))
+
     def _m_opt_mu0(
         self,
         kernel_matrix: np.ndarray,
@@ -472,15 +550,44 @@ class CAHB(BorrowingMethod):
             Array of mu_0(X_i) values, shape (m,)
         """
         sZs = 1.0 - Z
+        n = len(Y)
+        
+        # Ensure tau and theta0 are arrays with correct shape
+        tau = np.asarray(tau, dtype=float)
+        if tau.ndim == 0:
+            tau = np.full(n, float(tau), dtype=float)
+        elif tau.shape[0] != n:
+            tau = np.full(n, float(tau[0]) if len(tau) > 0 else 0.0, dtype=float)
+        else:
+            tau = tau.ravel()
+        
+        theta0 = np.asarray(theta0, dtype=float)
+        if theta0.ndim == 0:
+            theta0 = np.full(n, float(theta0), dtype=float)
+        elif theta0.shape[0] != n:
+            theta0 = np.full(n, float(theta0[0]) if len(theta0) > 0 else 0.0, dtype=float)
+        else:
+            theta0 = theta0.ravel()
+        
         # Precision weights: W_i = 1/(2*phi0^2) + tau^2(X_i)/2 (R code line 406)
         Ws = 0.5 / (phi0 ** 2) + 0.5 * tau
+        
         # Weighted observations: M_i = Y_i/(2*phi0^2) + tau^2(X_i)*theta0(X_i)/2 (R code line 407)
         Ms = Y / (2.0 * phi0 ** 2) + 0.5 * tau * theta0
         
+        # Ensure Ms and Ws are 1D arrays
+        Ms = np.asarray(Ms, dtype=float).ravel()
+        Ws = np.asarray(Ws, dtype=float).ravel()
+        
         # Apply control group mask and kernel weights (R code line 408-409)
         weighted = kernel_matrix * sZs[:, None]
-        numerator = (weighted * Ms[:, None]).sum(axis=0)
-        denominator = (weighted * Ws[:, None]).sum(axis=0)
+        # Use nansum to handle NaN/inf values gracefully
+        numerator = np.nansum(weighted * Ms[:, None], axis=0)
+        denominator = np.nansum(weighted * Ws[:, None], axis=0)
+        
+        # Replace NaN results with 0 (occurs when all values are NaN)
+        numerator = np.nan_to_num(numerator, nan=0.0, posinf=0.0, neginf=0.0)
+        denominator = np.nan_to_num(denominator, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Compute mu_0 = sum(K*sZ*M) / sum(K*sZ*W) (R code line 410)
         mu0 = np.zeros_like(numerator)
@@ -488,6 +595,73 @@ class CAHB(BorrowingMethod):
         mu0[mask] = numerator[mask] / denominator[mask]
         mu0[~mask] = 0.0
         return mu0
+
+    def _m_opt_mu1(
+        self,
+        kernel_matrix: np.ndarray,
+        Y: np.ndarray,
+        Z: np.ndarray,
+        invsigma2: float,
+        phi1: float,
+        theta1: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Optimize mu_1(x) at each observation location.
+        
+        Following utils.R lines 324-355 (mOptMu1):
+        Computes weighted local regression estimate combining current treatment data
+        and historical information via precision-weighted average.
+        
+        Args:
+            kernel_matrix: K(X_i, X_j) matrix, shape (n, m)
+            Y: Observed outcomes
+            Z: Treatment indicators
+            invsigma2: 1/sigma^2 (historical precision)
+            phi1: Current phi_1 estimate (observation noise)
+            theta1: Historical predictions for treatment group
+            
+        Returns:
+            Array of mu_1(X_i) values, shape (m,)
+        """
+        Zs = Z
+        n = len(Y)
+        
+        # Precision weights: W_i = 1/(2*phi1^2) + invsigma2/2 (R code line 344)
+        Ws_scalar = 0.5 / (phi1 ** 2) + 0.5 * float(invsigma2)
+        Ws = np.full(n, Ws_scalar, dtype=float)
+        
+        # Weighted observations: M_i = Y_i/(2*phi1^2) + invsigma2*theta1(X_i)/2 (R code line 346)
+        # Ensure theta1 is an array with correct shape
+        theta1 = np.asarray(theta1, dtype=float)
+        if theta1.ndim == 0:
+            theta1 = np.full(n, float(theta1), dtype=float)
+        elif theta1.shape[0] != n:
+            theta1 = np.full(n, float(theta1[0]) if len(theta1) > 0 else 0.0, dtype=float)
+        else:
+            theta1 = theta1.ravel()
+        
+        Ms = Y / (2.0 * phi1 ** 2) + 0.5 * float(invsigma2) * theta1
+        
+        # Ensure Ms and Ws are 1D arrays
+        Ms = np.asarray(Ms, dtype=float).ravel()
+        Ws = np.asarray(Ws, dtype=float).ravel()
+        
+        # Apply treatment group mask and kernel weights (R code line 349)
+        weighted = kernel_matrix * Zs[:, None]
+        # Use nansum to handle NaN/inf values gracefully
+        numerator = np.nansum(weighted * Ms[:, None], axis=0)
+        denominator = np.nansum(weighted * Ws[:, None], axis=0)
+        
+        # Replace NaN results with 0 (occurs when all values are NaN)
+        numerator = np.nan_to_num(numerator, nan=0.0, posinf=0.0, neginf=0.0)
+        denominator = np.nan_to_num(denominator, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Compute mu_1 = sum(K*Z*M) / sum(K*Z*W) (R code line 350)
+        mu1 = np.zeros_like(numerator)
+        mask = denominator > 1e-8
+        mu1[mask] = numerator[mask] / denominator[mask]
+        mu1[~mask] = 0.0
+        return mu1
 
     def _m_opt_tau(
         self,
@@ -523,10 +697,15 @@ class CAHB(BorrowingMethod):
         weighted = kernel_matrix * sZs[:, None]
         
         # Numerator: weighted sum of kernel weights (R code line 466)
-        numerator = (weighted).sum(axis=0)
+        # Use nansum to handle NaN/inf values gracefully
+        numerator = np.nansum(weighted, axis=0)
         
         # Denominator: weighted sum of squared differences + prior variance term (R code line 468)
-        denominator = (weighted * diff_sq[:, None]).sum(axis=0) + self.invgam2
+        denominator = np.nansum(weighted * diff_sq[:, None], axis=0) + self.invgam2
+        
+        # Replace NaN results with 0 (occurs when all values are NaN)
+        numerator = np.nan_to_num(numerator, nan=0.0, posinf=0.0, neginf=0.0)
+        denominator = np.nan_to_num(denominator, nan=0.0, posinf=0.0, neginf=0.0)
         
         # Raw tau^2 estimate (R code line 469)
         tau_raw = numerator / np.maximum(denominator, 1e-8)
@@ -609,6 +788,76 @@ class CAHB(BorrowingMethod):
             "tau": tau,
             "tau_raw": tau_raw_latest,
             "phi0": phi0,
+        }
+
+    def _fit_mu1_model(
+        self,
+        X_curr: np.ndarray,
+        Y_curr: np.ndarray,
+        Z_curr: np.ndarray,
+        invsigma2: float = 0.0,
+    ) -> Optional[dict]:
+        """
+        Fit mu1 model via coordinate-wise optimization.
+        
+        Following utils.R lines 690-727 (mu1.info.est.fn):
+        Iteratively optimize mu_1 and phi_1 until convergence.
+        
+        Args:
+            X_curr: Current trial covariates, shape (n, p)
+            Y_curr: Current trial outcomes, shape (n,)
+            Z_curr: Current trial treatment indicators, shape (n,)
+            invsigma2: 1/sigma^2 (historical precision, default 0 for no borrowing)
+            
+        Returns:
+            Dictionary containing fitted parameters, or None if insufficient treatment data
+        """
+        X_curr = _as_2d(X_curr)
+        Y_curr = np.asarray(Y_curr, dtype=float)
+        Z_curr = np.asarray(Z_curr, dtype=float)
+        
+        # Check if we have sufficient treatment group data
+        if Z_curr.sum() < 2:
+            return None
+        
+        # Compute kernel matrix components
+        _, cov_inv, log_norm = self._kernel_components(X_curr)
+        kernel_matrix = self._kernel_matrix(X_curr, X_curr, cov_inv, log_norm)
+        
+        # Get historical predictions theta_1(X_i) for treatment group
+        # Note: In R code, Theta1s is estimated from historical data
+        # For now, we use kernel mean from historical data
+        theta1 = self._kernel_mean(self.X_h, self.Y_h, self.h_hist, X_curr)
+        
+        # Initialize
+        phi1 = 1.0
+        mu1_prev = None
+        phi1_prev = None
+        
+        for iter_idx in range(self.max_iter):
+            mu1 = self._m_opt_mu1(kernel_matrix, Y_curr, Z_curr, invsigma2, phi1, theta1)
+            phi1 = self._opt_phi1(Y_curr, Z_curr, mu1)
+            
+            if mu1_prev is not None and phi1_prev is not None:
+                err_mu = np.sum((mu1 - mu1_prev) ** 2)
+                err_phi1 = (phi1 - phi1_prev) ** 2
+                if max(err_mu, err_phi1) < 1e-5:
+                    break
+            
+            mu1_prev = mu1
+            phi1_prev = phi1
+        
+        return {
+            "X": X_curr,
+            "Y": Y_curr,
+            "Z": Z_curr,
+            "cov_inv": cov_inv,
+            "log_norm": log_norm,
+            "kernel_matrix": kernel_matrix,
+            "theta1": theta1,
+            "mu1": mu1,
+            "phi1": phi1,
+            "invsigma2": invsigma2,
         }
 
     def _select_lambda_trunc(
@@ -736,65 +985,206 @@ class CAHB(BorrowingMethod):
         tau_val = self._tau_at_x(context, x_eval)
         return float(np.clip(1.0 + tau_val, 1.0, 1e4))
 
-    def _posterior_mu0(self, context: dict, x_eval: np.ndarray) -> float:
-        weights = self._kernel_vector(x_eval, context["X"], context["cov_inv"], context["log_norm"])
-        control_weights = context["sZs"] * weights
-        denominator = np.dot(control_weights, (1.0 / context["phi0_sq"]) + context["tau"])
-        if denominator <= 1e-8:
-            return float(self._kernel_mean(
-                context["X"][context["Z"] == 0],
-                context["Y"][context["Z"] == 0],
-                _silverman_bandwidth(context["X"][context["Z"] == 0]),
-                x_eval.reshape(1, -1),
-            )[0])
-        numerator = np.dot(
-            control_weights,
-            (context["Y"] / context["phi0_sq"]) + context["tau"] * context["theta0"],
-        )
-        return float(numerator / denominator)
+    def _posterior_mu0_mean(self, context: dict, X_eval: np.ndarray) -> np.ndarray:
+        """
+        Calculate posterior mean of mu0(X) following utils.R post.mean.mu0.fn (lines 562-595).
+        
+        Formula: num/den where
+        num = sum(sZs*mks*(YMat/phi0^2 + tau2Mat*theta0Mat))
+        den = sum(sZs*mks*(1/phi0^2 + tau2Mat))
+        """
+        xs = _as_2d(X_eval)
+        m = xs.shape[0]
+        p = xs.shape[1]
+        Xs = context["X"]
+        n = Xs.shape[0]
+        sZs = context["sZs"]
+        Y = context["Y"]
+        phi0_sq = context["phi0_sq"]
+        tau = context["tau"]
+        theta0 = context["theta0"]
+        
+        # Compute kernel matrix: mks[i, j] = K(Xs[i], xs[j])
+        # _kernel_matrix(X_eval, X_ref, ...) returns (n_ref, n_eval) = (n, m)
+        mks = self._kernel_matrix(xs, Xs, context["cov_inv"], context["log_norm"])  # shape (n, m)
+        
+        # Expand arrays for broadcasting
+        # Note: tau is already tau^2 (from _m_opt_tau which returns tau^2)
+        tau2Mat = np.tile(tau[:, None], (1, m))  # shape (n, m) - tau^2 values
+        sZsMat = np.tile(sZs[:, None], (1, m))  # shape (n, m)
+        YMat = np.tile(Y[:, None], (1, m))  # shape (n, m)
+        theta0Mat = np.tile(theta0[:, None], (1, m))  # shape (n, m)
+        
+        # Compute numerator and denominator (R code lines 586-587)
+        # den = sum(sZs*mks*(1/phi0^2 + tau2Mat))
+        # Use nansum to handle NaN/inf values gracefully
+        den = np.nansum(sZsMat * mks * (1.0 / phi0_sq + tau2Mat), axis=0)  # shape (m,)
+        # num = sum(sZs*mks*(YMat/phi0^2 + tau2Mat*theta0Mat))
+        num = np.nansum(sZsMat * mks * (YMat / phi0_sq + tau2Mat * theta0Mat), axis=0)  # shape (m,)
+        
+        # Replace NaN results with 0 (occurs when all values are NaN)
+        den = np.nan_to_num(den, nan=0.0, posinf=0.0, neginf=0.0)
+        num = np.nan_to_num(num, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Handle edge cases
+        mask = den > 1e-8
+        result = np.zeros(m)
+        result[mask] = num[mask] / den[mask]
+        result[~mask] = 0.0
+        
+        # Always return array, even for single point
+        return result
 
-    def _posterior_mu0_variance(self, context: dict, x_eval: np.ndarray) -> float:
-        weights = self._kernel_vector(x_eval, context["X"], context["cov_inv"], context["log_norm"])
-        control_weights = context["sZs"] * weights
-        precision_terms = (1.0 / context["phi0_sq"]) + context["tau"]
-        denom = np.dot(control_weights, precision_terms)
-        if denom <= 1e-8:
-            return np.inf
-        return float(1.0 / max(denom, 1e-8))
+    def _posterior_mu0_variance(self, context: dict, X_eval: np.ndarray) -> np.ndarray:
+        """
+        Calculate posterior variance of mu0(X) following utils.R post.var.mu0.fn (lines 531-559).
+        
+        Formula: 1 / sum(sZs*mks*(1/phi0^2 + tau2Mat))
+        """
+        xs = _as_2d(X_eval)
+        m = xs.shape[0]
+        Xs = context["X"]
+        n = Xs.shape[0]
+        sZs = context["sZs"]
+        phi0_sq = context["phi0_sq"]
+        tau = context["tau"]
+        
+        # Compute kernel matrix: mks[i, j] = K(Xs[i], xs[j])
+        # _kernel_matrix(X_eval, X_ref, ...) returns (n_ref, n_eval) = (n, m)
+        mks = self._kernel_matrix(xs, Xs, context["cov_inv"], context["log_norm"])  # shape (n, m)
+        
+        # Expand arrays for broadcasting
+        # Note: tau is already tau^2 (from _m_opt_tau which returns tau^2)
+        tau2Mat = np.tile(tau[:, None], (1, m))  # shape (n, m) - tau^2 values
+        sZsMat = np.tile(sZs[:, None], (1, m))  # shape (n, m)
+        
+        # Compute denominator (R code line 552)
+        # rv = sum(sZs*mks*(1/phi0^2 + tau2Mat))
+        # Use nansum to handle NaN/inf values gracefully
+        rv = np.nansum(sZsMat * mks * (1.0 / phi0_sq + tau2Mat), axis=0)  # shape (m,)
+        
+        # Replace NaN results with 0 (occurs when all values are NaN)
+        rv = np.nan_to_num(rv, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Return variance = 1/precision
+        # Cap variance to prevent extremely large values that cause wide CIs
+        result = np.zeros(m)
+        mask = rv > 1e-8
+        result[mask] = 1.0 / rv[mask]
+        # Cap variance at a reasonable maximum to prevent extremely wide CIs
+        # Use a conservative cap: 10 times the observation variance
+        # This prevents extreme values that cause wide CIs while still allowing reasonable uncertainty
+        max_var = 10.0 * phi0_sq  # Cap at 10 times observation variance
+        result = np.minimum(result, max_var)
+        result[~mask] = max_var  # Use capped variance instead of inf
+        
+        # Always return array, even for single point
+        return result
 
     def _posterior_mu0_stats(self, context: dict, X_eval: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        xs = _as_2d(X_eval)
-        means = np.zeros(xs.shape[0])
-        variances = np.zeros(xs.shape[0])
-        for idx, x in enumerate(xs):
-            means[idx] = self._posterior_mu0(context, x)
-            variances[idx] = self._posterior_mu0_variance(context, x)
+        """Calculate posterior mean and variance of mu0(X)."""
+        means = self._posterior_mu0_mean(context, X_eval)
+        variances = self._posterior_mu0_variance(context, X_eval)
         return means, variances
 
-    def _posterior_mu1_stats(
-        self, context: dict, X_eval: np.ndarray, Y: np.ndarray, Z: np.ndarray
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    def _posterior_mu1_mean(self, context: dict, X_eval: np.ndarray) -> np.ndarray:
+        """
+        Calculate posterior mean of mu1(X) following utils.R post.mean.mu1.fn (lines 778-810).
+        
+        Formula: num/den where
+        num = sum(ZsMat*mks*(YsMat/phi1^2 + theta1Mat*invsigma2))
+        den = sum(ZsMat*mks*(1/phi1^2 + invsigma2))
+        """
         xs = _as_2d(X_eval)
-        mask = Z > 0.5
-        if mask.sum() < 2:
+        m = xs.shape[0]
+        Xs = context["X"]
+        n = Xs.shape[0]
+        Zs = context["Z"]
+        Y = context["Y"]
+        phi1 = context["phi1"]
+        phi1_sq = phi1 ** 2
+        invsigma2 = context["invsigma2"]
+        theta1 = context["theta1"]
+        
+        # Compute kernel matrix: mks[i, j] = K(Xs[i], xs[j])
+        # _kernel_matrix(X_eval, X_ref, ...) returns (n_ref, n_eval) = (n, m)
+        mks = self._kernel_matrix(xs, Xs, context["cov_inv"], context["log_norm"])  # shape (n, m)
+        
+        # Expand arrays for broadcasting
+        ZsMat = np.tile(Zs[:, None], (1, m))  # shape (n, m)
+        YsMat = np.tile(Y[:, None], (1, m))  # shape (n, m)
+        theta1Mat = np.tile(theta1[:, None], (1, m))  # shape (n, m)
+        
+        # Compute numerator and denominator (R code lines 801-802)
+        # Use nansum to handle NaN/inf values gracefully
+        den = np.nansum(ZsMat * mks * (1.0 / phi1_sq + invsigma2), axis=0)  # shape (m,)
+        num = np.nansum(ZsMat * mks * (YsMat / phi1_sq + theta1Mat * invsigma2), axis=0)  # shape (m,)
+        
+        # Replace NaN results with 0 (occurs when all values are NaN)
+        den = np.nan_to_num(den, nan=0.0, posinf=0.0, neginf=0.0)
+        num = np.nan_to_num(num, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Handle edge cases
+        mask = den > 1e-8
+        result = np.zeros(m)
+        result[mask] = num[mask] / den[mask]
+        result[~mask] = 0.0
+        
+        # Always return array, even for single point
+        return result
+
+    def _posterior_mu1_variance(self, context: dict, X_eval: np.ndarray) -> np.ndarray:
+        """
+        Calculate posterior variance of mu1(X) following utils.R post.var.mu1.fn (lines 748-775).
+        
+        Formula: 1 / sum(ZsMat*mks*(1/phi1^2 + invsigma2))
+        """
+        xs = _as_2d(X_eval)
+        m = xs.shape[0]
+        Xs = context["X"]
+        n = Xs.shape[0]
+        Zs = context["Z"]
+        phi1 = context["phi1"]
+        phi1_sq = phi1 ** 2
+        invsigma2 = context["invsigma2"]
+        
+        # Compute kernel matrix: mks[i, j] = K(Xs[i], xs[j])
+        # _kernel_matrix(X_eval, X_ref, ...) returns (n_ref, n_eval) = (n, m)
+        mks = self._kernel_matrix(xs, Xs, context["cov_inv"], context["log_norm"])  # shape (n, m)
+        
+        # Expand arrays for broadcasting
+        ZsMat = np.tile(Zs[:, None], (1, m))  # shape (n, m)
+        
+        # Compute denominator (R code line 768)
+        # Use nansum to handle NaN/inf values gracefully
+        rv = np.nansum(ZsMat * mks * (1.0 / phi1_sq + invsigma2), axis=0)  # shape (m,)
+        
+        # Replace NaN results with 0 (occurs when all values are NaN)
+        rv = np.nan_to_num(rv, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Return variance = 1/precision
+        # Cap variance to prevent extremely large values that cause wide CIs
+        result = np.zeros(m)
+        mask = rv > 1e-8
+        result[mask] = 1.0 / rv[mask]
+        # Cap variance at a reasonable maximum to prevent extremely wide CIs
+        # Use a conservative cap: 10 times the observation variance
+        # This prevents extreme values that cause wide CIs while still allowing reasonable uncertainty
+        max_var = 10.0 * phi1_sq  # Cap at 10 times observation variance (use phi1, not phi0)
+        result = np.minimum(result, max_var)
+        result[~mask] = max_var  # Use capped variance instead of inf
+        
+        # Always return array, even for single point
+        return result
+
+    def _posterior_mu1_stats(
+        self, context: dict, X_eval: np.ndarray
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Calculate posterior mean and variance of mu1(X)."""
+        if context["Z"].sum() < 2:
             return None, None
-        X_trt = context["X"][mask]
-        Y_trt = context["Y"][mask]
-        bandwidth = self._kernel_bandwidth(X_trt)
-        means = np.zeros(xs.shape[0])
-        variances = np.zeros(xs.shape[0])
-        for idx, x in enumerate(xs):
-            w = self._gaussian_kernel(x, X_trt, bandwidth)
-            w_sum = float(np.sum(w))
-            if w_sum <= 1e-8:
-                means[idx] = float(np.mean(Y_trt))
-                variances[idx] = np.inf
-                continue
-            m = float(np.dot(w, Y_trt) / w_sum)
-            resid = Y_trt - m
-            local_var = float(np.dot(w, resid**2) / max(w_sum, 1e-8))
-            means[idx] = m
-            variances[idx] = max(local_var / max(w_sum, 1e-8), 1e-8)
+        means = self._posterior_mu1_mean(context, X_eval)
+        variances = self._posterior_mu1_variance(context, X_eval)
         return means, variances
 
     @staticmethod
@@ -820,30 +1210,98 @@ class CAHB(BorrowingMethod):
         return AllocationResult(pi_treatment=pi, diagnostics={"R_n": R_n})
 
     def estimate_treatment_effect(self, X, Y, Z):
+        """
+        Estimate treatment effect using bootstrap method to improve CI coverage.
+        
+        Bootstrap procedure:
+        1. Fit CAHB model on original data to get mu0 and mu1 estimates
+        2. Compute delta_vals = mu1 - mu0 at all data points
+        3. For each bootstrap iteration:
+           - Resample data with replacement
+           - Refit CAHB model on bootstrap sample
+           - Compute mu0_bs and mu1_bs
+           - Compute delta_bs = mean(mu1_bs - mu0_bs)
+        4. Summarize bootstrap samples using quantile method
+        """
         X = _as_2d(X)
         Y = np.asarray(Y, dtype=float)
         Z = np.asarray(Z, dtype=int)
+        
         if (Z == 0).sum() < 2 or (Z == 1).sum() < 2:
             delta = float(Y[Z == 1].mean() - Y[Z == 0].mean())
             return delta, np.nan, np.nan, 0.5
-        context = self._fit_cahb_model(X, Y, Z)
-        if context is None:
+        
+        # Fit CAHB model on original data
+        context_mu0 = self._fit_cahb_model(X, Y, Z)
+        if context_mu0 is None:
             delta = float(Y[Z == 1].mean() - Y[Z == 0].mean())
             return delta, np.nan, np.nan, 0.5
-        mu0_mean, mu0_var = self._posterior_mu0_stats(context, X)
-        mu1_stats = self._posterior_mu1_stats(context, X, Y, Z)
-        if mu1_stats[0] is None:
+        
+        # Fit mu1 model
+        context_mu1 = self._fit_mu1_model(X, Y, Z, invsigma2=0.0)
+        if context_mu1 is None:
             delta = float(Y[Z == 1].mean() - Y[Z == 0].mean())
             return delta, np.nan, np.nan, 0.5
-        mu1_mean, mu1_var = mu1_stats
+        
+        # Compute treatment effect estimates at all data points
+        mu0_est = self._posterior_mu0_mean(context_mu0, X)
+        mu1_est = self._posterior_mu1_mean(context_mu1, X)
+        delta_vals = mu1_est - mu0_est
+        
+        if np.all(~np.isfinite(delta_vals)):
+            delta = float(Y[Z == 1].mean() - Y[Z == 0].mean())
+            return delta, np.nan, np.nan, 0.5
+        
+        # Bootstrap to approximate sampling distribution of ATE
         draws = []
-        sd0 = np.sqrt(np.maximum(mu0_var, 1e-8))
-        sd1 = np.sqrt(np.maximum(mu1_var, 1e-8))
+        n = len(delta_vals)
+        
         for _ in range(self.posterior_draws):
-            mu0_samples = np.random.normal(mu0_mean, sd0)
-            mu1_samples = np.random.normal(mu1_mean, sd1)
-            draws.append(float(np.mean(mu1_samples - mu0_samples)))
-        return _delta_summary(np.asarray(draws), self.alpha)
+            # Resample with replacement
+            idx = np.random.randint(0, n, n)
+            X_bs = X[idx]
+            Y_bs = Y[idx]
+            Z_bs = Z[idx]
+            
+            if (Z_bs == 0).sum() < 2 or (Z_bs == 1).sum() < 2:
+                # Fallback to simple mean difference if insufficient groups
+                delta_bs = float(Y_bs[Z_bs == 1].mean() - Y_bs[Z_bs == 0].mean())
+                draws.append(delta_bs)
+                continue
+            
+            # Refit CAHB model on bootstrap sample
+            context_mu0_bs = self._fit_cahb_model(X_bs, Y_bs, Z_bs)
+            if context_mu0_bs is None:
+                delta_bs = float(Y_bs[Z_bs == 1].mean() - Y_bs[Z_bs == 0].mean())
+                draws.append(delta_bs)
+                continue
+            
+            context_mu1_bs = self._fit_mu1_model(X_bs, Y_bs, Z_bs, invsigma2=0.0)
+            if context_mu1_bs is None:
+                delta_bs = float(Y_bs[Z_bs == 1].mean() - Y_bs[Z_bs == 0].mean())
+                draws.append(delta_bs)
+                continue
+            
+            # Compute treatment effect estimates on bootstrap sample
+            mu0_bs = self._posterior_mu0_mean(context_mu0_bs, X_bs)
+            mu1_bs = self._posterior_mu1_mean(context_mu1_bs, X_bs)
+            delta_bs_vals = mu1_bs - mu0_bs
+            
+            if np.all(~np.isfinite(delta_bs_vals)):
+                draws.append(np.nan)
+            else:
+                # Average treatment effect across all data points
+                draws.append(float(np.nanmean(delta_bs_vals)))
+        
+        draws_arr = np.asarray(draws, dtype=float)
+        draws_arr = draws_arr[np.isfinite(draws_arr)]
+        
+        if draws_arr.size == 0:
+            delta = float(Y[Z == 1].mean() - Y[Z == 0].mean())
+            return delta, np.nan, np.nan, 0.5
+        
+        # Use quantile method for CAHB bootstrap inference
+        return _delta_summary_quantile(draws_arr, self.alpha)
 
 
 # ==============================================================================
@@ -866,7 +1324,8 @@ class CAHBUIPBase(BorrowingMethod):
         self.coord_max_iter = int(priors.get("uip_coord_iter", 50))
         self.post_gibbs_iter = int(priors.get("post_gibbs_iter", 400))
         self.post_gibbs_burn = int(priors.get("post_gibbs_burn", 200))
-        self.beta1_prior_scale = float(priors.get("beta1_prior_scale", 1e6))
+        # For UIP-IPD, prior precision on beta1 is Identity (scale=1) per paper.
+        self.beta1_prior_scale = float(priors.get("beta1_prior_scale", 1.0))
         self._amount_cache = []
         self._calibration_payload = []
         try:
@@ -892,6 +1351,17 @@ class CAHBUIPBase(BorrowingMethod):
         X = _as_2d(X)
         intercept = np.ones((X.shape[0], 1), dtype=float)
         return np.hstack([intercept, X])
+
+    def _beta0_prior_precision(self, feature_dim: int) -> np.ndarray:
+        """Weak prior precision on beta0 (default: none)."""
+        return np.zeros((feature_dim, feature_dim))
+
+    def _beta1_prior_precision(self, feature_dim: int, sigma2_1: float) -> np.ndarray:
+        """
+        Gaussian prior precision for beta1.
+        UIP-IPD target: V1^{-1} = X1^T X1 / sigma1^2 + I, so prior precision = I.
+        """
+        return np.eye(feature_dim) / max(self.beta1_prior_scale, 1e-8)
 
     @staticmethod
     def _stable_inverse(matrix: np.ndarray, ridge: float = 1e-8) -> np.ndarray:
@@ -999,8 +1469,7 @@ class CAHBUIPBase(BorrowingMethod):
         M = max(hist_summary["W_h"], 1e-6)
 
         ridge = 1e-8 * np.eye(feature_dim)
-        prior_reg = np.eye(feature_dim) / max(self.beta1_prior_scale, 1e-8)
-        prior_reg[0, 0] = 0.0  # leave intercept noninformative (centered covariates)
+        prior0 = self._beta0_prior_precision(feature_dim)
 
         kept_beta0 = []
         kept_beta1 = []
@@ -1015,7 +1484,7 @@ class CAHBUIPBase(BorrowingMethod):
             # beta0 update
             prec0 = (X0.T @ X0) / max(sigma2_0c, 1e-8)
             prec_hist = (M / max(sigma2_0h, 1e-8)) * hist_summary["S_h"]
-            V0_inv = prec0 + prec_hist + ridge
+            V0_inv = prec0 + prec_hist + ridge + prior0
             V0 = self._stable_inverse(V0_inv)
             V0 = 0.5 * (V0 + V0.T)
             mean0 = V0 @ (
@@ -1044,11 +1513,12 @@ class CAHBUIPBase(BorrowingMethod):
 
             # beta1 update
             XtX = X1.T @ X1
-            post_prec = XtX + prior_reg
+            prior_reg = self._beta1_prior_precision(feature_dim, sigma2_1)
+            post_prec = XtX / max(sigma2_1, 1e-8) + prior_reg
             V1 = self._stable_inverse(post_prec)
             V1 = 0.5 * (V1 + V1.T)
-            mean1 = V1 @ (X1.T @ y1)
-            beta1 = np.random.multivariate_normal(mean1, sigma2_1 * V1)
+            mean1 = V1 @ ((X1.T @ y1) / max(sigma2_1, 1e-8))
+            beta1 = np.random.multivariate_normal(mean1, V1)
 
             # sigma1^2 update
             resid1 = y1 - X1 @ beta1
@@ -1282,7 +1752,8 @@ class CAHBUIPBase(BorrowingMethod):
         amount_summary = {"mean": mean_M, "ci_low": ci_low, "ci_high": ci_high, "gain": np.nan}
         self._amount_cache = [amount_summary for _ in range(X.shape[0])]
         self._record_calibration_samples(X)
-        return _delta_summary(delta_draws, self.alpha)
+        # Use quantile method for CAHB-UIP inference
+        return _delta_summary_quantile(delta_draws, self.alpha)
 
     def _record_calibration_samples(self, X: np.ndarray):
         X = _as_2d(X)
@@ -1332,6 +1803,9 @@ class CAHB_UIP_SLD(CAHBUIPBase):
         y = np.asarray(self.Y_h, dtype=float)
         self._sld_n = float(len(y))
         self._summary_weight = 1.0
+        # Vague prior scale for non-intercept coefficients (slopes)
+        self.slope_prior_scale = float(priors.get("sld_beta1_prior_scale", 1e6))
+        self.beta0_slope_scale = float(priors.get("sld_beta0_prior_scale", 10.0))
         psi_shape = self._design_matrix(self.X_h).shape[1]
         self._summary_mean = 0.0
         self._summary_var = 1.0
@@ -1374,6 +1848,27 @@ class CAHB_UIP_SLD(CAHBUIPBase):
         center = np.mean(X, axis=0, keepdims=True)
         self._current_center = center
         return X - center
+
+    def _prior_precision_matrix(self, feature_dim: int) -> np.ndarray:  # pylint: disable=arguments-differ
+        prior_reg = np.eye(feature_dim) / max(self.slope_prior_scale, 1e-8)
+        prior_reg[0, 0] = 0.0  # intercept left noninformative; slopes vague
+        return prior_reg
+
+    def _beta0_prior_precision(self, feature_dim: int) -> np.ndarray:  # pylint: disable=arguments-differ
+        """Weakly informative prior for beta0 slopes: N(0, (10)^2 I)."""
+        prior_reg = np.zeros((feature_dim, feature_dim))
+        if feature_dim > 1:
+            slope_prec = 1.0 / max(self.beta0_slope_scale ** 2, 1e-8)
+            for j in range(1, feature_dim):
+                prior_reg[j, j] = slope_prec
+        return prior_reg
+
+    def _beta1_prior_precision(self, feature_dim: int, sigma2_1: float) -> np.ndarray:
+        """
+        Gaussian prior precision for beta1.
+        UIP-IPD target: V1^{-1} = X1^T X1 / sigma1^2 + I, so prior precision = I.
+        """
+        return np.eye(feature_dim) / max(self.beta1_prior_scale, 1e-8)
 
     def _historical_summary(self, feature_dim: int, X_curr: np.ndarray) -> Optional[dict]:
         if self._sld_n <= 1e-8:

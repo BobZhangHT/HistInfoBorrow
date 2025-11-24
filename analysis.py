@@ -437,12 +437,12 @@ def generate_plots(results_obj: dict):
     method_labels = getattr(config, 'METHOD_LABELS', {})
 
     scenario_order = [
-        ('S1', 1.0, r'S1 $\\kappa$=1.0'),
-        ('S2', 0.7, r'S2 $\\kappa$=0.7'),
-        ('S2', 1.3, r'S2 $\\kappa$=1.3'),
-        ('S3', 0.7, r'S3 $\\kappa$=0.7'),
-        ('S3', 1.3, r'S3 $\\kappa$=1.3'),
-        ('S4', 1.3, r'S4 $\\kappa$=1.3'),
+        ('S1', 1.0, r'S1 $\kappa$=1.0'),
+        ('S2', 0.7, r'S2 $\kappa$=0.7'),
+        ('S2', 1.3, r'S2 $\kappa$=1.3'),
+        ('S3', 0.7, r'S3 $\kappa$=0.7'),
+        ('S3', 1.3, r'S3 $\kappa$=1.3'),
+        ('S4', 1.3, r'S4 $\kappa$=1.3'),
     ]
     label_order = [s[2] for s in scenario_order]
     label_map = {(stype, float(kappa)): label for stype, kappa, label in scenario_order}
@@ -551,7 +551,7 @@ def generate_plots(results_obj: dict):
         for ax, (n_val, nh_val) in zip(axes_flat, combos):
             subset = metric_df[(metric_df['n'] == n_val) & (metric_df['n_h'] == nh_val)]
             _draw_box(ax, subset, metric_col, methods_for_plot, ylabel)
-            ax.set_title(rf"n={int(n_val)}, $n_h$={int(nh_val)}")
+            ax.set_title(rf"$n$={int(n_val)}, $n_h$={int(nh_val)}")
         for ax in axes_flat[len(combos):]:
             ax.set_visible(False)
         if legend_methods:
@@ -583,8 +583,66 @@ def generate_plots(results_obj: dict):
     rn_df = _prepare_metric('R_n', rn_methods)
     m_df = _prepare_metric('M', m_methods)
 
-    _plot_metric(rn_df, rn_methods, 'R_n', r'Median $R_n(\\mathbf{X})$', 'rn_box')
-    _plot_metric(m_df, m_methods, 'M', r'Median $M(\\mathbf{X})$', 'm_box')
+    _plot_metric(rn_df, rn_methods, 'R_n', r'Median $R_n(\mathbf{X})$', 'rn_box')
+    _plot_metric(m_df, m_methods, 'M', r'Median $M(\mathbf{X})$', 'm_box')
+
+    def _plot_s4_borrowing(raw_alloc: pd.DataFrame):
+        subset = raw_alloc[raw_alloc['scenario_type'] == 'S4'].copy()
+        if subset.empty:
+            return
+        needed_cols = {'x4', 'R_n', 'method', 'replicate_id', 'n', 'n_h'}
+        if not needed_cols.issubset(subset.columns):
+            return
+        methods_focus = ['CAHB', 'CAHB_UIP_IPD', 'CAHB_UIP_SLD']
+        subset = subset[subset['method'].isin(methods_focus)]
+        if subset.empty:
+            return
+        subset['stratum'] = np.where(subset['x4'] > 1.0, 'X4>1', 'X4<=1')
+        group_cols = ['n', 'n_h', 'method', 'replicate_id', 'stratum']
+        agg = (
+            subset.groupby(group_cols, as_index=False)['R_n']
+            .median()
+        )
+        combos = sorted({(int(r.n), int(r.n_h)) for r in agg[['n', 'n_h']].dropna().itertuples(index=False)})
+        if not combos:
+            return
+        ncols = len(combos)
+        fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 4), sharey=True)
+        axes = np.atleast_1d(axes)
+        for ax, (n_val, nh_val) in zip(axes, combos):
+            panel = agg[(agg['n'] == n_val) & (agg['n_h'] == nh_val)]
+            if panel.empty:
+                ax.set_visible(False)
+                continue
+            palette = {m: colors.get(m, 'gray') for m in methods_focus}
+            sns.boxplot(
+                data=panel,
+                x='stratum',
+                y='R_n',
+                hue='method',
+                order=['X4<=1', 'X4>1'],
+                hue_order=[m for m in methods_focus if m in panel['method'].unique()],
+                palette=palette,
+                ax=ax,
+                linewidth=0.8,
+                fliersize=2.5,
+            )
+            if ax.legend_:
+                ax.legend_.remove()
+            ax.set_xlabel('Stratum')
+            ax.set_ylabel(r'Median $R_n(\mathbf{X})$')
+            ax.set_title(rf"$n$={n_val}, $n_h$={nh_val}")
+        plot_methods = [m for m in methods_focus if m in agg['method'].unique()]
+        handles = _method_handles(plot_methods)
+        if handles:
+            fig.legend(handles, [_label(m) for m in plot_methods], loc='lower center', ncol=len(plot_methods), frameon=False)
+        fig.tight_layout(rect=(0, 0.08, 1, 1))
+        out_path = os.path.join(config.PLOTS_DIR, 's4_borrowing_box.pdf')
+        fig.savefig(out_path)
+        plt.close(fig)
+        print(f"[+] Saved S4 borrowing stratified plot: {out_path}")
+
+    _plot_s4_borrowing(alloc_df)
 
     print(f"[+] All plots saved to: {config.PLOTS_DIR}")
 
