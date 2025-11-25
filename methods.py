@@ -233,7 +233,10 @@ class BaseMethod:
             self.alpha = 0.05
         self.name = "Base"
         try:
-            self.posterior_draws = int(priors.get("posterior_draws", 200))
+            bootstrap_default = priors.get("bootstrap_iterations")
+            if bootstrap_default is None:
+                bootstrap_default = priors.get("posterior_draws", 200)
+            self.posterior_draws = int(bootstrap_default)
         except Exception:
             self.posterior_draws = 200
 

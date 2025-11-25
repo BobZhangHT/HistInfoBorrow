@@ -124,6 +124,8 @@ PRIORS = {
     # Inverse-Gamma priors for variance parameters (weakly informative)
     'variance_ig_a': 1e-3,     # IG shape parameter (alpha)
     'variance_ig_b': 1e-3,     # IG scale parameter (beta)
+    # Bootstrap iterations for methods that rely on resampling (CAHB, KBCD)
+    'bootstrap_iterations': 500,
 
     # CAHB-UIP hyperparameters
     'uip_gamma_alpha': 2.0,    # Prior shape for the amount parameter M(x)

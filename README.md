@@ -1,74 +1,83 @@
 # CAHB-UIP: Covariate-Adjusted Historical Borrowing with Unit Information Prior
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Simulation study code for **"Covariate-Adjusted Historical Borrowing with Unit Information Prior (CAHB-UIP)"** — a variance-aware adaptive randomization method for clinical trials with historical control information.
+Simulation study code for **Covariate-Adjusted Historical Borrowing with Unit Information Prior (CAHB-UIP)**—a variance-aware adaptive randomization design that borrows historical control information while guarding against incompatibility.
 
 ## Overview
 
-This repository implements the sequential design described in the CAHB-UIP manuscript. Four covariate-adaptive allocation rules are compared:
+Four covariate-adaptive allocation rules are implemented in `methods.py`:
 
-1. **CAHB-UIP-IPD** *(Proposed)* — Variance-aware borrowing that uses individual-patient historical data and the variance-aware unit information prior.
-2. **CAHB-UIP-SLD** *(Proposed)* — Same framework but consuming only study-level summaries of the historical controls.
-3. **CAHB (Jin et al., 2023)** — Baseline covariate-adjusted borrowing with commensurability priors.
-4. **KBCD (Jiang et al., 2018)** — Kernel-based biased coin design with no historical borrowing.
+1. **CAHB-UIP-IPD** (proposed): variance-aware borrowing with individual-patient historical data.  
+2. **CAHB-UIP-SLD** (proposed): same UIP framework using only study-level summaries \((n_h, \hat{\mu}_h, V_h)\).  
+3. **CAHB** (Jin et al., 2023): commensurability prior on concurrent-control precision.  
+4. **KBCD** (Jiang et al., 2018): kernel-based biased coin design without borrowing.
 
-### Key Innovation
+Key model components follow the manuscript:
 
-CAHB-UIP decouples the concurrent-control variance from the historical-control variance and introduces a **Gamma-distributed amount parameter** \(M(x)\) that measures how many *units of normalized Fisher information* can be borrowed at covariate profile \(x\). The framework:
+$$
+Y_{z} \mid X \sim \mathcal{N}\!\big(\mu_z(X),\, \sigma_z^2(X)\big), \quad z \in \{0,1\}
+$$
 
-- Updates \( \mu_0(x), \sigma^2_{0,c}(x), \sigma^2_{0,h}(x), M(x) \) via the variance-aware coordinate-ascent Algorithm 1.
-- Computes the local CECCS gain \(R_n(x) = 1 + M(x)\sigma^2_{0,c}(x)/(W_0(x)\sigma^2_{0,h}(x))\) and drives adaptive allocation through Algorithm 2.
-- Runs a Gibbs sampler (Algorithm 3) for final inference, providing posterior draws of the individualized treatment effect functions.
+$$
+\mu_0(x) = b(x)^\top \beta_0,\qquad \tau(x) = \tau_0 + 0.5x_1 - 0.5x_3,\qquad \mu_1(x) = \mu_0(x) + \tau(x)
+$$
 
-The SLD variant swaps the IPD kernel-weighted quantities \(W_h, \bar{Y}_h, SS_h\) with the global summary triple \((n_h, \hat{\mu}_h, V_h)\) while retaining the same conjugate updates.
+CAHB-UIP introduces a Gamma-distributed amount parameter \(M(x)\) and separates the historical and concurrent control variances. The local CECCS gain driving randomization is
+
+$$
+R_n(x) = 1 + \frac{M(x)\,\sigma^2_{0,c}(x)}{W_0(x)\,\sigma^2_{0,h}(x)},
+$$
+
+where \(W_0(x)\) is the kernel-weighted effective sample size for the current control. Coordinate-ascent updates for \(\mu_0(x)\), \(\sigma^2_{0,c}(x)\), \(\sigma^2_{0,h}(x)\), and \(M(x)\) are followed by a Gibbs sampler for posterior draws of \(\{\mu_0(x), \mu_1(x)\}\).
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.8 or higher (tested on Python 3.9)
-- 8+ GB RAM recommended for parallel simulations
-
-### Setup
+- Python 3.8+ (tested on Python 3.9)
+- Recommended: 8+ GB RAM for parallel runs
 
 ```bash
-# Clone the repository
 git clone https://github.com/yourusername/CAHB-UIP.git
 cd CAHB-UIP
-
-# Create virtual environment (recommended)
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-
-# Install dependencies
+venv\Scripts\activate  # PowerShell
 pip install -r requirements.txt
 ```
 
-## Quick Start
+## Running Simulations
 
-### Run Complete Simulation Study
+- **Default (fast demo):** `python main.py` uses the current `config.py` setting `FAST_DEMO=1` with `FAST_DEMO_REPLICATES=10` for quick sanity checks. Results are cached under `simulation_cache/` and can be resumed automatically.  
+- **Force full study (1,000 reps):** `python main.py --full` or set `FAST_DEMO=0` in `config.py`.  
+- **Force demo regardless of config:** `python main.py --demo`.  
+- **Reset cache:** `python main.py --reset` (or delete `simulation_cache/`).
 
-```bash
-python main.py
-```
+## Simulation Design (matches `config.py`)
 
-This runs 1,000 replicates per (scenario × method) combination, executes in parallel with all available CPU cores, checkpoints intermediate results, and creates publication-ready tables/plots under `results/`.
+- Current sample size: \(n = 200\)  
+- Historical sample sizes: \(n_h \in \{400, 800\}\)  
+- Base treatment effect: \(\tau_0 \in \{0.0\ \text{(Type I)},\ 0.4\ \text{(Power)}\}\)  
+- Variance inflation for historical control: \(\kappa \in \{0.7, 1.0, 1.3\}\) depending on scenario  
+- Total scenarios: **24** (all combinations of \(n_h\), \(\tau_0\), scenario type, and \(\kappa\))
 
-### Fast Demo Mode
+Scenario-specific historical bias \(\Delta_0(x)\):
 
-```bash
-python main.py --demo
-python main.py --demo --reset  # delete cache first
-```
+- **S1 (ideal):** \(\Delta_0(x)=0,\ \kappa=1.0\)  
+- **S2 (variance mismatch):** \(\Delta_0(x)=0,\ \kappa\in\{0.7,1.3\}\)  
+- **S3 (constant bias):** \(\Delta_0(x)=0.4,\ \kappa\in\{0.7,1.3\}\)  
+- **S4 (subgroup bias):** \(\Delta_0(x)=0.6\,\mathbb{1}\{x_4>1\},\ \kappa=1.3\)
 
-Environment variables `CAHB_FAST_DEMO=1` and `CAHB_FAST_DEMO_REPS=<N>` provide the same switches. Use `python main.py --full` to force the publication-sized run even when demo flags are set.
+## Outputs
 
-### Resume / Reset
+- **Tables (`results/tables/`):** `estimation_metrics.csv`, `estimation_metrics.tex`, `type_i_error_power.tex` (Bias, RMSE, Coverage, CI width, Type I error, Power, allocation rate).  
+- **Plots (`results/plots/`):** Boxplots of \(R_n(\mathbf{X})\) and \(M(\mathbf{X})\) by \((n, n_h)\), plus subgroup borrowing diagnostics for S4 (`rn_box_*.pdf`, `m_box_*.pdf`, `s4_borrowing_box.pdf`).  
+- **Cache:** `simulation_cache/` stores replicate checkpoints for resumability.
 
-- Rerun `python main.py` to resume from cached replicates.
-- Remove `.simulation_cache/` (or use `--reset`) to start from scratch.
+## Configuration Notes (`config.py`)
+
+- `FAST_DEMO`, `FAST_DEMO_REPLICATES`, `FULL_RUN_REPLICATES`
+- Parallelism and memory: `N_JOBS`, `MAX_MEMORY_PER_JOB`, `BATCH_SIZE`, `USE_CACHE`
+- Priors and Gibbs settings: `PRIORS['uip_gamma_alpha']`, `uip_coord_iter`, `post_gibbs_iter`, etc.
+- Scenario grid: `get_scenario_definitions()` controls \(n_h\), \(\tau_0\), \(\kappa\), and \(\Delta_0(\cdot)\).
 
 ## Project Structure
 
@@ -84,80 +93,17 @@ CAHB-UIP/
 └── README.md               # This file
 ```
 
-## Simulation Design
-
-The simulation evaluates **32 scenarios** produced by the factorial combination:
-
-- Current sample size (`n`): 200, 400
-- Historical sample size (`n_h`): 400, 800
-- Base treatment effect (`tau_0`): 0.0 (Type I error) or 0.4 (Power)
-- Generating mechanisms: S1 (ideal), S2 (variance mismatch), S3 (constant bias), S4 (subgroup bias)
-
-### Evaluation Metrics
-
-- **Estimation**: Bias, RMSE, Coverage, CI Width
-- **Decision**: Type I error (`tau_0 = 0`), Power (`tau_0 = 0.4`)
-- **Allocation**: Treatment allocation rate and CECCS trajectories
-
-## Methods Implemented
-
-### CAHB-UIP-IPD (Proposed)
-
-Implements Algorithms 1–3 from the CAHB-UIP paper. The method:
-
-- Fits local kernel statistics for \(W_0, \bar{Y}_0, W_h, \bar{Y}_h, SS\) at each covariate profile.
-- Runs the variance-aware coordinate-ascent updates for \(\mu_0, \sigma^2_{0,c}, \sigma^2_{0,h}, M\) until convergence.
-- Computes the CECCS gain \(R_n(x)\) to bias future assignments toward the informationally weaker arm.
-- Performs a local Gibbs sampler for \(\{\mu_0(x), \mu_1(x)\}\) to obtain posterior draws for inference.
-
-### CAHB-UIP-SLD (Proposed)
-
-Applies the same UIP machinery when only study-level historical summaries are available. The kernel-based historical sufficient statistics are replaced with the global triple \((n_h, \hat{\mu}_h, V_h)\), yielding a conjugate Gaussian/Gamma update without IPD access.
-
-### CAHB (Jin et al., 2023)
-
-Baseline covariate-adjusted borrowing with commensurability priors that operate on the concurrent control precision.
-
-### KBCD (Jiang et al., 2018)
-
-Kernel-based biased coin design that balances local sample sizes without borrowing historical data.
-
-## Output Files
-
-### Tables (`results/tables/`)
-
-- `simulation_summary.csv` — Full metric dump.
-- `estimation_metrics.csv/.tex` — Bias/RMSE/Coverage summaries.
-- `type_i_error_power.tex` — Scenario-level decision summaries.
-
-### Plots (`results/plots/`)
-
-- `type_power_curves.pdf` — Type I error & power trajectories.
-- `allocation_dynamics.pdf` — Average treatment allocation and CECCS gain trajectories.
-- `calibration_discount.pdf` — Posterior summaries of the UIP amount parameter \(M(x)\) across covariates.
-
-All figures are PDF (300 DPI, Times New Roman) and ready for publication.
-
-## Configuration Highlights
-
-Key parameters live in `config.py`:
-
-- `N_REPLICATES`, `N_JOBS`, `USE_CACHE`
-- `METHODS_TO_RUN` and `METHOD_LABELS`
-- `PRIORS` (variance IG hyperparameters, UIP Gamma prior, Gibbs settings)
-- Scenario definitions and bias functions (`delta0_*`)
-
 ## Citation
 
 ```bibtex
 @article{cahb-uip2024,
-  title={Covariate-Adjusted Historical Borrowing with Unit Information Prior},
-  author={[Authors]},
-  journal={[Journal]},
-  year={2024}
+  title   = {Covariate-Adjusted Historical Borrowing with Unit Information Prior},
+  author  = {[Authors]},
+  journal = {[Journal]},
+  year    = {2024}
 }
 ```
 
 ## License
 
-This project is licensed under the MIT License — see [LICENSE](LICENSE).
+This project is licensed under the MIT License. See `LICENSE`.
