@@ -1,20 +1,20 @@
-"""
+﻿"""
 config.py
 
-Configuration file for the CAHB-UIP simulation study.
+Configuration file for the BRAVE simulation study.
 
 This module centralizes all simulation parameters, scenario definitions, prior
 specifications, and file paths for the Covariate-Adjusted Historical Borrowing
-with Unit Information Prior (CAHB-UIP) simulation study as described in the manuscript.
+with Unit Information Prior (BRAVE) simulation study as described in the manuscript.
 
 The simulation framework evaluates four covariate-adaptive randomization methods:
-    - CAHB-UIP-IPD: Proposed method with individual-patient historical data
-    - CAHB-UIP-SLD: Proposed method for summary-level historical borrowing
+    - BRAVE-IPD: Proposed method with individual-patient historical data
+    - BRAVE-SLD: Proposed method for summary-level historical borrowing
     - CAHB: Jin et al. (2023) - SIM paper
     - KBCD: Jiang et al. (2018) - kernel-based biased coin design
 
 References:
-    - CAHB-UIP manuscript (references/CAHB_UIP.pdf)
+    - BRAVE manuscript (references/BRAVE.pdf)
     - Jin et al. (2023): Statistics in Medicine (references/2023_SIM_CAHB.pdf)
     - Jiang et al. (2018): KBCD paper (references/KBCD.pdf)
 """
@@ -87,16 +87,16 @@ BATCH_SIZE = 100
 # Methods to evaluate in the simulation study
 # Each method name must correspond to a class in methods.py
 METHODS_TO_RUN = [
-    'CAHB_UIP_IPD',  # Proposed method with IPD-driven borrowing
-    'CAHB_UIP_SLD',  # Proposed method using summary-level historical borrowing
-    'CAHB',          # Jin et al. (2023) - baseline borrowing method
-    'KBCD',          # Jiang et al. (2018) - no borrowing benchmark
+    'BRAVE_IPD',  # Proposed method with IPD-driven borrowing
+    'BRAVE_SLD',  # Proposed method using summary-level historical borrowing
+    'CAHB',       # Jin et al. (2023) - baseline borrowing method
+    'KBCD',       # Jiang et al. (2018) - no borrowing benchmark
 ]
 
 # Method display names for tables and figures
 METHOD_LABELS = {
-    'CAHB_UIP_IPD': 'CAHB-UIP-IPD',
-    'CAHB_UIP_SLD': 'CAHB-UIP-SLD',
+    'BRAVE_IPD': 'BRAVE-IPD',
+    'BRAVE_SLD': 'BRAVE-SLD',
     'CAHB': 'CAHB',
     'KBCD': 'KBCD',
 }
@@ -127,7 +127,7 @@ PRIORS = {
     # Bootstrap iterations for methods that rely on resampling (CAHB, KBCD)
     'bootstrap_iterations': 500,
 
-    # CAHB-UIP hyperparameters
+    # BRAVE hyperparameters
     'uip_gamma_alpha': 2.0,    # Prior shape for the amount parameter M(x)
     'uip_coord_iter': 100,      # Max coordinate-ascent iterations
     'uip_coord_tol': 1e-4,     # Convergence tolerance for coordinate-ascent

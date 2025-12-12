@@ -1,4 +1,4 @@
-# Requirements for CAHB-UIP Simulation Study
+# Requirements for BRAVE Simulation Study
 # ==========================================
 #
 # Core computational libraries for adaptive randomization simulation,
@@ -8,8 +8,8 @@
 #   pip install -r requirements.txt
 #
 # Or with conda:
-#   conda create -n cahb-pp python=3.9
-#   conda activate cahb-pp
+#   conda create -n brave python=3.9
+#   conda activate brave
 #   pip install -r requirements.txt
 
 # Core Scientific Computing
@@ -30,7 +30,7 @@ seaborn>=0.11.0,<1.0.0        # Statistical visualization and color palettes
 # --------------------------------
 joblib>=1.0.0,<2.0.0          # Parallel execution and checkpointing
 tqdm>=4.62.0,<5.0.0           # Progress bars for monitoring simulations
-numba>=0.56.0                 # Accelerate CAHB-UIP sampling kernels
+numba>=0.56.0                 # Accelerate BRAVE sampling kernels
 
 # Optional: Performance and Development
 # ---------------------------------------

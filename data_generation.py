@@ -1,10 +1,10 @@
 """
 data_generation.py
 
-Data Generating Mechanisms (DGMs) for CAHB-UIP Simulation Study
+Data Generating Mechanisms (DGMs) for BRAVE Simulation Study
 
 This module implements the covariate and outcome generation processes described
-in Section 3.1 of the CAHB-UIP manuscript. It supports both:
+in Section 3.1 of the BRAVE manuscript. It supports both:
     1. Historical data generation (control-only, single-arm trials)
     2. Current trial data generation (adaptive two-arm randomized trials)
 
@@ -46,7 +46,7 @@ Historical data model:
     where Delta_0(X) represents historical bias (scenario-dependent)
 
 References:
-    CAHB-UIP manuscript Section 3.1 (references/CAHB_UIP.pdf)
+    BRAVE manuscript Section 3.1
 """
 
 import numpy as np

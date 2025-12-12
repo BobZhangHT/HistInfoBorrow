@@ -1,10 +1,10 @@
 ﻿"""
 methods.py
 
-Implementation of the covariate-adaptive methods used in the CAHB-UIP
-simulation study.  The code mirrors the notation in the CAHB-UIP paper and
-supplementary materials as well as the original authors' R reference
-implementation (`utils.R`).
+Implementation of the BRAVE (Bayesian Robust Adaptive Variance-Aware) design
+from the latest manuscript. This modernizes the previous BRAVE prototype
+with the Beta–Bernoulli robust mixture prior, variance-decoupled UIP borrowing,
+and the information-ratio driven allocation used throughout the paper.
 """
 
 from dataclasses import dataclass
@@ -13,7 +13,6 @@ import warnings
 
 import numpy as np
 from scipy.stats import norm
-from scipy.interpolate import CubicSpline
 
 try:
     from numba import njit
@@ -140,7 +139,7 @@ def _delta_summary(delta_samples: np.ndarray, alpha: float) -> Tuple[float, floa
     - se = sd(samples) / sqrt(n)
     - CI = [mean - 1.96*se, mean + 1.96*se]
     
-    NOTE: This function is currently not used. All methods (CAHB, KBCD, CAHB-UIP)
+    NOTE: This function is currently not used. All methods (CAHB, KBCD, BRAVE)
     now use _delta_summary_quantile instead. Kept for reference.
     """
     delta_samples = np.asarray(delta_samples, dtype=float)
@@ -189,7 +188,7 @@ def _delta_summary_quantile(delta_samples: np.ndarray, alpha: float) -> Tuple[fl
     - CI = [quantile(samples, alpha/2), quantile(samples, 1-alpha/2)]
     - prob = P(delta > 0)
     
-    This method is used for CAHB-UIP methods.
+    This method is used for BRAVE methods.
     """
     delta_samples = np.asarray(delta_samples, dtype=float)
     mask = np.isfinite(delta_samples)
@@ -1192,7 +1191,7 @@ class CAHB(BorrowingMethod):
 
     @staticmethod
     def _kernel_bandwidth(X: np.ndarray) -> np.ndarray:
-        """Helper for local kernel regressions (shared with CAHB-UIP variants)."""
+        """Helper for local kernel regressions (shared with BRAVE variants)."""
         if X.size == 0:
             return np.ones(X.shape[1] if X.ndim > 1 else 1)
         return _silverman_bandwidth(_as_2d(X))
@@ -1308,21 +1307,26 @@ class CAHB(BorrowingMethod):
 
 
 # ==============================================================================
-# CAHB-UIP: Variance-aware Unit Information Prior Borrowing
+# BRAVE: Bayesian Robust Variance-Aware Unit Information Prior Borrowing
 # ==============================================================================
 
 
-class CAHBUIPBase(BorrowingMethod):
-    """Variance-aware covariate-adjusted borrowing with the UIP framework."""
+class BRAVEBase(BorrowingMethod):
+    """Variance-aware covariate-adjusted borrowing with the BRAVE mixture UIP framework."""
 
-    method_label = "CAHB-UIP"
+    method_label = "BRAVE"
 
     def __init__(self, historical_data: dict, scenario_params: dict, priors: dict):
         super().__init__(historical_data, scenario_params, priors)
         self.name = self.method_label
         self.alpha0 = float(priors.get("ig_shape", 0.01))
         self.beta0 = float(priors.get("ig_scale", 0.01))
-        self.gamma_alpha = float(priors.get("uip_gamma_alpha", 2.0))
+        # Hyperparameters for the BRAVE robust mixture prior
+        self.gamma_a0 = float(priors.get("brave_gamma_a0", 1.0))
+        self.gamma_b0 = float(priors.get("brave_gamma_b0", 1.0))
+        # Amount parameter prior shape (alpha_M) with UIP default for backward compatibility
+        self.amount_shape = float(priors.get("brave_amount_shape", priors.get("uip_gamma_alpha", 2.0)))
+        self.robust_scale = float(priors.get("brave_robust_scale", 100.0))
         self.coord_tol = float(priors.get("uip_coord_tol", 1e-4))
         self.coord_max_iter = int(priors.get("uip_coord_iter", 50))
         self.post_gibbs_iter = int(priors.get("post_gibbs_iter", 400))
@@ -1331,6 +1335,10 @@ class CAHBUIPBase(BorrowingMethod):
         self.beta1_prior_scale = float(priors.get("beta1_prior_scale", 1.0))
         self._amount_cache = []
         self._calibration_payload = []
+        self._last_wL = 0.0
+        self._last_gamma = 0.5
+        self._posterior_M_mean = np.nan
+        self._posterior_wL_mean = np.nan
         try:
             import config as _cfg  # type: ignore
 
@@ -1374,6 +1382,37 @@ class CAHBUIPBase(BorrowingMethod):
             return np.linalg.inv(work)
         except np.linalg.LinAlgError:
             return np.linalg.pinv(work)
+
+    @staticmethod
+    def _log_mvn_density(vector: np.ndarray, mean: np.ndarray, precision: np.ndarray) -> float:
+        """Log-density of MVN with precision matrix for numerical stability."""
+        vec = np.asarray(vector, dtype=float).ravel()
+        mu = np.asarray(mean, dtype=float).ravel()
+        prec = np.asarray(precision, dtype=float)
+        diff = vec - mu
+        sign, logdet = np.linalg.slogdet(prec)
+        if sign <= 0:
+            return -np.inf
+        quad = float(diff.T @ (prec @ diff))
+        p = diff.size
+        return 0.5 * (logdet - quad - p * np.log(2.0 * np.pi))
+
+    @staticmethod
+    def _compat_weight(mu0: float, mu_hat: float, sigma2_0h: float, amount: float, gamma: float, robust_scale: float) -> float:
+        """Posterior responsibility w_L for local mixture prior."""
+        sigma2_0h = max(float(sigma2_0h), 1e-8)
+        amount = max(float(amount), 1e-8)
+        gamma = float(np.clip(gamma, 1e-6, 1.0 - 1e-6))
+        # Informative component
+        var_inf = sigma2_0h / amount
+        # Robust component
+        var_rob = sigma2_0h * max(robust_scale, 1.0)
+        f1 = norm.pdf(mu0, loc=mu_hat, scale=np.sqrt(var_inf))
+        f0 = norm.pdf(mu0, loc=mu_hat, scale=np.sqrt(var_rob))
+        denom = gamma * f1 + (1.0 - gamma) * f0
+        if denom <= 0.0:
+            return 0.0
+        return float(np.clip((gamma * f1) / denom, 0.0, 1.0))
 
     def _historical_summary(self, feature_dim: int, X_curr: np.ndarray) -> Optional[dict]:
         if self.X_h.size == 0:
@@ -1467,9 +1506,11 @@ class CAHBUIPBase(BorrowingMethod):
         beta1 = _ols(X1, y1)
         resid0 = y0 - X0 @ beta0
         sigma2_0c = float(max(np.var(resid0, ddof=1), 1e-3))
-        sigma2_0h = max(self._historical_ss(hist_summary, beta0), 1e-3)
+        sigma2_0h = float(max(self._historical_ss(hist_summary, beta0), 1e-3))
         sigma2_1 = float(max(np.var(y1 - X1 @ beta1, ddof=1), 1e-3))
         M = max(hist_summary["W_h"], 1e-6)
+        gamma = 0.5
+        L_state = 1
 
         ridge = 1e-8 * np.eye(feature_dim)
         prior0 = self._beta0_prior_precision(feature_dim)
@@ -1477,21 +1518,40 @@ class CAHBUIPBase(BorrowingMethod):
         kept_beta0 = []
         kept_beta1 = []
         kept_M = []
+        kept_wL = []
         delta_draws = []
 
         phi_all = design_all
         burn = max(0, int(burn_in))
         total_iter = max(n_iter, burn + 10)
+        robust_prec_base = np.eye(feature_dim)
+
+        fixed_sigma = hist_summary.get("fixed_sigma2", None)
+        amount_rate_prior = self._amount_prior_rate(hist_summary["W_h"])
+        beta_hat = hist_summary["beta_hat"]
+        S_h = hist_summary["S_h"]
+        q_h = hist_summary["q_h"]
 
         for it in range(total_iter):
+            # Compatibility weight and latent indicator
+            prec_inf = (M / max(sigma2_0h, 1e-8)) * S_h
+            prec_rob = robust_prec_base / max(self.robust_scale * sigma2_0h, 1e-8)
+            log_num = np.log(max(gamma, 1e-8)) + self._log_mvn_density(beta0, beta_hat, prec_inf)
+            log_den = np.logaddexp(log_num, np.log(max(1.0 - gamma, 1e-8)) + self._log_mvn_density(beta0, beta_hat, prec_rob))
+            w_L = float(np.exp(log_num - log_den))
+            L_state = np.random.binomial(1, np.clip(w_L, 0.0, 1.0))
+            gamma = float(np.random.beta(self.gamma_a0 + L_state, self.gamma_b0 + 1 - L_state))
+
+            # Prior precision for beta0 depends on L_state
+            prior_prec = prec_inf if L_state == 1 else prec_rob
+
             # beta0 update
             prec0 = (X0.T @ X0) / max(sigma2_0c, 1e-8)
-            prec_hist = (M / max(sigma2_0h, 1e-8)) * hist_summary["S_h"]
-            V0_inv = prec0 + prec_hist + ridge + prior0
+            V0_inv = prec0 + prior_prec + ridge + prior0
             V0 = self._stable_inverse(V0_inv)
             V0 = 0.5 * (V0 + V0.T)
             mean0 = V0 @ (
-                (X0.T @ y0) / max(sigma2_0c, 1e-8) + (M / max(sigma2_0h, 1e-8)) * hist_summary["q_h"]
+                (X0.T @ y0) / max(sigma2_0c, 1e-8) + prior_prec @ beta_hat
             )
             beta0 = np.random.multivariate_normal(mean0, V0)
 
@@ -1501,18 +1561,26 @@ class CAHBUIPBase(BorrowingMethod):
             scale_c = self.beta0 + 0.5 * np.dot(resid0, resid0)
             sigma2_0c = float(invgamma.rvs(shape_c, scale=max(scale_c, 1e-8)))
 
-            # sigma0h^2 update
-            ss_h = self._historical_ss(hist_summary, beta0)
-            shape_h = self.alpha0 + hist_summary["W_h"] / 2.0
-            scale_h = self.beta0 + 0.5 * ss_h
-            sigma2_0h = float(invgamma.rvs(shape_h, scale=max(scale_h, 1e-8)))
+            # sigma0h^2 update (fixed for SLD)
+            if fixed_sigma is not None:
+                sigma2_0h = float(fixed_sigma)
+            else:
+                ss_h = self._historical_ss(hist_summary, beta0)
+                quad_term = float((beta0 - beta_hat).T @ (S_h @ (beta0 - beta_hat)))
+                if L_state == 0:
+                    quad_term = 0.01 * float(np.dot(beta0 - beta_hat, beta0 - beta_hat))
+                shape_h = self.alpha0 + hist_summary["W_h"] / 2.0 + feature_dim / 2.0
+                scale_h = self.beta0 + 0.5 * ss_h + 0.5 * quad_term / max(M if L_state == 1 else 1.0, 1e-8)
+                sigma2_0h = float(invgamma.rvs(shape_h, scale=max(scale_h, 1e-8)))
 
-            # M update
-            diff = beta0 - hist_summary["beta_hat"]
-            quad = float(diff.T @ (hist_summary["S_h"] @ diff))
-            rate_M = (self.gamma_alpha / max(hist_summary["W_h"], 1e-8)) + 0.5 * quad / max(sigma2_0h, 1e-8)
-            shape_M = self.gamma_alpha + feature_dim / 2.0
-            M = float(np.random.gamma(shape_M, 1.0 / max(rate_M, 1e-8)))
+            # M update (only meaningful when borrowing is on)
+            if L_state == 1:
+                quad = float((beta0 - beta_hat).T @ (S_h @ (beta0 - beta_hat)))
+                rate_M = amount_rate_prior + 0.5 * quad / max(sigma2_0h, 1e-8)
+                shape_M = self.amount_shape + feature_dim / 2.0
+                M = float(np.random.gamma(shape_M, 1.0 / max(rate_M, 1e-8)))
+            else:
+                M = max(M, 1e-6)  # retain small positive value for stability
 
             # beta1 update
             XtX = X1.T @ X1
@@ -1533,6 +1601,7 @@ class CAHBUIPBase(BorrowingMethod):
                 kept_beta0.append(beta0.copy())
                 kept_beta1.append(beta1.copy())
                 kept_M.append(M)
+                kept_wL.append(w_L)
                 delta_draws.append(float(np.mean(phi_all @ (beta1 - beta0))))
 
         if not kept_beta0:
@@ -1541,12 +1610,14 @@ class CAHBUIPBase(BorrowingMethod):
         kept_beta0 = np.asarray(kept_beta0)
         kept_beta1 = np.asarray(kept_beta1)
         kept_M = np.asarray(kept_M)
+        kept_wL = np.asarray(kept_wL)
         delta_draws = np.asarray(delta_draws, dtype=float)
 
         return {
             "beta0": kept_beta0,
             "beta1": kept_beta1,
             "M_draws": kept_M,
+            "wL_draws": kept_wL,
             "delta_draws": delta_draws,
         }
 
@@ -1570,12 +1641,12 @@ class CAHBUIPBase(BorrowingMethod):
 
     def _amount_prior_rate(self, weight: float) -> float:
         weight = max(float(weight), 1e-6)
-        return self.gamma_alpha / weight
+        return self.amount_shape / weight
 
     def _posterior_mode_amount(self, mu0: float, hist_mean: float, sigma2_hist: float, beta_prior: float) -> float:
         if not np.isfinite(beta_prior):
             return 0.0
-        alpha_post = self.gamma_alpha + 0.5
+        alpha_post = self.amount_shape + 0.5
         diff_sq = (mu0 - hist_mean) ** 2
         beta_post = beta_prior + diff_sq / (2.0 * max(sigma2_hist, 1e-8))
         if alpha_post <= 1.0:
@@ -1583,17 +1654,20 @@ class CAHBUIPBase(BorrowingMethod):
         return float((alpha_post - 1.0) / max(beta_post, 1e-8))
 
     @staticmethod
-    def _cecss_gain(W0: float, Wh: float, sigma2_ctrl: float, sigma2_hist: float, amount: float) -> float:
-        if W0 <= 1e-8 or Wh <= 1e-8 or amount <= 1e-10:
+    def _cecss_gain(W0: float, Wh: float, sigma2_ctrl: float, sigma2_hist: float, amount: float, w_L: float, robust_scale: float) -> float:
+        if W0 <= 1e-8 or Wh <= 1e-8:
             return 1.0
-        denom = max(W0 * max(sigma2_hist, 1e-8), 1e-8)
+        sigma2_hist = max(sigma2_hist, 1e-8)
         try:
             import config as _cfg
 
             max_rn = float(getattr(_cfg, "MAX_ESS", 1e4))
         except Exception:
             max_rn = 1e4
-        gain = 1.0 + amount * max(sigma2_ctrl, 1e-8) / denom
+        borrowed = max(w_L, 0.0) * max(amount, 0.0)
+        robust_term = (1.0 - max(min(w_L, 1.0), 0.0)) / max(robust_scale, 1.0)
+        lambda_eff = borrowed + robust_term
+        gain = 1.0 + lambda_eff * max(sigma2_ctrl, 1e-8) / max(W0 * sigma2_hist, 1e-8)
         return float(np.clip(gain, 1.0, max_rn))
 
     # ------------------------------------------------------------------
@@ -1636,29 +1710,54 @@ class CAHBUIPBase(BorrowingMethod):
             trt_stats.variance if trt_stats.weight > 1e-8 and np.isfinite(trt_stats.variance) else sigma2_0c,
             1e-6,
         )
-        beta_M = self._amount_prior_rate(hist_stats.weight) if borrow_enabled else np.inf
+        gamma = 0.5
+        w_L = 0.5
+        beta_M = self._amount_prior_rate(hist_stats.weight if borrow_enabled else 1.0)
+        robust_scale = max(self.robust_scale, 1.0)
 
         for _ in range(self.coord_max_iter):
             mu0_prev = mu0
             sigma2_0c_prev = sigma2_0c
             sigma2_0h_prev = sigma2_0h
             amount_prev = amount
+            gamma_prev = gamma
+            w_prev = w_L
 
-            precision = ctrl_stats.weight / max(sigma2_0c_prev, 1e-8)
             if borrow_enabled:
-                precision += amount_prev / max(sigma2_0h_prev, 1e-8)
+                # E-step: posterior responsibility of compatible component
+                w_L = self._compat_weight(
+                    mu0, hist_stats.mean, sigma2_0h_prev, max(amount_prev, 1e-8), gamma_prev, robust_scale
+                )
+                # Update gamma using posterior mean of Beta (stabler than mode when params<=1)
+                gamma_num = self.gamma_a0 + w_L
+                gamma_den = self.gamma_a0 + self.gamma_b0 + 1.0
+                gamma = float(np.clip(gamma_num / max(gamma_den, 1e-8), 1e-4, 0.9996))
+                lambda_eff = w_L * amount_prev + (1.0 - w_L) / robust_scale
+            else:
+                w_L = 0.0
+                lambda_eff = 0.0
+            precision = ctrl_stats.weight / max(sigma2_0c_prev, 1e-8) + lambda_eff / max(sigma2_0h_prev, 1e-8)
             if precision > 1e-8:
                 weighted_mean = (
                     ctrl_stats.weight * ctrl_stats.mean / max(sigma2_0c_prev, 1e-8)
-                    + (amount_prev * hist_stats.mean / max(sigma2_0h_prev, 1e-8) if borrow_enabled else 0.0)
+                    + lambda_eff * hist_stats.mean / max(sigma2_0h_prev, 1e-8)
                 ) / precision
                 mu0 = float(weighted_mean)
             else:
                 mu0 = float(ctrl_stats.mean)
 
-            sigma2_0c = self._posterior_mode_variance(ctrl_stats, mu0)
+            # Variance updates (IG mode)
+            ss0 = self._weighted_ss(ctrl_stats, mu0)
+            sigma2_0c = (self.beta0 + 0.5 * ss0) / (self.alpha0 + ctrl_stats.weight / 2.0 + 1.0)
+
+            ss_h = self._weighted_ss(hist_stats, mu0)
+            sigma2_0h = (self.beta0 + 0.5 * ss_h + 0.5 * lambda_eff * (mu0 - hist_stats.mean) ** 2) / (
+                self.alpha0 + hist_stats.weight / 2.0 + 1.5
+            )
+            sigma2_0h = max(sigma2_0h, 1e-6)
+
             if borrow_enabled:
-                sigma2_0h = self._posterior_mode_variance(hist_stats, mu0)
+                beta_M = self._amount_prior_rate(hist_stats.weight)
                 amount = self._posterior_mode_amount(mu0, hist_stats.mean, sigma2_0h, beta_M)
             else:
                 sigma2_0h = sigma2_0c
@@ -1666,7 +1765,8 @@ class CAHBUIPBase(BorrowingMethod):
 
             if trt_stats.weight > 1e-8 and np.isfinite(trt_stats.mean):
                 mu1 = float(trt_stats.mean)
-                sigma2_1 = self._posterior_mode_variance(trt_stats, mu1)
+                ss1 = self._weighted_ss(trt_stats, mu1)
+                sigma2_1 = (self.beta0 + 0.5 * ss1) / (self.alpha0 + trt_stats.weight / 2.0 + 1.0)
             else:
                 mu1 = mu0
                 sigma2_1 = sigma2_0c
@@ -1674,8 +1774,10 @@ class CAHBUIPBase(BorrowingMethod):
             deltas = [
                 abs(mu0 - mu0_prev),
                 abs(amount - amount_prev),
+                abs(w_L - w_prev),
                 abs(np.log(max(sigma2_0c, 1e-6)) - np.log(max(sigma2_0c_prev, 1e-6))),
                 abs(np.log(max(sigma2_0h, 1e-6)) - np.log(max(sigma2_0h_prev, 1e-6))),
+                abs(gamma - gamma_prev),
             ]
             if max(deltas) < self.coord_tol:
                 break
@@ -1690,6 +1792,9 @@ class CAHBUIPBase(BorrowingMethod):
             "W0": float(ctrl_stats.weight),
             "Wh": float(hist_stats.weight),
             "W1": float(trt_stats.weight),
+            "w_L": float(w_L),
+            "gamma": float(gamma),
+            "lambda_eff": float(lambda_eff),
         }
 
     # ------------------------------------------------------------------
@@ -1709,7 +1814,17 @@ class CAHBUIPBase(BorrowingMethod):
         if ca is None:
             return AllocationResult(pi_treatment=0.5, diagnostics={"R_n": 1.0, "M": 0.0})
 
-        R_n = self._cecss_gain(ca["W0"], ca["Wh"], ca["sigma2_0c"], ca["sigma2_0h"], ca["M"])
+        self._last_wL = float(ca.get("w_L", 0.0))
+        self._last_gamma = float(ca.get("gamma", 0.5))
+        R_n = self._cecss_gain(
+            ca["W0"],
+            ca["Wh"],
+            ca["sigma2_0c"],
+            ca["sigma2_0h"],
+            ca["M"],
+            self._last_wL,
+            self.robust_scale,
+        )
         n0_eff = R_n * max(ca["W0"], 1e-8)
         pi = self._imbalance_probability(n0_eff, ca["W1"])
         diagnostics = {
@@ -1718,6 +1833,9 @@ class CAHBUIPBase(BorrowingMethod):
             "mu0": ca["mu0"],
             "sigma2_0c": ca["sigma2_0c"],
             "sigma2_0h": ca["sigma2_0h"],
+            "w_L": self._last_wL,
+            "gamma": self._last_gamma,
+            "lambda_eff": ca.get("lambda_eff"),
         }
         return AllocationResult(pi_treatment=pi, diagnostics=diagnostics)
 
@@ -1743,6 +1861,7 @@ class CAHBUIPBase(BorrowingMethod):
 
         delta_draws = gibbs_result["delta_draws"]
         M_draws = gibbs_result["M_draws"]
+        wL_draws = gibbs_result.get("wL_draws", np.asarray([]))
         if M_draws.size > 0:
             mean_M = float(np.mean(M_draws))
             ci_low = float(np.quantile(M_draws, self.alpha / 2.0))
@@ -1752,10 +1871,14 @@ class CAHBUIPBase(BorrowingMethod):
             ci_low = np.nan
             ci_high = np.nan
 
-        amount_summary = {"mean": mean_M, "ci_low": ci_low, "ci_high": ci_high, "gain": np.nan}
+        mean_wL = float(np.mean(wL_draws)) if wL_draws.size > 0 else float(self._last_wL)
+        self._last_wL = mean_wL
+        self._posterior_M_mean = mean_M
+        self._posterior_wL_mean = mean_wL
+        amount_summary = {"mean": mean_M, "ci_low": ci_low, "ci_high": ci_high, "gain": np.nan, "w_L": mean_wL}
         self._amount_cache = [amount_summary for _ in range(X.shape[0])]
         self._record_calibration_samples(X)
-        # Use quantile method for CAHB-UIP inference
+        # Use quantile method for BRAVE inference
         return _delta_summary_quantile(delta_draws, self.alpha)
 
     def _record_calibration_samples(self, X: np.ndarray):
@@ -1782,6 +1905,8 @@ class CAHBUIPBase(BorrowingMethod):
                     "M_ci_low": entry["ci_low"],
                     "M_ci_high": entry["ci_high"],
                     "R_n": entry["gain"],
+                    "w_L": entry.get("w_L", self._last_wL),
+                    "gamma": self._last_gamma,
                 }
             )
         self._calibration_payload = payload
@@ -1790,22 +1915,22 @@ class CAHBUIPBase(BorrowingMethod):
         return list(self._calibration_payload)
 
 
-class CAHB_UIP_IPD(CAHBUIPBase):
-    """CAHB-UIP implementation using individual-level historical data."""
+class BRAVE_IPD(BRAVEBase):
+    """BRAVE implementation using individual-level historical data."""
 
-    method_label = "CAHB-UIP-IPD"
+    method_label = "BRAVE_IPD"
 
 
-class CAHB_UIP_SLD(CAHBUIPBase):
-    """CAHB-UIP implementation that consumes summary-level historical data."""
+class BRAVE_SLD(BRAVEBase):
+    """BRAVE implementation that consumes summary-level historical data."""
 
-    method_label = "CAHB-UIP-SLD"
+    method_label = "BRAVE_SLD"
 
     def __init__(self, historical_data: dict, scenario_params: dict, priors: dict):
         super().__init__(historical_data, scenario_params, priors)
         y = np.asarray(self.Y_h, dtype=float)
         self._sld_n = float(len(y))
-        self._summary_weight = 1.0
+        self._summary_weight = max(self._sld_n, 1.0)
         # Vague prior scale for non-intercept coefficients (slopes)
         self.slope_prior_scale = float(priors.get("sld_beta1_prior_scale", 1e6))
         self.beta0_slope_scale = float(priors.get("sld_beta0_prior_scale", 10.0))
@@ -1831,8 +1956,9 @@ class CAHB_UIP_SLD(CAHBUIPBase):
             XtX_inv = np.linalg.pinv(XtX_reg)
             var_mu = float(bar_psi @ XtX_inv @ bar_psi) * sigma2_hat
             self._summary_mean = float(bar_psi @ beta_hat)
-            self._summary_var = sigma2_hat
-            self._summary_var_mu = max(var_mu, 1e-8)
+            # SLD: treat variance as n_h * Vh
+            self._summary_var = sigma2_hat * self._sld_n
+            self._summary_var_mu = max(var_mu * self._sld_n, 1e-8)
             self._summary_beta = beta_hat
             self._summary_bar_psi = bar_psi
         self._current_center = None
@@ -1876,7 +2002,7 @@ class CAHB_UIP_SLD(CAHBUIPBase):
     def _historical_summary(self, feature_dim: int, X_curr: np.ndarray) -> Optional[dict]:
         if self._sld_n <= 1e-8:
             return None
-        iu = 1.0 / max(self._sld_n * self._summary_var_mu, 1e-8)
+        iu = 1.0 / max(self._summary_var_mu, 1e-8)
         S_h = np.zeros((feature_dim, feature_dim))
         S_h[0, 0] = iu
         q_h = np.zeros(feature_dim)
@@ -1890,7 +2016,8 @@ class CAHB_UIP_SLD(CAHBUIPBase):
             "S_h": S_h,
             "q_h": q_h,
             "beta_hat": beta_hat,
-            "W_h": 1.0,
+            "W_h": max(self._sld_n, 1.0),
+            "fixed_sigma2": float(self._summary_var),
         }
 
     def _historical_ss(self, hist_summary: dict, beta0: np.ndarray) -> float:
@@ -1898,4 +2025,4 @@ class CAHB_UIP_SLD(CAHBUIPBase):
         return float(self._summary_var_mu + diff ** 2)
 
 
-__all__ = ["AllocationResult", "KBCD", "CAHB", "CAHB_UIP_IPD", "CAHB_UIP_SLD"]
+__all__ = ["AllocationResult", "KBCD", "CAHB", "BRAVE_IPD", "BRAVE_SLD"]

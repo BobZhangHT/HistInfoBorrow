@@ -1,9 +1,9 @@
-"""
+﻿"""
 single_test.py
 
 Run a single replication for a chosen scenario across multiple methods.
 All methods see the same pre-generated covariate sequence and potential
-outcomes. CAHB-UIP allocation uses the variance-aware coordinate-ascent
+outcomes. BRAVE allocation uses the variance-aware coordinate-ascent
 updates implemented in methods.py, while the final inference still uses
 the Gibbs sampler inside each method's `estimate_treatment_effect`.
 """
@@ -17,7 +17,6 @@ import numpy as np
 import config
 import data_generation
 import methods
-from main import run_single_simulation  # retained for reference if needed
 
 
 def _build_shared_sequences(scenario: Dict, seed: int):

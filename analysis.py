@@ -1,7 +1,7 @@
 """
 analysis.py
 
-Results Analysis and Visualization for CAHB-UIP Simulation Study
+Results Analysis and Visualization for the BRAVE Simulation Study
 
 This module processes raw simulation results and generates publication-ready
 outputs including:
@@ -33,7 +33,7 @@ Output Specifications:
 - Follows Statistics in Medicine figure/table guidelines
 
 References:
-    CAHB-UIP manuscript Section 3.5 (Evaluation Metrics)
+    BRAVE manuscript Section 3.5 (Evaluation Metrics)
 """
 
 import os
@@ -47,7 +47,6 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 import seaborn as sns
-from matplotlib.lines import Line2D
 
 # Import project configuration
 try:
@@ -122,13 +121,22 @@ def configure_plot_style():
     # Define colorblind-friendly palette
     # Based on Wong (2011) Nature Methods palette
     colors = {
-        'KBCD': '#009E73',          # Bluish green
-        'CAHB': '#56B4E9',          # Sky blue
-        'CAHB_UIP_IPD': '#E69F00',  # Orange
-        'CAHB_UIP_SLD': '#D55E00',  # Vermilion
+        'KBCD': '#009E73',      # Bluish green
+        'CAHB': '#56B4E9',      # Sky blue
+        'BRAVE_IPD': '#E69F00', # Orange
+        'BRAVE_SLD': '#D55E00', # Vermilion
     }
     
     return colors
+
+
+# Default method label mapping (used if config lacks entries or for legacy aliases)
+DEFAULT_METHOD_LABELS = {
+    'BRAVE_IPD': 'BRAVE-IPD',
+    'BRAVE_SLD': 'BRAVE-SLD',
+    'CAHB': 'CAHB',
+    'KBCD': 'KBCD',
+}
 
 
 # =============================================================================
@@ -216,6 +224,8 @@ def process_results(results_list: list) -> dict:
         'alloc_rate_treatment': 'mean',
         'is_success': 'mean',
         'n_total': 'mean',
+        'post_M_mean': 'mean',
+        'post_wL_mean': 'mean',
         'replicate_id': 'count'
     }
 
@@ -272,6 +282,8 @@ def process_results(results_list: list) -> dict:
                 'prop_treated': point.get('prop_treated'),
                 'R_n': point.get('R_n'),
                 'M': point.get('M'),
+                'w_L': point.get('w_L'),
+                'gamma': point.get('gamma'),
                 'x1': point.get('x1'),
                 'x2': point.get('x2'),
                 'x3': point.get('x3'),
@@ -305,6 +317,8 @@ def process_results(results_list: list) -> dict:
                 'M_ci_low': entry.get('M_ci_low'),
                 'M_ci_high': entry.get('M_ci_high'),
                 'R_n': entry.get('R_n'),
+                'w_L': entry.get('w_L'),
+                'gamma': entry.get('gamma'),
             })
 
     if calibration_records:
@@ -341,23 +355,26 @@ def generate_tables(results_obj: dict):
         
     os.makedirs(config.TABLES_DIR, exist_ok=True)
     
+    # Final inference stage metrics (Section 3.4)
+    # Includes: Bias, RMSE, Type I Error, Power, 95% CrI Coverage, CI Width
+    # Also includes posterior M and w_L for BRAVE methods (NaN for others)
     estimation_cols = [
         'scenario_name', 'method', 'tau_0', 'n', 'n_h', 'scenario_type', 'kappa',
         'Bias', 'RMSE', 'Coverage', 'CI_Width', 'Alloc_Rate_Treatment',
-        'Type_I_Error', 'Power'
+        'Type_I_Error', 'Power', 'post_M_mean', 'post_wL_mean'
     ]
     estimation_cols = [c for c in estimation_cols if c in summary_df.columns]
     estimation_df = summary_df[estimation_cols].copy()
-    est_csv = os.path.join(config.TABLES_DIR, 'estimation_metrics.csv')
+    est_csv = os.path.join(config.TABLES_DIR, 'final_inference_metrics.csv')
     estimation_df.to_csv(est_csv, index=False, float_format='%.4f')
-    print(f"[+] Estimation metrics table saved: {est_csv}")
+    print(f"[+] Final inference metrics table saved: {est_csv}")
 
     # Publication-ready LaTeX table
     display_df = estimation_df.copy()
+    method_labels = DEFAULT_METHOD_LABELS.copy()
     if hasattr(config, 'METHOD_LABELS'):
-        display_df['method_label'] = display_df['method'].map(config.METHOD_LABELS).fillna(display_df['method'])
-    else:
-        display_df['method_label'] = display_df['method']
+        method_labels.update(getattr(config, 'METHOD_LABELS', {}))
+    display_df['method_label'] = display_df['method'].map(method_labels).fillna(display_df['method'])
 
     try:
         tex_pivot = display_df.pivot_table(
@@ -426,7 +443,17 @@ def generate_tables(results_obj: dict):
 # =============================================================================
 
 def generate_plots(results_obj: dict):
-    """Generate 2x2 grid boxplots for R_n(X) and M(X) diagnostics."""
+    """
+    Generate evaluation metrics plots for adaptive allocation stage and final inference stage.
+    
+    Adaptive allocation stage plots:
+    1. Averaged trajectory curves for allocation ratio (all 4 designs)
+    2. Averaged density plots for R_n(X) (all 4 designs, KBCD fixed at 1)
+    3. Averaged density plots for M(X) (BRAVE-IPD and BRAVE-SLD)
+    4. Averaged density plots for w_L(x) (BRAVE-IPD and BRAVE-SLD)
+    5. Individual plots per scenario
+    6. Combined 6×4 grid plots for n_h=400 and 800
+    """
     alloc_df = results_obj.get('allocation_path', pd.DataFrame())
     if alloc_df.empty:
         warnings.warn("Empty allocation diagnostics. No plots generated.")
@@ -434,7 +461,9 @@ def generate_plots(results_obj: dict):
 
     os.makedirs(config.PLOTS_DIR, exist_ok=True)
     colors = configure_plot_style()
-    method_labels = getattr(config, 'METHOD_LABELS', {})
+    method_labels = DEFAULT_METHOD_LABELS.copy()
+    if hasattr(config, 'METHOD_LABELS'):
+        method_labels.update(getattr(config, 'METHOD_LABELS', {}))
 
     scenario_order = [
         ('S1', 1.0, r'S1 $\kappa$=1.0'),
@@ -475,174 +504,362 @@ def generate_plots(results_obj: dict):
 
     alloc_df['scenario_label'] = alloc_df.apply(_scenario_label, axis=1)
     alloc_df = alloc_df[alloc_df['scenario_label'].isin(label_order)]
+    
+    # Ensure KBCD has R_n = 1.0
+    alloc_df.loc[alloc_df['method'] == 'KBCD', 'R_n'] = 1.0
 
-    def _prepare_metric(metric_col: str, method_pool: List[str]) -> pd.DataFrame:
-        metric_df = alloc_df.dropna(subset=[metric_col]).copy()
-        if metric_df.empty:
-            return metric_df
-        group_cols = ['n', 'n_h', 'scenario_type', 'kappa', 'tau_0', 'method', 'replicate_id', 'scenario_label']
-        metric_df = metric_df.groupby(group_cols, as_index=False)[metric_col].median()
-        metric_df['scenario_label'] = pd.Categorical(metric_df['scenario_label'], categories=label_order, ordered=True)
-        metric_df = metric_df[metric_df['method'].isin(method_pool)]
-        return metric_df
+    # Design order for all plots
+    design_order = ['BRAVE_IPD', 'BRAVE_SLD', 'CAHB', 'KBCD']
+    brave_methods = ['BRAVE_IPD', 'BRAVE_SLD']
+    palette_all = {m: colors.get(m, 'gray') for m in design_order}
 
-    def _method_handles(methods_for_plot: List[str]) -> List[Line2D]:
-        handles = []
-        for m in methods_for_plot:
-            handles.append(
-                Line2D([0], [0], color=colors.get(m, 'gray'), marker='s', linestyle='', label=_label(m))
-            )
-        return handles
+    def _label(method: str) -> str:
+        return method_labels.get(method, method)
+    
+    def _safe_filename(label: str) -> str:
+        """Convert scenario label to safe filename."""
+        return label.replace(' ', '_').replace('$', '').replace('\\', '').replace('=', '').replace('{', '').replace('}', '')
 
-    def _draw_box(ax, data: pd.DataFrame, metric_col: str, methods_for_plot: List[str], ylabel: str):
-        if data.empty:
-            ax.set_visible(False)
-            return []
-        method_order = [m for m in methods_for_plot if m in data['method'].unique()]
-        if not method_order:
-            ax.set_visible(False)
-            return []
-        palette = {m: colors.get(m, 'gray') for m in method_order}
-        sns.boxplot(
-            data=data,
-            x='scenario_label',
-            y=metric_col,
-            hue='method',
-            order=label_order,
-            hue_order=method_order,
-            palette=palette,
-            ax=ax,
-            linewidth=0.8,
-            fliersize=2.5,
+    # =====================================================================
+    # 1. Allocation Trajectory Plots (all 4 designs)
+    # =====================================================================
+    def _plot_allocation_trajectories():
+        """Generate averaged trajectory curves for allocation ratio (all 4 designs)."""
+        df = alloc_df.dropna(subset=['prop_treated', 'sample_size']).copy()
+        if df.empty:
+            warnings.warn("No allocation trajectory data available.")
+            return
+        
+        df['scenario_label'] = df.apply(_scenario_label, axis=1)
+        
+        # Average across replicates for each (scenario, method, sample_size, n_h) combination
+        traj_agg = (
+            df.groupby(['scenario_label', 'scenario_type', 'kappa', 'n_h', 'method', 'sample_size'], as_index=False)
+            .agg(prop_treated_mean=('prop_treated', 'mean'))
         )
-        ax.set_xlabel('Simulation scenario')
-        ax.set_ylabel(ylabel)
-        ax.tick_params(axis='x', labelrotation=25)
-        if ax.legend_:
-            ax.legend_.remove()
-        return method_order
+        
+        # Individual plots per scenario
+        for n_h_val in sorted(df['n_h'].dropna().unique()):
+            for scen_label in label_order:
+                sub = traj_agg[(traj_agg['n_h'] == n_h_val) & (traj_agg['scenario_label'] == scen_label)]
+                if sub.empty:
+                    continue
+                
+                fig, ax = plt.subplots(figsize=(7, 5))
+                for method in design_order:
+                    method_data = sub[sub['method'] == method]
+                    if method_data.empty:
+                        continue
+                    ax.plot(
+                        method_data['sample_size'],
+                        method_data['prop_treated_mean'],
+                        color=palette_all.get(method, 'gray'),
+                        label=_label(method),
+                        linewidth=2.0
+                    )
+                ax.set_ylabel('Allocation ratio to treatment', fontsize=11)
+                ax.set_xlabel('Sample size', fontsize=11)
+                ax.set_ylim(0, 1)
+                ax.set_title(f"{scen_label}, $n_h$={int(n_h_val)}", fontsize=12)
+                ax.legend(title='Method', fontsize=9)
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                safe_label = _safe_filename(scen_label)
+                out = os.path.join(config.PLOTS_DIR, f"traj_alloc_{safe_label}_nh{int(n_h_val)}.pdf")
+                fig.savefig(out)
+                plt.close(fig)
+                print(f"[+] Saved allocation trajectory: {out}")
+    
+    _plot_allocation_trajectories()
 
-    def _combination_order(df: pd.DataFrame) -> List[tuple]:
-        preferred = [(200, 400), (200, 800), (400, 400), (400, 800)]
-        observed = list({(int(row.n), int(row.n_h)) for row in df[['n', 'n_h']].dropna().itertuples(index=False)})
-        combos = [c for c in preferred if c in observed]
-        for combo in sorted(observed):
-            if combo not in combos:
-                combos.append(combo)
-        return combos
-
-    def _plot_metric(metric_df: pd.DataFrame, methods_for_plot: List[str], metric_col: str, ylabel: str, prefix: str):
-        if metric_df.empty:
-            warnings.warn(f"No data available for {metric_col} plotting.")
+    # =====================================================================
+    # 2. Density Plots for R_n(X) (all 4 designs, averaged across replications)
+    # =====================================================================
+    def _plot_rn_density():
+        """Generate averaged density plots for R_n(X) across all designs."""
+        df = alloc_df.dropna(subset=['R_n']).copy()
+        if df.empty:
+            warnings.warn("No R_n data available.")
             return
+        
+        df['scenario_label'] = df.apply(_scenario_label, axis=1)
+        
+        # Individual plots per scenario
+        for n_h_val in sorted(df['n_h'].dropna().unique()):
+            for scen_label in label_order:
+                sub = df[(df['n_h'] == n_h_val) & (df['scenario_label'] == scen_label)]
+                if sub.empty:
+                    continue
+                
+                fig, ax = plt.subplots(figsize=(7, 5))
+                for method in design_order:
+                    vals = sub[sub['method'] == method]['R_n'].dropna()
+                    if vals.empty:
+                        continue
+                    
+                    # For KBCD, R_n should be exactly 1.0
+                    if method == 'KBCD':
+                        ax.axvline(1.0, color=palette_all.get(method, 'gray'), 
+                                 linestyle='--', linewidth=2.0, label=_label(method))
+                    elif np.nanstd(vals) < 1e-6:
+                        ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
+                                 linestyle='--', linewidth=2.0, label=_label(method))
+                    else:
+                        sns.kdeplot(vals, ax=ax, label=_label(method), 
+                                  color=palette_all.get(method, 'gray'), 
+                                  clip=(0, None), linewidth=2.0)
+                
+                ax.set_xlabel(r'$R_n(\mathbf{X})$', fontsize=11)
+                ax.set_ylabel('Density', fontsize=11)
+                ax.set_title(f"$R_n$ density - {scen_label}, $n_h$={int(n_h_val)}", fontsize=12)
+                ax.legend(title='Method', fontsize=9)
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                safe_label = _safe_filename(scen_label)
+                out = os.path.join(config.PLOTS_DIR, f"density_rn_{safe_label}_nh{int(n_h_val)}.pdf")
+                fig.savefig(out)
+                plt.close(fig)
+                print(f"[+] Saved R_n density: {out}")
+    
+    _plot_rn_density()
 
-        combos = _combination_order(metric_df)
-        if not combos:
-            warnings.warn(f"No (n, n_h) combinations found for {metric_col}.")
+    # =====================================================================
+    # 3. Density Plots for M(X) (BRAVE-IPD and BRAVE-SLD only)
+    # =====================================================================
+    def _plot_M_density():
+        """Generate averaged density plots for M(X) (BRAVE methods only)."""
+        df = alloc_df.dropna(subset=['M']).copy()
+        if df.empty:
+            warnings.warn("No M data available.")
             return
-
-        n_panels = len(combos)
-        ncols = 2
-        nrows = int(np.ceil(n_panels / ncols))
-        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), sharey=True)
-        axes = np.atleast_2d(axes)
-        axes_flat = axes.flatten()
-        legend_methods = [m for m in methods_for_plot if m in metric_df['method'].unique()]
-        for ax, (n_val, nh_val) in zip(axes_flat, combos):
-            subset = metric_df[(metric_df['n'] == n_val) & (metric_df['n_h'] == nh_val)]
-            _draw_box(ax, subset, metric_col, methods_for_plot, ylabel)
-            ax.set_title(rf"$n$={int(n_val)}, $n_h$={int(nh_val)}")
-        for ax in axes_flat[len(combos):]:
-            ax.set_visible(False)
-        if legend_methods:
-            handles = _method_handles(legend_methods)
-            fig.legend(handles, [_label(m) for m in legend_methods], loc='lower center', ncol=min(len(handles), 4), frameon=False)
-        fig.tight_layout(rect=(0, 0.08, 1, 1))
-        grid_path = os.path.join(config.PLOTS_DIR, f"{prefix}_grid.pdf")
-        fig.savefig(grid_path)
-        plt.close(fig)
-        print(f"[+] Saved {prefix} grid: {grid_path}")
-
-        for n_val, nh_val in combos:
-            subset = metric_df[(metric_df['n'] == n_val) & (metric_df['n_h'] == nh_val)]
-            fig_single, ax_single = plt.subplots(figsize=(7, 5))
-            used_methods = _draw_box(ax_single, subset, metric_col, methods_for_plot, ylabel)
-            if used_methods:
-                handles = _method_handles(used_methods)
-                fig_single.legend(handles, [_label(m) for m in used_methods], loc='upper right', frameon=False)
-            fig_single.tight_layout()
-            sub_path = os.path.join(config.PLOTS_DIR, f"{prefix}_n{int(n_val)}_nh{int(nh_val)}.pdf")
-            fig_single.savefig(sub_path)
-            plt.close(fig_single)
-            print(f"[+] Saved subplot: {sub_path}")
-
-    all_methods = getattr(config, 'METHODS_TO_RUN', [])
-    rn_methods = [m for m in all_methods if m in alloc_df['method'].unique()]
-    m_methods = [m for m in all_methods if m.startswith('CAHB_UIP') and m in alloc_df['method'].unique()]
-
-    rn_df = _prepare_metric('R_n', rn_methods)
-    m_df = _prepare_metric('M', m_methods)
-
-    _plot_metric(rn_df, rn_methods, 'R_n', r'Median $R_n(\mathbf{X})$', 'rn_box')
-    _plot_metric(m_df, m_methods, 'M', r'Median $M(\mathbf{X})$', 'm_box')
-
-    def _plot_s4_borrowing(raw_alloc: pd.DataFrame):
-        subset = raw_alloc[raw_alloc['scenario_type'] == 'S4'].copy()
-        if subset.empty:
+        
+        df = df[df['method'].isin(brave_methods)]
+        if df.empty:
+            warnings.warn("No BRAVE method data for M.")
             return
-        needed_cols = {'x4', 'R_n', 'method', 'replicate_id', 'n', 'n_h'}
-        if not needed_cols.issubset(subset.columns):
+        
+        df['scenario_label'] = df.apply(_scenario_label, axis=1)
+        
+        # Individual plots per scenario
+        for n_h_val in sorted(df['n_h'].dropna().unique()):
+            for scen_label in label_order:
+                sub = df[(df['n_h'] == n_h_val) & (df['scenario_label'] == scen_label)]
+                if sub.empty:
+                    continue
+                
+                fig, ax = plt.subplots(figsize=(7, 5))
+                for method in brave_methods:
+                    vals = sub[sub['method'] == method]['M'].dropna()
+                    if vals.empty:
+                        continue
+                    
+                    if np.nanstd(vals) < 1e-6:
+                        ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
+                                 linestyle='--', linewidth=2.0, label=_label(method))
+                    else:
+                        sns.kdeplot(vals, ax=ax, label=_label(method),
+                                  color=palette_all.get(method, 'gray'),
+                                  clip=(0, None), linewidth=2.0)
+                
+                ax.set_xlabel(r'$M(\mathbf{X})$', fontsize=11)
+                ax.set_ylabel('Density', fontsize=11)
+                ax.set_title(f"$M$ density - {scen_label}, $n_h$={int(n_h_val)}", fontsize=12)
+                ax.legend(title='Method', fontsize=9)
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                safe_label = _safe_filename(scen_label)
+                out = os.path.join(config.PLOTS_DIR, f"density_M_{safe_label}_nh{int(n_h_val)}.pdf")
+                fig.savefig(out)
+                plt.close(fig)
+                print(f"[+] Saved M density: {out}")
+    
+    _plot_M_density()
+
+    # =====================================================================
+    # 4. Density Plots for w_L(x) (BRAVE-IPD and BRAVE-SLD only)
+    # =====================================================================
+    def _plot_wL_density():
+        """Generate averaged density plots for w_L(x) (BRAVE methods only)."""
+        df = alloc_df.dropna(subset=['w_L']).copy()
+        if df.empty:
+            warnings.warn("No w_L data available.")
             return
-        methods_focus = ['CAHB', 'CAHB_UIP_IPD', 'CAHB_UIP_SLD']
-        subset = subset[subset['method'].isin(methods_focus)]
-        if subset.empty:
+        
+        df = df[df['method'].isin(brave_methods)]
+        if df.empty:
+            warnings.warn("No BRAVE method data for w_L.")
             return
-        subset['stratum'] = np.where(subset['x4'] > 1.0, 'X4>1', 'X4<=1')
-        group_cols = ['n', 'n_h', 'method', 'replicate_id', 'stratum']
-        agg = (
-            subset.groupby(group_cols, as_index=False)['R_n']
-            .median()
-        )
-        combos = sorted({(int(r.n), int(r.n_h)) for r in agg[['n', 'n_h']].dropna().itertuples(index=False)})
-        if not combos:
-            return
-        ncols = len(combos)
-        fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 4), sharey=True)
-        axes = np.atleast_1d(axes)
-        for ax, (n_val, nh_val) in zip(axes, combos):
-            panel = agg[(agg['n'] == n_val) & (agg['n_h'] == nh_val)]
-            if panel.empty:
-                ax.set_visible(False)
+        
+        df['scenario_label'] = df.apply(_scenario_label, axis=1)
+        
+        # Individual plots per scenario
+        for n_h_val in sorted(df['n_h'].dropna().unique()):
+            for scen_label in label_order:
+                sub = df[(df['n_h'] == n_h_val) & (df['scenario_label'] == scen_label)]
+                if sub.empty:
+                    continue
+                
+                fig, ax = plt.subplots(figsize=(7, 5))
+                for method in brave_methods:
+                    vals = sub[sub['method'] == method]['w_L'].dropna()
+                    if vals.empty:
+                        continue
+                    
+                    if np.nanstd(vals) < 1e-6:
+                        ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
+                                 linestyle='--', linewidth=2.0, label=_label(method))
+                    else:
+                        sns.kdeplot(vals, ax=ax, label=_label(method),
+                                  color=palette_all.get(method, 'gray'),
+                                  clip=(0, 1), linewidth=2.0)
+                
+                ax.set_xlabel(r'$w_L(\mathbf{x})$', fontsize=11)
+                ax.set_ylabel('Density', fontsize=11)
+                ax.set_title(f"$w_L$ density - {scen_label}, $n_h$={int(n_h_val)}", fontsize=12)
+                ax.legend(title='Method', fontsize=9)
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                safe_label = _safe_filename(scen_label)
+                out = os.path.join(config.PLOTS_DIR, f"density_wL_{safe_label}_nh{int(n_h_val)}.pdf")
+                fig.savefig(out)
+                plt.close(fig)
+                print(f"[+] Saved w_L density: {out}")
+    
+    _plot_wL_density()
+
+    # =====================================================================
+    # 5. Combined 6×4 Grid Plots for n_h=400 and 800
+    # Each row = scenario, Each column = plot type (allocation, Rn, M, w_L)
+    # =====================================================================
+    def _plot_combined_grids():
+        """Generate combined 6×4 grid plots: 6 scenarios × 4 plot types."""
+        scenarios = [(stype, kappa, label) for stype, kappa, label in scenario_order]
+        plot_types = ['allocation', 'Rn', 'M', 'w_L']
+        
+        for n_h_val in [400, 800]:
+            # Check if we have data for this n_h
+            df_nh = alloc_df[alloc_df['n_h'] == n_h_val].copy()
+            if df_nh.empty:
                 continue
-            palette = {m: colors.get(m, 'gray') for m in methods_focus}
-            sns.boxplot(
-                data=panel,
-                x='stratum',
-                y='R_n',
-                hue='method',
-                order=['X4<=1', 'X4>1'],
-                hue_order=[m for m in methods_focus if m in panel['method'].unique()],
-                palette=palette,
-                ax=ax,
-                linewidth=0.8,
-                fliersize=2.5,
-            )
-            if ax.legend_:
-                ax.legend_.remove()
-            ax.set_xlabel('Stratum')
-            ax.set_ylabel(r'Median $R_n(\mathbf{X})$')
-            ax.set_title(rf"$n$={n_val}, $n_h$={nh_val}")
-        plot_methods = [m for m in methods_focus if m in agg['method'].unique()]
-        handles = _method_handles(plot_methods)
-        if handles:
-            fig.legend(handles, [_label(m) for m in plot_methods], loc='lower center', ncol=len(plot_methods), frameon=False)
-        fig.tight_layout(rect=(0, 0.08, 1, 1))
-        out_path = os.path.join(config.PLOTS_DIR, 's4_borrowing_box.pdf')
-        fig.savefig(out_path)
-        plt.close(fig)
-        print(f"[+] Saved S4 borrowing stratified plot: {out_path}")
-
-    _plot_s4_borrowing(alloc_df)
+            
+            df_nh['scenario_label'] = df_nh.apply(_scenario_label, axis=1)
+            
+            # Create 6×4 grid: rows = scenarios, cols = plot types
+            fig, axes = plt.subplots(len(scenarios), len(plot_types),
+                                   figsize=(3.5 * len(plot_types), 2.5 * len(scenarios)),
+                                   sharex=False, sharey=False)
+            axes = np.atleast_2d(axes)
+            
+            for i, (stype, kappa, scen_label) in enumerate(scenarios):
+                scen_sub = df_nh[(df_nh['scenario_type'] == stype) &
+                                (df_nh['kappa'].astype(float) == float(kappa))]
+                
+                if scen_sub.empty:
+                    continue
+                
+                # Column 0: Allocation trajectory
+                ax = axes[i, 0]
+                traj_df = scen_sub.dropna(subset=['prop_treated', 'sample_size']).copy()
+                if not traj_df.empty:
+                    traj_agg = (
+                        traj_df.groupby(['method', 'sample_size'], as_index=False)
+                        .agg(prop_treated_mean=('prop_treated', 'mean'))
+                    )
+                    for method in design_order:
+                        method_data = traj_agg[traj_agg['method'] == method]
+                        if not method_data.empty:
+                            ax.plot(method_data['sample_size'], method_data['prop_treated_mean'],
+                                  color=palette_all.get(method, 'gray'), label=_label(method),
+                                  linewidth=1.5, alpha=0.8)
+                    ax.set_ylim(0, 1)
+                    ax.set_ylabel('Alloc. ratio', fontsize=8)
+                    if i == len(scenarios) - 1:
+                        ax.set_xlabel('Sample size', fontsize=8)
+                    ax.grid(True, alpha=0.3)
+                    if i == 0:
+                        ax.set_title('Allocation', fontsize=9)
+                        ax.legend(fontsize=6, loc='upper right', ncol=2)
+                
+                # Column 1: R_n density
+                ax = axes[i, 1]
+                rn_df = scen_sub.dropna(subset=['R_n']).copy()
+                if not rn_df.empty:
+                    for method in design_order:
+                        vals = rn_df[rn_df['method'] == method]['R_n'].dropna()
+                        if vals.empty:
+                            continue
+                        if method == 'KBCD':
+                            ax.axvline(1.0, color=palette_all.get(method, 'gray'),
+                                     linestyle='--', linewidth=1.5, alpha=0.8)
+                        elif np.nanstd(vals) < 1e-6:
+                            ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
+                                     linestyle='--', linewidth=1.5, alpha=0.8)
+                        else:
+                            sns.kdeplot(vals, ax=ax, color=palette_all.get(method, 'gray'),
+                                      fill=False, clip=(0, None), linewidth=1.5, alpha=0.8)
+                    ax.set_ylabel('Density', fontsize=8)
+                    if i == len(scenarios) - 1:
+                        ax.set_xlabel(r'$R_n$', fontsize=8)
+                    ax.grid(True, alpha=0.3)
+                    if i == 0:
+                        ax.set_title(r'$R_n$ Density', fontsize=9)
+                
+                # Column 2: M density (BRAVE only)
+                ax = axes[i, 2]
+                m_df = scen_sub.dropna(subset=['M']).copy()
+                m_df = m_df[m_df['method'].isin(brave_methods)]
+                if not m_df.empty:
+                    for method in brave_methods:
+                        vals = m_df[m_df['method'] == method]['M'].dropna()
+                        if vals.empty:
+                            continue
+                        if np.nanstd(vals) < 1e-6:
+                            ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
+                                     linestyle='--', linewidth=1.5, alpha=0.8)
+                        else:
+                            sns.kdeplot(vals, ax=ax, color=palette_all.get(method, 'gray'),
+                                      fill=False, clip=(0, None), linewidth=1.5, alpha=0.8)
+                    ax.set_ylabel('Density', fontsize=8)
+                    if i == len(scenarios) - 1:
+                        ax.set_xlabel(r'$M$', fontsize=8)
+                    ax.grid(True, alpha=0.3)
+                    if i == 0:
+                        ax.set_title(r'$M$ Density', fontsize=9)
+                
+                # Column 3: w_L density (BRAVE only)
+                ax = axes[i, 3]
+                wl_df = scen_sub.dropna(subset=['w_L']).copy()
+                wl_df = wl_df[wl_df['method'].isin(brave_methods)]
+                if not wl_df.empty:
+                    for method in brave_methods:
+                        vals = wl_df[wl_df['method'] == method]['w_L'].dropna()
+                        if vals.empty:
+                            continue
+                        if np.nanstd(vals) < 1e-6:
+                            ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
+                                     linestyle='--', linewidth=1.5, alpha=0.8)
+                        else:
+                            sns.kdeplot(vals, ax=ax, color=palette_all.get(method, 'gray'),
+                                      fill=False, clip=(0, 1), linewidth=1.5, alpha=0.8)
+                    ax.set_ylabel('Density', fontsize=8)
+                    if i == len(scenarios) - 1:
+                        ax.set_xlabel(r'$w_L$', fontsize=8)
+                    ax.grid(True, alpha=0.3)
+                    if i == 0:
+                        ax.set_title(r'$w_L$ Density', fontsize=9)
+                
+                # Add scenario label on the leftmost axis
+                axes[i, 0].set_ylabel(scen_label, fontsize=9)
+            
+            fig.suptitle(f'Adaptive Allocation Stage Metrics ($n_h$={int(n_h_val)})', 
+                         fontsize=12, y=0.995)
+            fig.tight_layout(rect=[0.05, 0, 1, 0.99])
+            out = os.path.join(config.PLOTS_DIR, f"combined_6x4_grid_nh{int(n_h_val)}.pdf")
+            fig.savefig(out)
+            plt.close(fig)
+            print(f"[+] Saved combined 6×4 grid: {out}")
+    
+    _plot_combined_grids()
 
     print(f"[+] All plots saved to: {config.PLOTS_DIR}")
 
@@ -654,4 +871,3 @@ if __name__ == "__main__":
     print("analysis.py - Results processing module")
     print("This module is typically called from main.py")
     print("\nTo test, run: python main.py")
-

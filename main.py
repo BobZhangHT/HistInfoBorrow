@@ -1,8 +1,7 @@
-import argparse
 """
 main.py
 
-Main Orchestration Script for CAHB-UIP Simulation Study
+Main Orchestration Script for the BRAVE Simulation Study
 
 This script coordinates the complete simulation workflow:
     1. Configuration loading and validation
@@ -49,7 +48,7 @@ Output:
 - .simulation_cache/: Cached simulation results (for resumability)
 
 References:
-    CAHB-UIP manuscript Section 3 (Simulation Study Design)
+    BRAVE manuscript Section 3 (Simulation Study Design)
 """
 
 import argparse
@@ -194,9 +193,11 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
     
     # ==== 3. Instantiate Method ====
     
+    method_key = method_name
+
     try:
         # Get method class from methods module
-        MethodClass = getattr(methods, method_name)
+        MethodClass = getattr(methods, method_key)
         method_instance = MethodClass(
             historical_data=hist_data,
             scenario_params=scenario,
@@ -244,7 +245,7 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
         X_new = data_generation.generate_covariates(n=1)
         
         # Get allocation probability from the method
-        # This is where methods differ (CAHB-UIP variants vs CAHB vs KBCD)
+        # This is where methods differ (BRAVE variants vs CAHB vs KBCD)
         try:
             alloc_output = method_instance.get_allocation_prob(
                 X_curr=X_curr,
@@ -268,6 +269,8 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
         if not np.isfinite(pi_1):
             pi_1 = 0.5
         diag_Rn = float(diag.get("R_n", 1.0)) if isinstance(diag, dict) else 1.0
+        diag_wL = float(diag.get("w_L", np.nan)) if isinstance(diag, dict) else np.nan
+        diag_gamma = float(diag.get("gamma", np.nan)) if isinstance(diag, dict) else np.nan
         diag_discount = np.nan
         if isinstance(diag, dict):
             if "M" in diag and np.isfinite(diag["M"]):
@@ -296,19 +299,20 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
         Y_curr = np.append(Y_curr, Y_new)
         
         total_enrolled = len(Z_curr)
-        if total_enrolled >= monitor_start and ((total_enrolled - monitor_start) % monitor_step == 0):
-            prop_treated = float(np.sum(Z_curr) / total_enrolled)
-            x_vals = X_new.reshape(-1)
-            allocation_path.append({
-                "sample_size": int(total_enrolled),
-                "prop_treated": prop_treated,
-                "R_n": diag_Rn,
-                "M": diag_discount,
-                "x1": float(x_vals[0]),
-                "x2": float(x_vals[1]),
-                "x3": float(x_vals[2]),
-                "x4": float(x_vals[3]),
-            })
+        prop_treated = float(np.sum(Z_curr) / total_enrolled)
+        x_vals = X_new.reshape(-1)
+        allocation_path.append({
+            "sample_size": int(total_enrolled),
+            "prop_treated": prop_treated,
+            "R_n": diag_Rn,
+            "M": diag_discount,
+            "w_L": diag_wL,
+            "gamma": diag_gamma,
+            "x1": float(x_vals[0]),
+            "x2": float(x_vals[1]),
+            "x3": float(x_vals[2]),
+            "x4": float(x_vals[3]),
+        })
     
     # ==== 5. Final Analysis ====
     
@@ -318,11 +322,14 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
             Y=Y_curr,
             Z=Z_curr
         )
+        post_M_mean = float(getattr(method_instance, "_posterior_M_mean", np.nan))
+        post_wL_mean = float(getattr(method_instance, "_posterior_wL_mean", np.nan))
     except Exception as e:
         # Estimation can fail (e.g., singular matrices with small samples)
         warnings.warn(f"Estimation failed for {scenario['name']}, method {method_name}, "
                      f"rep {replicate_id}: {e}")
         delta_hat, ci_low, ci_high, prob_gt_0 = np.nan, np.nan, np.nan, np.nan
+        post_M_mean, post_wL_mean = np.nan, np.nan
 
     try:
         calibration_samples = method_instance.get_calibration_payload()
@@ -338,7 +345,7 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
         'scenario_id': scenario['id'],
         'scenario_name': scenario['name'],
         'scenario_type': scenario.get('scenario_type', 'Unknown'),
-        'method': method_name,
+        'method': method_key,
         'replicate_id': replicate_id,
         
         # Scenario parameters
@@ -352,6 +359,8 @@ def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -
         'ci_low': ci_low,
         'ci_high': ci_high,
         'prob_gt_0': prob_gt_0,
+        'post_M_mean': post_M_mean,
+        'post_wL_mean': post_wL_mean,
         
         # Allocation summary
         'n_total': scenario['n'],
@@ -413,7 +422,7 @@ def main(demo_override: Optional[bool] = None, clear_cache: bool = False):
         shutil.rmtree(config.CACHE_DIR, ignore_errors=True)
 
     print("=" * 80)
-    print("CAHB-UIP SIMULATION STUDY".center(80))
+    print("BRAVE SIMULATION STUDY".center(80))
     print("=" * 80)
     print(f"Mode: {'FAST-DEMO' if demo_mode else 'FULL'} (N_REPLICATES={config.N_REPLICATES})")
     print()
@@ -656,7 +665,7 @@ def main(demo_override: Optional[bool] = None, clear_cache: bool = False):
 # =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the CAHB-UIP simulation study")
+    parser = argparse.ArgumentParser(description="Run the BRAVE simulation study")
     parser.add_argument(
         "--demo",
         action="store_true",
@@ -677,8 +686,3 @@ if __name__ == "__main__":
         parser.error("Cannot specify both --demo and --full")
     override = True if args.demo else False if args.full else None
     main(demo_override=override, clear_cache=args.reset)
-
-
-
-
-

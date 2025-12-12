@@ -1,23 +1,24 @@
-# CAHB-UIP: Covariate-Adjusted Historical Borrowing with Unit Information Prior
+# BRAVE: Bayesian Robust Adaptive Variance-Aware Design
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Simulation study code for Covariate-Adjusted Historical Borrowing with Unit Information Prior (CAHB-UIP), a variance-aware adaptive randomization design that borrows historical control information while guarding against incompatibility.
+Simulation study code for BRAVE (Bayesian Robust Adaptive Variance-Aware), a variance-aware adaptive randomization design that borrows historical control information while guarding against incompatibility through a robust mixture prior framework.
 
 ## Overview
 
 Four covariate-adaptive allocation rules are implemented in `methods.py`:
 
-1. **CAHB-UIP-IPD** (proposed): variance-aware borrowing with individual-patient historical data.  
-2. **CAHB-UIP-SLD** (proposed): same UIP framework using only study-level summaries such as historical sample size, mean, and variance.  
+1. **BRAVE-IPD** (proposed): variance-aware borrowing with individual-patient historical data using robust mixture prior.  
+2. **BRAVE-SLD** (proposed): same BRAVE framework using only study-level summaries such as historical sample size, mean, and variance.  
 3. **CAHB** (Jin et al., 2023): commensurability prior on concurrent-control precision.  
 4. **KBCD** (Jiang et al., 2018): kernel-based biased coin design without borrowing.
 
 Key model components:
 
 - Outcomes follow a normal model with arm-specific means and variances. The control mean uses a linear basis on the covariates, and the treatment mean adds a heterogeneous treatment effect that increases with the first covariate and decreases with the third.
-- CAHB-UIP separates historical and concurrent control variances and uses a Gamma-distributed borrowing-amount parameter to decide how much information to pull from the historical controls at each covariate profile.
-- The CECCS gain guiding randomization grows when the concurrent control data are sparse or noisy relative to the historical control, and shrinks when compatibility is poor.
+- BRAVE separates historical and concurrent control variances and uses a Gamma-distributed borrowing-amount parameter M(X) to decide how much information to pull from the historical controls at each covariate profile.
+- The information ratio R_n(X) guiding randomization grows when the concurrent control data are sparse or noisy relative to the historical control, and shrinks when compatibility is poor.
+- BRAVE uses a robust Beta-Bernoulli mixture prior with compatibility weight w_L(X) to guard against incompatibility.
 - Parameters for the control mean, control variances, and borrowing amount are updated by coordinate ascent, followed by a Gibbs sampler to draw posterior treatment-effect curves.
 
 ## Installation
@@ -26,8 +27,8 @@ Key model components:
 - Recommended: 8+ GB RAM for parallel runs
 
 ```bash
-git clone https://github.com/yourusername/CAHB-UIP.git
-cd CAHB-UIP
+git clone https://github.com/yourusername/BRAVE.git
+cd BRAVE
 python -m venv venv
 venv\Scripts\activate  # PowerShell
 pip install -r requirements.txt
@@ -57,25 +58,51 @@ Scenario-specific historical bias:
 
 ## Outputs
 
-- Tables (`results/tables/`): `estimation_metrics.csv`, `estimation_metrics.tex`, `type_i_error_power.tex` (Bias, RMSE, Coverage, CI width, Type I error, Power, allocation rate).  
-- Plots (`results/plots/`): Boxplots of the CECCS gain and borrowing amount by each combination of current and historical sample sizes, plus subgroup borrowing diagnostics for S4 (`rn_box_*.pdf`, `m_box_*.pdf`, `s4_borrowing_box.pdf`).  
-- Cache: `simulation_cache/` stores replicate checkpoints for resumability.
+### Final Inference Stage Metrics (CSV)
+
+Tables (`results/tables/`): 
+- `final_inference_metrics.csv`: Comprehensive evaluation metrics including:
+  - **Estimation accuracy**: Bias, RMSE
+  - **Uncertainty quantification**: 95% CrI Coverage, CI Width
+  - **Hypothesis testing**: Type I Error (τ₀ = 0), Power (τ₀ = 0.4)
+  - **BRAVE-specific**: Posterior mean M and w_L for BRAVE-IPD and BRAVE-SLD
+- `estimation_metrics.tex`, `type_i_error_power.tex`: LaTeX-formatted tables for manuscript
+
+### Adaptive Allocation Stage Plots
+
+Plots (`results/plots/`): 
+
+**Individual scenario plots** (per scenario × κ combination):
+- `traj_alloc_*.pdf`: Allocation trajectory plots showing averaged allocation ratio to treatment arms for all 4 designs
+- `density_rn_*.pdf`: Density plots of R_n(X) for all 4 designs (KBCD fixed at R_n = 1.0)
+- `density_M_*.pdf`: Density plots of M(X) for BRAVE-IPD and BRAVE-SLD
+- `density_wL_*.pdf`: Density plots of w_L(x) for BRAVE-IPD and BRAVE-SLD
+
+**Combined grid plots**:
+- `combined_6x4_grid_nh400.pdf`: 6×4 grid showing all scenarios (rows) × 4 plot types (columns) for n_h=400
+- `combined_6x4_grid_nh800.pdf`: 6×4 grid showing all scenarios (rows) × 4 plot types (columns) for n_h=800
+  - Columns: (1) Allocation trajectory, (2) R_n density, (3) M density, (4) w_L density
+  - Rows: 6 scenario × κ combinations (S1 κ=1.0, S2 κ=0.7, S2 κ=1.3, S3 κ=0.7, S3 κ=1.3, S4 κ=1.3)
+
+**Cache**: `simulation_cache/` stores replicate checkpoints for resumability.
 
 ## Configuration Notes (`config.py`)
 
-- `FAST_DEMO`, `FAST_DEMO_REPLICATES`, `FULL_RUN_REPLICATES`
-- Parallelism and memory: `N_JOBS`, `MAX_MEMORY_PER_JOB`, `BATCH_SIZE`, `USE_CACHE`
-- Priors and Gibbs settings: `PRIORS['uip_gamma_alpha']`, `uip_coord_iter`, `post_gibbs_iter`, etc.
-- Scenario grid: `get_scenario_definitions()` controls historical sample sizes, base treatment effects, variance factors, and historical bias functions.
+- **Simulation settings**: `FAST_DEMO`, `FAST_DEMO_REPLICATES`, `FULL_RUN_REPLICATES`
+- **Parallelism and memory**: `N_JOBS`, `MAX_MEMORY_PER_JOB`, `BATCH_SIZE`, `USE_CACHE`
+- **BRAVE priors and Gibbs settings**: `PRIORS['brave_gamma_a0']`, `brave_gamma_b0`, `brave_amount_shape`, `uip_coord_iter`, `post_gibbs_iter`, etc.
+- **CAHB settings**: `PRIORS['cahb_gamma']`, `cahb_lambda`, `cahb_lambda_quantile`
+- **Scenario grid**: `get_scenario_definitions()` controls historical sample sizes, base treatment effects, variance factors (κ), and historical bias functions
+- **Evaluation metrics**: `ALPHA` (significance level), `DECISION_THRESHOLD` (posterior probability threshold for success)
 
 ## Project Structure
 
 ```
-CAHB-UIP/
+BRAVE/
 ├── config.py               # Simulation configuration and scenarios
-├── data_generation.py      # Data generating mechanisms (DGMs)
-├── methods.py              # Implementation of CAHB-UIP, CAHB, KBCD
-├── analysis.py             # Results processing and visualization
+├── data_generation.py       # Data generating mechanisms (DGMs)
+├── methods.py              # Implementation of BRAVE-IPD, BRAVE-SLD, CAHB, KBCD
+├── analysis.py             # Results processing, visualization, and evaluation metrics
 ├── main.py                 # Main orchestration script
 ├── single_test.py          # Deterministic single-replication harness
 ├── requirements.txt        # Python dependencies
@@ -85,8 +112,8 @@ CAHB-UIP/
 ## Citation
 
 ```bibtex
-@article{cahb-uip2024,
-  title   = {Covariate-Adjusted Historical Borrowing with Unit Information Prior},
+@article{brave2024,
+  title   = {BRAVE: Bayesian Robust Adaptive Variance-Aware Design for Covariate-Adaptive Randomization with Historical Borrowing},
   author  = {[Authors]},
   journal = {[Journal]},
   year    = {2024}
