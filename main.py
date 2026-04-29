@@ -1,688 +1,180 @@
 """
-main.py
-
-Main Orchestration Script for the BRAVE Simulation Study
-
-This script coordinates the complete simulation workflow:
-    1. Configuration loading and validation
-    2. Parallel execution of simulation replicates
-    3. Checkpoint/cache management for resumability
-    4. Progress tracking with detailed status updates
-    5. Results aggregation and analysis
-
-Key Features:
--------------
-- **Parallel Computation**: Uses joblib for multi-core execution
-- **Memory Management**: Batch processing to prevent memory overflow
-- **Checkpointing**: Automatic caching of completed replicates
-- **Resumability**: Continues from last checkpoint after interruption
-- **Progress Tracking**: Real-time progress bars via tqdm
-
-Simulation Workflow:
---------------------
-For each (scenario, method, replicate) combination:
-    1. Generate historical data
-    2. Initialize method with historical data
-    3. Run adaptive trial:
-        a. Burn-in phase: balanced 1:1 randomization
-        b. Adaptive phase: method-specific allocation probabilities
-    4. Final analysis: estimate treatment effect and inference
-    5. Cache results
+main.py — Monte Carlo Simulation Runner (with subgroup tracking)
+=================================================================
+Records per-patient X1 subgroup for allocation ratio analysis,
+plus borrowing diagnostics (mean W, R_n, D_PDC) showing how each
+method responds to historical estimator precision τ²_H.
 
 Usage:
-------
-    python main.py
-
-Configuration:
---------------
-Modify config.py to change:
-    - Number of replicates (N_REPLICATES)
-    - Parallel workers (N_JOBS)
-    - Caching behavior (USE_CACHE)
-    - Memory limits (MAX_MEMORY_PER_JOB)
-
-Output:
--------
-- results/tables/*.csv, *.tex: Performance metric tables
-- results/plots/*.pdf: Publication-quality figures
-- .simulation_cache/: Cached simulation results (for resumability)
-
-References:
-    BRAVE manuscript Section 3 (Simulation Study Design)
+  python main.py                              # demo (10 reps)
+  python main.py --mode full --jobs 4         # 3×2 factorial (500 reps)
+  python main.py --mode precision --jobs 4    # σ_H gradient sweep
 """
+import argparse, os, time
+from pathlib import Path
+import numpy as np, pandas as pd
+from joblib import Parallel, delayed
+import config
 
-import argparse
-import os
-import shutil
-import sys
-import gc
-import warnings
-from contextlib import contextmanager
-from typing import Dict, List, Optional
-
-import numpy as np
-import joblib
-from joblib import parallel
-from tqdm import tqdm
-
-# =============================================================================
-# Project Module Imports
-# =============================================================================
-
-# Add project root to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-try:
-    import config
-    import data_generation
-    import methods
-    import analysis
-except ImportError as e:
-    print(f"ERROR: Could not import project modules: {e}")
-    print("Ensure all .py files are in the same directory.")
-    sys.exit(1)
-
-AllocationResult = getattr(methods, "AllocationResult", None)
-
-
-# =============================================================================
-# Helpers
-# =============================================================================
-
-@contextmanager
-def tqdm_joblib(tqdm_object: tqdm):
-    """
-    Context manager to patch joblib to report into a tqdm progress bar.
-    """
-    class TqdmBatchCompletionCallback(parallel.BatchCompletionCallBack):
-        def __call__(self, *args, **kwargs):
-            tqdm_object.update(n=self.batch_size)
-            return super().__call__(*args, **kwargs)
-
-    old_callback = parallel.BatchCompletionCallBack
-    parallel.BatchCompletionCallBack = TqdmBatchCompletionCallback
+# Prefer C-backed methods (~5–8× faster). Fall back to Python if DLL absent.
+_BACKEND = os.environ.get("RADISH_BACKEND", "auto").lower()
+if _BACKEND in ("c", "auto"):
     try:
-        yield tqdm_object
-    finally:
-        parallel.BatchCompletionCallBack = old_callback
-        tqdm_object.close()
+        from methods_c import RADISH, CAHB, KBCD, _as_2d
+        _BACKEND = "C"
+    except ImportError as _e:
+        if _BACKEND == "c":
+            raise
+        from methods import RADISH, CAHB, KBCD, _as_2d
+        _BACKEND = "Python (C lib not built; run `python build_c.py`)"
+else:
+    from methods import RADISH, CAHB, KBCD, _as_2d
+    _BACKEND = "Python"
+print(f"[main] backend = {_BACKEND}")
 
+# ── Data-generating mechanism ────────────────────────────────────
+def gen_cov(n, rng):
+    X = np.zeros((n, 2)); X[:,0] = rng.binomial(1,.5,n); X[:,1] = rng.standard_normal(n)
+    return X
 
-# =============================================================================
-# Single Simulation Function
-# =============================================================================
+def mu0c(X):
+    X = np.atleast_2d(X); b = config.BETA
+    return b[0] + b[1]*X[:,0] + b[2]*X[:,1] + b[3]*X[:,0]*X[:,1]
 
-def run_single_simulation(scenario: Dict, method_name: str, replicate_id: int) -> Optional[Dict]:
-    """
-    Executes a single simulation replicate for one scenario and method.
-    
-    This function is the core computation unit that gets parallelized and cached.
-    It simulates a complete adaptive randomized trial from start to finish.
-    
-    Trial Simulation Process:
-    --------------------------
-    1. Set random seed for reproducibility
-    2. Generate historical data (control-only)
-    3. Instantiate the randomization method
-    4. Burn-in phase: enroll n_init subjects with balanced allocation
-    5. Adaptive phase: enroll remaining subjects with method-specific allocation
-        - For each new subject:
-            a. Generate covariates
-            b. Compute allocation probability
-            c. Randomize treatment assignment
-            d. Generate outcome
-            e. Update cumulative dataset
-    6. Final analysis: estimate treatment effect and compute inference
-    7. Return performance metrics
-    
-    Args:
-        scenario: Dictionary with scenario parameters:
-            - id: Scenario identifier
-            - name: Human-readable name
-            - n: Current trial sample size
-            - n_h: Historical trial sample size
-            - tau_0: Base treatment effect
-            - kappa: Variance inflation factor
-            - Delta_0_func: Historical bias function
-        method_name: Name of the method class (must exist in methods.py)
-        replicate_id: Replicate number (0 to N_REPLICATES-1)
-    
-    Returns:
-        Dictionary containing:
-            - scenario_id, scenario_name, method, replicate_id
-            - n, n_h, tau_0: Scenario parameters
-            - delta_hat: Treatment effect estimate
-            - ci_low, ci_high: 95% CI bounds
-            - prob_gt_0: P(delta > 0 | Data)
-            - n_treated: Number assigned to treatment
-            - n_total: Total sample size
-        
-        Returns None if simulation fails (caught exceptions)
-    
-    Notes:
-        - Uses deterministic seeding for reproducibility
-        - Seed depends on (scenario_id, method_index, replicate_id)
-        - Failures are logged but do not crash the entire study
-        - Memory is explicitly released after completion
-    """
-    
-    # ==== 1. Set Random Seed for Reproducibility ====
-    
-    # Construct unique seed from simulation parameters
-    # This ensures different scenarios/methods/replicates get different seeds
-    # but the same combination always gets the same seed
+def gen_hist(sc_key, rng, scenarios=None):
+    scenarios = scenarios or config.SCENARIOS
+    sc = scenarios[sc_key]; X = gen_cov(config.N_HISTORICAL, rng)
+    return X, mu0c(X) + sc["b_theta"] + rng.standard_normal(len(X))*sc["sigma_h"]
+
+def gen_outcome(X, Z, delta, rng):
+    X = np.atleast_2d(X); Z = np.asarray(Z, float)
+    sig = np.where(Z == 0, config.SIGMA_0, config.SIGMA_1)
+    return mu0c(X) + delta*Z + rng.standard_normal(len(Z))*sig
+
+# ── Single trial ─────────────────────────────────────────────────
+def run_trial(sc_key, eff_key, mcls, rep, rng, scenarios=None):
+    scenarios = scenarios or config.SCENARIOS
+    td = config.EFFECT_SIZES[eff_key]
+    Xh, Yh = gen_hist(sc_key, rng, scenarios)
+    m = mcls({"X_h": Xh, "Y_h": Yh}, config.COVARIATE_PARAMS, config.PRIORS)
+    Xs = gen_cov(config.N_CURRENT, rng)
+    Xo, Yo, Zo, Pi = [], [], [], []
+    for i in range(config.N_CURRENT):
+        xn = Xs[i]
+        pt = 0.5 if i < config.INTERIM_START else \
+             m.get_allocation_prob(np.array(Xo), np.array(Yo),
+                                   np.array(Zo), xn).pi_treatment
+        z = rng.binomial(1, pt)
+        y = gen_outcome(xn.reshape(1,-1), np.array([z]), td, rng)[0]
+        Xo.append(xn); Yo.append(y); Zo.append(z); Pi.append(pt)
+    Xa, Ya, Za = np.array(Xo), np.array(Yo), np.array(Zo)
+    est, cl, ch, pp = m.estimate_treatment_effect(Xa, Ya, Za)
+    rej = int(np.isfinite(cl) and np.isfinite(ch) and (cl > 0 or ch < 0))
+
+    # ── Borrowing diagnostics ──
     try:
-        method_idx = config.METHODS_TO_RUN.index(method_name)
-    except ValueError:
-        method_idx = 0
-    
-    seed = (scenario['id'] * 100000) + (method_idx * 10000) + replicate_id
-    np.random.seed(seed)
-    
-    # ==== 2. Generate Historical Data ====
-    
-    try:
-        hist_data = data_generation.generate_historical_data(
-            n_h=scenario['n_h'],
-            scenario_params=scenario
-        )
-    except Exception as e:
-        warnings.warn(f"Failed to generate historical data for {scenario['name']}, "
-                     f"method {method_name}, rep {replicate_id}: {e}")
-        return None
-    
-    # ==== 3. Instantiate Method ====
-    
-    method_key = method_name
-
-    try:
-        # Get method class from methods module
-        MethodClass = getattr(methods, method_key)
-        method_instance = MethodClass(
-            historical_data=hist_data,
-            scenario_params=scenario,
-            priors=config.PRIORS
-        )
-    except AttributeError:
-        warnings.warn(f"Method {method_name} not found in methods module.")
-        return None
-    except Exception as e:
-        warnings.warn(f"Failed to instantiate method {method_name}: {e}")
-        return None
-
-    # ==== 4. Trial Simulation ====
-    
-    # 4a. Burn-in Phase: Balanced Allocation
-    # ---------------------------------------
-    # First n_init subjects receive balanced 1:1 randomization
-    # This provides initial data for adaptive methods to "learn" from
-    
-    X_curr = data_generation.generate_covariates(config.N_INIT)
-    Z_curr = np.random.binomial(1, config.ALLOC_BURN_IN, config.N_INIT)
-    
-    # Generate burn-in outcomes
-    Y_curr = np.array([
-        data_generation.generate_single_outcome(
-            X_new=X_curr[i].reshape(1, -1),
-            z_new=Z_curr[i],
-            tau_0=scenario['tau_0'],
-            kappa=scenario['kappa']
-        )
-        for i in range(config.N_INIT)
-    ])
-    
-    # 4b. Adaptive Allocation Phase
-    # ------------------------------
-    # Remaining subjects receive adaptive allocation based on method
-    
-    n_adaptive = scenario['n'] - config.N_INIT
-    monitor_start = getattr(config, "SEQ_MONITOR_START", config.N_INIT)
-    monitor_step = max(1, int(getattr(config, "SEQ_MONITOR_STEP", 20)))
-    allocation_path = []
-    
-    for _ in range(n_adaptive):
-        # Generate new subject's covariates
-        X_new = data_generation.generate_covariates(n=1)
-        
-        # Get allocation probability from the method
-        # This is where methods differ (BRAVE variants vs CAHB vs KBCD)
-        try:
-            alloc_output = method_instance.get_allocation_prob(
-                X_curr=X_curr,
-                Y_curr=Y_curr,
-                Z_curr=Z_curr,
-                X_new=X_new
-            )
-            diag = {}
-            if AllocationResult is not None and isinstance(alloc_output, AllocationResult):
-                pi_1 = float(np.clip(alloc_output.pi_treatment, 0.0, 1.0))
-                diag = dict(getattr(alloc_output, "diagnostics", {}) or {})
-            else:
-                pi_1 = float(np.clip(float(alloc_output), 0.0, 1.0))
-        except Exception as e:
-            # If allocation fails, default to balanced
-            warnings.warn(f"Allocation failed for {method_name}, using balanced: {e}")
-            pi_1 = 0.5
-            diag = {}
-        
-        # Guard diagnostics
-        if not np.isfinite(pi_1):
-            pi_1 = 0.5
-        diag_Rn = float(diag.get("R_n", 1.0)) if isinstance(diag, dict) else 1.0
-        diag_wL = float(diag.get("w_L", np.nan)) if isinstance(diag, dict) else np.nan
-        diag_gamma = float(diag.get("gamma", np.nan)) if isinstance(diag, dict) else np.nan
-        diag_discount = np.nan
-        if isinstance(diag, dict):
-            if "M" in diag and np.isfinite(diag["M"]):
-                diag_discount = float(diag["M"])
-            elif "mean" in diag and np.isfinite(diag["mean"]):
-                diag_discount = float(diag["mean"])
-        max_rn_allowed = float(getattr(config, "MAX_ESS", 1e6))
-        if not np.isfinite(diag_Rn):
-            diag_Rn = 1.0
-        diag_Rn = float(np.clip(diag_Rn, 0.0, max_rn_allowed))
-        
-        # Randomize treatment assignment
-        Z_new = np.random.binomial(1, pi_1)
-        
-        # Generate outcome
-        Y_new = data_generation.generate_single_outcome(
-            X_new=X_new,
-            z_new=Z_new,
-            tau_0=scenario['tau_0'],
-            kappa=scenario['kappa']
-        )
-        
-        # Update cumulative dataset
-        X_curr = np.vstack([X_curr, X_new])
-        Z_curr = np.append(Z_curr, Z_new)
-        Y_curr = np.append(Y_curr, Y_new)
-        
-        total_enrolled = len(Z_curr)
-        prop_treated = float(np.sum(Z_curr) / total_enrolled)
-        x_vals = X_new.reshape(-1)
-        allocation_path.append({
-            "sample_size": int(total_enrolled),
-            "prop_treated": prop_treated,
-            "R_n": diag_Rn,
-            "M": diag_discount,
-            "w_L": diag_wL,
-            "gamma": diag_gamma,
-            "x1": float(x_vals[0]),
-            "x2": float(x_vals[1]),
-            "x3": float(x_vals[2]),
-            "x4": float(x_vals[3]),
-        })
-    
-    # ==== 5. Final Analysis ====
-    
-    try:
-        delta_hat, ci_low, ci_high, prob_gt_0 = method_instance.estimate_treatment_effect(
-            X=X_curr,
-            Y=Y_curr,
-            Z=Z_curr
-        )
-        post_M_mean = float(getattr(method_instance, "_posterior_M_mean", np.nan))
-        post_wL_mean = float(getattr(method_instance, "_posterior_wL_mean", np.nan))
-    except Exception as e:
-        # Estimation can fail (e.g., singular matrices with small samples)
-        warnings.warn(f"Estimation failed for {scenario['name']}, method {method_name}, "
-                     f"rep {replicate_id}: {e}")
-        delta_hat, ci_low, ci_high, prob_gt_0 = np.nan, np.nan, np.nan, np.nan
-        post_M_mean, post_wL_mean = np.nan, np.nan
-
-    try:
-        calibration_samples = method_instance.get_calibration_payload()
-        if calibration_samples is None:
-            calibration_samples = []
+        diag = m.compute_diagnostics(Xa, Ya, Za)
     except Exception:
-        calibration_samples = []
-    
-    # ==== 6. Compile Results ====
-    
-    result = {
-        # Identifiers
-        'scenario_id': scenario['id'],
-        'scenario_name': scenario['name'],
-        'scenario_type': scenario.get('scenario_type', 'Unknown'),
-        'method': method_key,
-        'replicate_id': replicate_id,
-        
-        # Scenario parameters
-        'n': scenario['n'],
-        'n_h': scenario['n_h'],
-        'tau_0': scenario['tau_0'],
-        'kappa': scenario.get('kappa', np.nan),
-        
-        # Estimates
-        'delta_hat': delta_hat,
-        'ci_low': ci_low,
-        'ci_high': ci_high,
-        'prob_gt_0': prob_gt_0,
-        'post_M_mean': post_M_mean,
-        'post_wL_mean': post_wL_mean,
-        
-        # Allocation summary
-        'n_total': scenario['n'],
-        'n_treated': int(np.sum(Z_curr)),
-        'n_control': int(np.sum(1 - Z_curr)),
-        'allocation_path': allocation_path,
-        'calibration_samples': calibration_samples,
-    }
-    
-    # ==== 7. Memory Cleanup ====
-    
-    # Explicitly delete large objects to free memory
-    del X_curr, Y_curr, Z_curr, method_instance, hist_data
-    gc.collect()
-    
-    return result
+        diag = {"mean_W": np.nan, "mean_Rn": np.nan,
+                "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
 
+    # ── Subgroup allocation ratios (X1=0 vs X1=1) ──
+    x1 = Xa[:, 0]
+    mask0 = x1 == 0; mask1 = x1 == 1
+    alloc_x1_0 = float(np.mean(Za[mask0])) if mask0.sum() > 0 else np.nan
+    alloc_x1_1 = float(np.mean(Za[mask1])) if mask1.sum() > 0 else np.nan
 
-# =============================================================================
-# Main Orchestration Function
-# =============================================================================
-
-def main(demo_override: Optional[bool] = None, clear_cache: bool = False):
-    """
-    Main entry point for the simulation study.
-    
-    Coordinates the complete workflow:
-        1. Validate configuration
-        2. Setup directories
-        3. Initialize caching
-        4. Create task list
-        5. Execute tasks in parallel with progress tracking
-        6. Process and save results
-        7. Generate tables and plots
-    
-    Progress Tracking:
-        - Real-time progress bar showing completed/total tasks
-        - Estimated time remaining
-        - Current task details
-    
-    Checkpointing:
-        - Completed tasks cached to disk
-        - Interrupted runs can resume from last checkpoint
-        - Cache location: .simulation_cache/
-    
-    Error Handling:
-        - Individual task failures logged but don't stop study
-        - Final check: warn if too many failures
-        - Continue with valid results even if some tasks fail
-    """
-    
-    # Determine run mode (full vs fast demo)
-    demo_mode = config.FAST_DEMO if demo_override is None else bool(demo_override)
-    config.FAST_DEMO = demo_mode
-    config.N_REPLICATES = config.FAST_DEMO_REPLICATES if demo_mode else config.FULL_RUN_REPLICATES
-
-    if clear_cache and os.path.isdir(config.CACHE_DIR):
-        print(f"Clearing cache directory for fresh run: {config.CACHE_DIR}")
-        shutil.rmtree(config.CACHE_DIR, ignore_errors=True)
-
-    print("=" * 80)
-    print("BRAVE SIMULATION STUDY".center(80))
-    print("=" * 80)
-    print(f"Mode: {'FAST-DEMO' if demo_mode else 'FULL'} (N_REPLICATES={config.N_REPLICATES})")
-    print()
-    
-    # ==== 1. Validate Configuration ====
-    
-    print("Step 1: Validating configuration...")
-    try:
-        config.validate_config()
-    except Exception as e:
-        print(f"Configuration validation failed: {e}")
-        sys.exit(1)
-    
-    print()
-    
-    # ==== 2. Setup Directories ====
-    
-    print("Step 2: Creating directories...")
-    directories = [
-        config.CACHE_DIR,
-        config.RESULTS_DIR,
-        config.PLOTS_DIR,
-        config.TABLES_DIR
-    ]
-    
-    if hasattr(config, 'RAW_DATA_DIR'):
-        directories.append(config.RAW_DATA_DIR)
-    
-    for directory in directories:
-        os.makedirs(directory, exist_ok=True)
-        print(f"  √ {directory}")
-    
-    print()
-    
-    # ==== 3. Setup Caching ====
-    
-    print("Step 3: Initializing checkpoint system...")
-    
-    # Create memory-mapped cache with size limits
-    try:
-        memory = joblib.Memory(
-            location=config.CACHE_DIR,
-            verbose=0,
-            bytes_limit=None  # Supported in newer joblib
-        )
-    except TypeError:
-        memory = joblib.Memory(
-            location=config.CACHE_DIR,
-            verbose=0
-        )
-    
-    # Wrap simulation function with caching if enabled
-    if config.USE_CACHE:
-        cached_run_single = memory.cache(run_single_simulation)
-        print(f"  √ Checkpointing enabled (cache: {config.CACHE_DIR})")
-        print("    √ Completed replicates will be cached")
-        print("    √ Interrupted runs can resume from checkpoint")
-    else:
-        cached_run_single = run_single_simulation
-        print("  √ Checkpointing DISABLED (set USE_CACHE=True to enable)")
-    
-    print()
-    
-    # ==== 4. Load Scenarios and Create Task List ====
-    
-    print("Step 4: Loading simulation scenarios...")
-    scenarios = config.get_scenario_definitions()
-    
-    print(f"  √ Loaded {len(scenarios)} scenarios")
-    print(f"  √ Comparing {len(config.METHODS_TO_RUN)} methods:")
-    for method in config.METHODS_TO_RUN:
-        print(f"      - {method}")
-    print(f"  √ Running {config.N_REPLICATES} replicates per (scenario x method)")
-    if getattr(config, "FAST_DEMO", False):
-        print(f"    √ FAST_DEMO active (use '--full' or unset flag for {config.FULL_RUN_REPLICATES} replicates)")
-    
-    # Create task list: all (scenario, method, replicate) combinations
-    print("\nStep 5: Creating task queue...")
-    
-    tasks = []
-    for scenario in scenarios:
-        for method_name in config.METHODS_TO_RUN:
-            for rep_id in range(config.N_REPLICATES):
-                # Use joblib.delayed to defer execution
-                task = joblib.delayed(cached_run_single)(scenario, method_name, rep_id)
-                tasks.append(task)
-    
-    n_tasks = len(tasks)
-    print(f"  √ Created {n_tasks:,} tasks")
-    print(f"  √ Using {config.N_JOBS} parallel workers")
-    if hasattr(config, 'MAX_MEMORY_PER_JOB') and config.MAX_MEMORY_PER_JOB:
-        print(f"  √ Memory limit: {config.MAX_MEMORY_PER_JOB} MB per worker")
-    
-    print()
-    
-    # ==== 5. Execute Tasks in Parallel ====
-    
-    print("=" * 80)
-    print("RUNNING SIMULATIONS".center(80))
-    print("=" * 80)
-    print()
-    
-    # Configure joblib Parallel with memory management
-    # Limit BLAS threads in workers to avoid oversubscription/memory spikes
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-    parallel_kwargs = {
-        'n_jobs': config.N_JOBS,
-        'verbose': 0,  # Suppress joblib's own progress (we use tqdm)
-        'backend': 'loky',  # Use loky backend for better memory management
-        'batch_size': 1,    # Small batches to cap per-worker memory
-        'pre_dispatch': 'n_jobs',  # Do not queue more than workers
-    }
-    
-    # Add memory limit if specified
-    if hasattr(config, 'MAX_MEMORY_PER_JOB') and config.MAX_MEMORY_PER_JOB:
-        # Convert MB to bytes
-        max_memory_bytes = config.MAX_MEMORY_PER_JOB * 1024 * 1024
-        # Note: joblib's max_nbytes applies per worker
-        parallel_kwargs['max_nbytes'] = max_memory_bytes
-    
-    progress_bar = tqdm(
-        total=n_tasks,
-        desc="Simulating",
-        unit="task",
-        ncols=100,
-        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+    return dict(
+        scenario=sc_key, effect_type=eff_key, method=m.name, rep=rep,
+        true_delta=td, estimated_delta=est, ci_low=cl, ci_high=ch,
+        rejected=rej, estimation_bias=est-td,
+        allocation_ratio=float(np.mean(Za)),
+        alloc_x1_0=alloc_x1_0,
+        alloc_x1_1=alloc_x1_1,
+        n_x1_0=int(mask0.sum()),
+        n_x1_1=int(mask1.sum()),
+        mean_W=diag["mean_W"],
+        mean_Rn=diag["mean_Rn"],
+        mean_Dpdc=diag["mean_Dpdc"],
+        mean_tau2_H=diag["mean_tau2_H"],
+        # Scenario factors (for precision-grid plots)
+        b_theta=float(scenarios[sc_key]["b_theta"]),
+        sigma_h=float(scenarios[sc_key]["sigma_h"]),
     )
 
-    try:
-        with tqdm_joblib(progress_bar):
-            results = joblib.Parallel(**parallel_kwargs)(tasks)
-    except KeyboardInterrupt:
-        print("\n\nSimulation interrupted by user (Ctrl+C).")
-        print("Partial results may be cached. Rerun to resume from checkpoint.")
-        sys.exit(1)
+def _task(sc, ef, mc, r, seed, scenarios):
+    try: return run_trial(sc, ef, mc, r, np.random.default_rng(seed), scenarios)
     except Exception as e:
-        print(f"\n\nERROR during parallel execution: {e}")
-        print("Check logs for details.")
-        sys.exit(1)
-    
-    print()
-    print("=" * 80)
-    
-    # ==== 6. Filter and Validate Results ====
-    
-    print("\nStep 6: Processing results...")
-    
-    # Remove None results (failed tasks)
-    n_total = len(results)
-    results = [r for r in results if r is not None]
-    n_valid = len(results)
-    n_failed = n_total - n_valid
-    
-    print(f"  √ Total tasks: {n_total:,}")
-    print(f"  √ Successful: {n_valid:,} ({100*n_valid/n_total:.1f}%)")
-    
-    if n_failed > 0:
-        print(f"  √ Failed: {n_failed:,} ({100*n_failed/n_total:.1f}%)")
-        
-        # Warn if failure rate is high
-        if n_failed / n_total > 0.1:
-            warnings.warn(
-                f"High failure rate ({100*n_failed/n_total:.1f}%). "
-                "Check error messages above for details.",
-                UserWarning
-            )
-    
-    if n_valid == 0:
-        print("\n ERROR: All simulations failed. Cannot generate results.")
-        print("Check configuration and error messages.")
-        sys.exit(1)
-    
-    print()
-    
-    # ==== 7. Aggregate Results ====
-    
-    print("Step 7: Computing performance metrics...")
-    
-    try:
-        analysis_outputs = analysis.process_results(results)
-        summary_df = analysis_outputs.get('summary')
-        n_summary = len(summary_df) if summary_df is not None else 0
-        print(f"  √ Aggregated {n_summary} (scenario x method) combinations")
-        print(f"  √ Metrics computed: Bias, RMSE, Coverage, Type I Error, Power")
-    except Exception as e:
-        print(f"\n ERROR during results processing: {e}")
-        sys.exit(1)
-    
-    print()
-    
-    # ==== 8. Generate Tables ====
-    
-    print("Step 8: Generating tables...")
-    
-    try:
-        analysis.generate_tables(analysis_outputs)
-    except Exception as e:
-        print(f" Warning: Table generation failed: {e}")
-    
-    print()
-    
-    # ==== 9. Generate Plots ====
-    
-    print("Step 9: Generating plots...")
-    
-    try:
-        analysis.generate_plots(analysis_outputs)
-    except Exception as e:
-        print(f" Warning: Plot generation failed: {e}")
-    
-    print()
-    
-    # ==== 10. Summary ====
-    
-    print("=" * 80)
-    print("SIMULATION COMPLETE".center(80))
-    print("=" * 80)
-    print()
-    print("Results saved to:")
-    print(f"  √ Tables: {config.TABLES_DIR}")
-    print(f"  √ Plots:  {config.PLOTS_DIR}")
-    print(f"  √ Cache:  {config.CACHE_DIR} (for resumability)")
-    print()
-    print("Next steps:")
-    print("  1. Review tables in results/tables/")
-    print("  2. Review plots in results/plots/")
-    print("  3. Incorporate into manuscript")
-    print()
-    print("To rerun with fresh data:")
-    print(f"  rm -rf {config.CACHE_DIR}")
-    print(f"  python main.py")
-    print()
-    print(" Done!")
-    print("=" * 80)
+        return dict(error=str(e), scenario=sc, effect_type=ef,
+                    method=mc.__name__, rep=r)
 
+# ── Parallel runner ──────────────────────────────────────────────
+def run_sim(mode, seed=2026, n_jobs=4):
+    nreps = config.get_mode_replications(mode)
+    scenarios = config.get_mode_scenarios(mode)
+    tasks, idx = [], 0
+    for sc in scenarios:
+        for ef in config.EFFECT_SIZES:
+            for mc in [RADISH, CAHB, KBCD]:
+                for r in range(nreps):
+                    tasks.append((sc, ef, mc, r, seed+idx, scenarios)); idx += 1
+    print(f"[{mode}] {len(tasks)} tasks  (reps={nreps}, jobs={n_jobs}, "
+          f"scenarios={len(scenarios)})")
+    res = Parallel(n_jobs=n_jobs, backend="loky", verbose=5)(
+        delayed(_task)(*t) for t in tasks)
+    good = [r for r in res if "error" not in r]
+    bad  = [r for r in res if "error" in r]
+    if bad: print(f"  {len(bad)} errors; first: {bad[0]}")
+    return pd.DataFrame(good)
 
-# =============================================================================
-# Entry Point
-# =============================================================================
+# ── Metrics ──────────────────────────────────────────────────────
+def metrics(df, scenarios=None):
+    df = df.copy(); td = df["true_delta"]
+    df["coverage"] = ((df.ci_low <= td) & (td <= df.ci_high)).astype(int)
+    df["width"] = df.ci_high - df.ci_low
+    df["sq_err"] = (df.estimated_delta - td)**2
+    sc_order = list(scenarios.keys()) if scenarios is not None else config.SCENARIO_ORDER
+    rows = []
+    for sc in sc_order:
+        for ef in config.EFFECT_ORDER:
+            for mt in config.METHOD_ORDER:
+                s = df[(df.scenario==sc)&(df.effect_type==ef)&(df.method==mt)]
+                if s.empty: continue
+                rr = s.rejected.mean()
+                rows.append(dict(Scenario=sc, Effect=ef, Method=mt, N=len(s),
+                    Bias=round(s.estimation_bias.mean(),4),
+                    RMSE=round(np.sqrt(s.sq_err.mean()),4),
+                    Rejection=round(rr,4), Coverage=round(s.coverage.mean(),4),
+                    Width=round(s.width.mean(),4),
+                    Alloc_Overall=round(s.allocation_ratio.mean(),4),
+                    Alloc_X1_0=round(s.alloc_x1_0.mean(),4),
+                    Alloc_X1_1=round(s.alloc_x1_1.mean(),4),
+                    Mean_W=round(s.mean_W.mean(skipna=True),4) if "mean_W" in s else "",
+                    Mean_Rn=round(s.mean_Rn.mean(skipna=True),4) if "mean_Rn" in s else "",
+                    Mean_Dpdc=round(s.mean_Dpdc.mean(skipna=True),4) if "mean_Dpdc" in s else "",
+                    Type_I_Error=round(rr,4) if ef=="Null" else "",
+                    Power=round(rr,4) if ef=="Power" else ""))
+    return pd.DataFrame(rows)
 
+# ── CLI ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the BRAVE simulation study")
-    parser.add_argument(
-        "--demo",
-        action="store_true",
-        help="Run in fast demonstration mode (small number of replicates)",
-    )
-    parser.add_argument(
-        "--reset",
-        action="store_true",
-        help="Delete the cache directory before running (applies to demo and full modes)",
-    )
-    parser.add_argument(
-        "--full",
-        action="store_true",
-        help="Force full run even if FAST_DEMO env/config is enabled",
-    )
-    args = parser.parse_args()
-    if args.demo and args.full:
-        parser.error("Cannot specify both --demo and --full")
-    override = True if args.demo else False if args.full else None
-    main(demo_override=override, clear_cache=args.reset)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["demo","full","precision"], default="demo")
+    ap.add_argument("--seed", type=int, default=2026)
+    ap.add_argument("--jobs", type=int, default=config.N_JOBS)
+    args = ap.parse_args()
+    t0 = time.time()
+    df = run_sim(args.mode, args.seed, args.jobs)
+    print(f"\nDone in {(time.time()-t0)/60:.1f} min  ({len(df)} results)")
+    out = config.get_mode_output_dir(args.mode); out.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out/"raw_results.csv", index=False)
+    scenarios = config.get_mode_scenarios(args.mode)
+    tbl = metrics(df, scenarios); tbl.to_csv(out/"metrics.csv", index=False)
+    print("\n" + tbl.to_string(index=False))
+    # Generate plots
+    try:
+        import analysis
+        analysis.run_analysis(df, out, mode=args.mode)
+        print(f"\nPlots saved to {out}/plots/")
+    except Exception as e:
+        print(f"Plot generation skipped: {e}")

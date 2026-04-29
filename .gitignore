@@ -73,6 +73,7 @@ references/
 papers/
 R Codes/
 simulation_cache/
+real_data/
 *.pdf
 
 # Large data files
@@ -157,6 +158,7 @@ $RECYCLE.BIN/
 docs/_build/
 docs/_static/
 docs/_templates/
+docs/
 
 # =============================================================================
 # Testing and Coverage
@@ -167,6 +169,8 @@ docs/_templates/
 htmlcov/
 .tox/
 .hypothesis/
+scripts/
+tune_results/
 
 # =============================================================================
 # Keep These Files (Negative Patterns)

@@ -1,873 +1,672 @@
 """
-analysis.py
+analysis.py — Publication-quality figures and tables.
 
-Results Analysis and Visualization for the BRAVE Simulation Study
+Two output modes
+----------------
+mode="full"       3×2 factorial scenarios:
+    Fig 1  Allocation Ratio   (Null | Power)
+    Fig 2  Bias + RMSE        (2×2 metric × effect)
+    Fig 3  CI Width + Coverage (2×2 metric × effect)
+    Fig 4  Type-I + Power
+    Fig 5  Borrowing Diagnostics: mean W, mean R_n         ← NEW
+    Fig 6  Precision-Awareness Map: W vs (b_θ, σ_H) heat   ← NEW
 
-This module processes raw simulation results and generates publication-ready
-outputs including:
-    1. Performance metric tables (CSV and LaTeX formats)
-    2. High-quality PDF plots meeting Statistics in Medicine standards
-    3. Comprehensive evaluation metrics (Section 3.5)
+mode="precision"  σ_H gradient sweep at fixed b_θ:
+    Fig P1  Borrowing weight W vs σ_H        (showcase)   ← NEW
+    Fig P2  Information ratio R_n vs σ_H                  ← NEW
+    Fig P3  RMSE & Coverage vs σ_H                        ← NEW
+    Fig P4  Type-I error / Power vs σ_H                   ← NEW
 
-Evaluation Metrics (Section 3.5 of manuscript):
------------------------------------------------
-1. Estimation Performance:
-   - Bias: E[delta_hat - delta_true]
-   - RMSE: sqrt(E[(delta_hat - delta_true)^2])
-   - Coverage: P(delta_true in CI_95%)
-   - CI Width: Average width of 95% confidence intervals
-
-2. Decision Error Rates:
-   - Type I Error: P(reject H0 | H0 true) when tau_0 = 0
-   - Power: P(reject H0 | H1 true) when tau_0 = 0.4
-   - Decision threshold: P(delta > 0 | Data) > 0.975
-
-3. Allocation Performance:
-   - Treatment allocation rate: proportion assigned to treatment
-   - Allocation balance across covariate subgroups
-
-Output Specifications:
-----------------------
-- Figures: PDF format, 300 DPI, Times New Roman font
-- Tables: CSV for data, LaTeX for manuscript insertion
-- Follows Statistics in Medicine figure/table guidelines
-
-References:
-    BRAVE manuscript Section 3.5 (Evaluation Metrics)
+All figures saved as vector PDF at publication quality.
 """
-
-import os
+from __future__ import annotations
+from pathlib import Path
 import warnings
-from typing import List
-import pandas as pd
-import numpy as np
 
-# Configure matplotlib for publication-quality PDFs
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
+import matplotlib.patches as mpatches
+import numpy as np
+import pandas as pd
 
-# Import project configuration
 try:
     import config
-    import data_generation
-except ImportError as e:
-    warnings.warn(f"Could not import project modules: {e}")
+except ImportError:
+    config = None
 
+# ═══════════════════════════════════════════════════════════════════
+# Publication-quality global style
+# ═══════════════════════════════════════════════════════════════════
 
-# =============================================================================
-# Style Configuration for Publication-Quality Figures
-# =============================================================================
-
-def configure_plot_style():
-    """
-    Configures matplotlib and seaborn for Statistics in Medicine publication standards.
-    
-    Guidelines:
-        - Font: Times New Roman, 10pt for body, 12pt for titles
-        - Resolution: 300 DPI minimum
-        - Format: PDF (vector graphics)
-        - Colors: Colorblind-friendly palette
-        - Grids: Light, unobtrusive
-    """
-    # Set publication style
-    sns.set_style("whitegrid")
-    sns.set_context("paper", font_scale=1.2)
-    
-    # Matplotlib rcParams
-    plt.rcParams.update({
-        # Font settings
-        'font.family': 'serif',
-        'font.serif': ['Times New Roman', 'Times', 'DejaVu Serif'],
-        'font.size': 10,
-        'axes.labelsize': 10,
-        'axes.titlesize': 12,
-        'xtick.labelsize': 9,
-        'ytick.labelsize': 9,
-        'legend.fontsize': 9,
-        'legend.title_fontsize': 10,
-        
-        # Figure settings
-        'figure.figsize': (7, 5),
-        'figure.dpi': 100,  # Screen display
-        'savefig.dpi': 300,  # Publication quality
-        'savefig.format': 'pdf',
-        'savefig.bbox': 'tight',
-        
-        # Line and marker settings
-        'lines.linewidth': 1.5,
-        'lines.markersize': 6,
-        'patch.linewidth': 0.5,
-        
-        # Grid settings
-        'axes.grid': True,
-        'grid.linestyle': ':',
-        'grid.linewidth': 0.5,
-        'grid.alpha': 0.6,
-        
-        # Axes settings
-        'axes.linewidth': 0.8,
-        'axes.edgecolor': 'black',
-        'axes.labelpad': 4.0,
-        
-        # Legend settings
-        'legend.frameon': True,
-        'legend.framealpha': 0.9,
-        'legend.edgecolor': 'gray',
-        'legend.fancybox': False,
-    })
-    
-    # Define colorblind-friendly palette
-    # Based on Wong (2011) Nature Methods palette
-    colors = {
-        'KBCD': '#009E73',      # Bluish green
-        'CAHB': '#56B4E9',      # Sky blue
-        'BRAVE_IPD': '#E69F00', # Orange
-        'BRAVE_SLD': '#D55E00', # Vermilion
-    }
-    
-    return colors
-
-
-# Default method label mapping (used if config lacks entries or for legacy aliases)
-DEFAULT_METHOD_LABELS = {
-    'BRAVE_IPD': 'BRAVE-IPD',
-    'BRAVE_SLD': 'BRAVE-SLD',
-    'CAHB': 'CAHB',
-    'KBCD': 'KBCD',
+PUB_RC = {
+    # Fonts (LaTeX-friendly, sans-serif body, serif math optional)
+    "font.family":        "sans-serif",
+    "font.sans-serif":    ["Arial", "Helvetica", "DejaVu Sans"],
+    "font.size":          11,
+    "axes.titlesize":     12,
+    "axes.labelsize":     11,
+    "xtick.labelsize":    10,
+    "ytick.labelsize":    10,
+    "legend.fontsize":    9.5,
+    "legend.title_fontsize": 10,
+    "figure.titlesize":   13,
+    # Lines & axes
+    "axes.linewidth":     0.9,
+    "axes.spines.top":    False,
+    "axes.spines.right":  False,
+    "axes.grid":          True,
+    "grid.linestyle":     ":",
+    "grid.linewidth":     0.6,
+    "grid.alpha":         0.4,
+    "lines.linewidth":    1.8,
+    "lines.markersize":   5.5,
+    "lines.markeredgewidth": 0.8,
+    # Ticks
+    "xtick.direction":    "out",
+    "ytick.direction":    "out",
+    "xtick.major.size":   3.5,
+    "ytick.major.size":   3.5,
+    "xtick.major.width":  0.8,
+    "ytick.major.width":  0.8,
+    # Vector PDF
+    "pdf.fonttype":       42,    # TrueType for editable text in PDFs
+    "ps.fonttype":        42,
+    "savefig.dpi":        600,
+    "savefig.bbox":       "tight",
+    "savefig.pad_inches": 0.05,
+    # Legend
+    "legend.frameon":     True,
+    "legend.framealpha":  0.92,
+    "legend.edgecolor":   "0.6",
+    "legend.fancybox":    False,
 }
 
+plt.rcParams.update(PUB_RC)
 
-# =============================================================================
-# True Treatment Effect Calculation
-# =============================================================================
+# Color-blind-friendly palette (Okabe–Ito-derived)
+METHOD_ORDER  = ["KBCD", "CAHB", "RADISH"]
+METHOD_COLORS = {
+    "KBCD":   "#0072B2",   # blue
+    "CAHB":   "#D55E00",   # vermillion
+    "RADISH": "#009E73",   # bluish green
+}
+METHOD_MARKERS = {"KBCD": "o", "CAHB": "s", "RADISH": "^"}
+METHOD_LABELS  = {
+    "KBCD":   "KBCD (no borrowing)",
+    "CAHB":   "CAHB",
+    "RADISH": "RADISH (proposed)",
+}
 
-def get_true_delta(tau_0: float) -> float:
-    """
-    Computes the true marginal average treatment effect (MATE).
-    
-    From Section 3.1, the conditional average treatment effect is:
-        tau(x) = tau_0 + 0.5*X1 - 0.5*I(X2=1)
-    
-    Marginal expectation:
-        E[tau(X)] = E[tau_0 + 0.5*X1 - 0.5*I(X2=1)]
-                  = tau_0 + 0.5*E[X1] - 0.5*P(X2=1)
-                  = tau_0 + 0.5*0 - 0.5*0.5
-                  = tau_0 - 0.25
-    
-    Args:
-        tau_0: Base treatment effect parameter
-    
-    Returns:
-        True marginal average treatment effect
-    """
-    return tau_0
+EFFECT_DISPLAY = {"Null": r"$\Delta = 0$ (Null)", "Power": r"$\Delta = 0.5$ (Power)"}
 
 
-# =============================================================================
-# Results Processing
-# =============================================================================
+def _save(fig, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(path), format="pdf")
+    plt.close(fig)
 
-def process_results(results_list: list) -> dict:
-    """
-    Processes raw simulation results into aggregated performance metrics and
-    supporting data structures required for downstream figures.
-    """
-    outputs = {
-        'summary': pd.DataFrame(),
-        'raw': pd.DataFrame(),
-        'allocation_path': pd.DataFrame(),
-        'calibration': pd.DataFrame(),
-    }
 
-    if not results_list:
-        warnings.warn("No results to process. Returning empty structures.")
-        return outputs
+def _scen_short_factorial(s):
+    if config and s in config.SCENARIOS:
+        sc = config.SCENARIOS[s]
+        idx = s.split("_")[0]
+        return f"{idx}\n$b={sc['b_theta']}$\n$\\sigma_H={sc['sigma_h']}$"
+    return s
 
-    df = pd.DataFrame(results_list)
-    outputs['raw'] = df.copy()
 
-    n_total = len(df)
-    df = df[df['delta_hat'].notna()]
-    n_valid = len(df)
-    if n_valid < n_total:
-        warnings.warn(f"Removed {n_total - n_valid} failed replicates ({100*(n_total-n_valid)/n_total:.1f}%)")
+def _aggregate(df, scenarios):
+    df = df.copy()
+    td = df["true_delta"]
+    df["coverage"] = ((df.ci_low <= td) & (td <= df.ci_high)).astype(int)
+    df["width"] = df.ci_high - df.ci_low
+    df["sq_err"] = (df.estimated_delta - td) ** 2
 
-    if df.empty:
-        warnings.warn("All replicates failed. Cannot compute metrics.")
-        return outputs
+    rows = []
+    for sc in scenarios:
+        for ef in ["Null", "Power"]:
+            for mt in METHOD_ORDER:
+                s = df[(df.scenario == sc) & (df.effect_type == ef) & (df.method == mt)]
+                if s.empty: continue
+                rows.append(dict(
+                    Scenario=sc, Effect=ef, Method=mt, n=len(s),
+                    Bias=s.estimation_bias.mean(),
+                    Bias_se=s.estimation_bias.std(ddof=1)/np.sqrt(len(s)),
+                    RMSE=np.sqrt(s.sq_err.mean()),
+                    Rejection=s.rejected.mean(),
+                    Rejection_se=np.sqrt(s.rejected.mean()*(1-s.rejected.mean())/len(s)),
+                    Coverage=s.coverage.mean(),
+                    Width=s.width.mean(),
+                    Width_se=s.width.std(ddof=1)/np.sqrt(len(s)),
+                    Alloc=s.allocation_ratio.mean(),
+                    Mean_W=s.get("mean_W", pd.Series(dtype=float)).mean(skipna=True),
+                    Mean_W_se=s.get("mean_W", pd.Series(dtype=float)).std(ddof=1, skipna=True)/np.sqrt(max(len(s.get("mean_W", pd.Series(dtype=float)).dropna()),1)),
+                    Mean_Rn=s.get("mean_Rn", pd.Series(dtype=float)).mean(skipna=True),
+                    Mean_Dpdc=s.get("mean_Dpdc", pd.Series(dtype=float)).mean(skipna=True),
+                ))
+    return pd.DataFrame(rows)
 
-    df['true_delta'] = df['tau_0'].apply(get_true_delta)
-    df['error'] = df['delta_hat'] - df['true_delta']
-    df['abs_error'] = np.abs(df['error'])
-    df['sq_error'] = df['error'] ** 2
-    df['coverage'] = ((df['true_delta'] >= df['ci_low']) &
-                      (df['true_delta'] <= df['ci_high']))
-    df['ci_width'] = df['ci_high'] - df['ci_low']
-    threshold = config.DECISION_THRESHOLD
-    df['is_success'] = df['prob_gt_0'] > threshold
-    df['alloc_rate_treatment'] = df['n_treated'] / df['n_total']
 
-    key_cols = ['method', 'tau_0', 'n', 'n_h', 'scenario_type', 'kappa']
-    key_cols = [col for col in key_cols if col in df.columns]
-    groupby_cols = key_cols.copy()
-    if 'scenario_name' in df.columns:
-        groupby_cols = ['scenario_name'] + groupby_cols
+# ═══════════════════════════════════════════════════════════════════
+# Helpers for grouped bar charts
+# ═══════════════════════════════════════════════════════════════════
 
-    agg_funcs = {
-        'error': 'mean',
-        'abs_error': 'mean',
-        'sq_error': lambda x: np.sqrt(np.mean(x)),
-        'coverage': 'mean',
-        'ci_width': 'mean',
-        'alloc_rate_treatment': 'mean',
-        'is_success': 'mean',
-        'n_total': 'mean',
-        'post_M_mean': 'mean',
-        'post_wL_mean': 'mean',
-        'replicate_id': 'count'
-    }
+def _grouped_bar(ax, agg, scenarios, metric, ylabel, ylim=None,
+                 ref_line=None, ref_label=None,
+                 short_fn=_scen_short_factorial,
+                 err_metric=None, value_fontsize=7.0, value_fmt="{:.3f}"):
+    x = np.arange(len(scenarios)); w = 0.27
+    for j, mt in enumerate(METHOD_ORDER):
+        ms = agg[agg.Method == mt]
+        vals, errs = [], []
+        for sc in scenarios:
+            row = ms[ms.Scenario == sc]
+            vals.append(float(row[metric].values[0]) if len(row) else np.nan)
+            errs.append(float(row[err_metric].values[0]) if (err_metric and len(row)) else 0.0)
+        bars = ax.bar(x + (j-1)*w, vals, w, label=METHOD_LABELS[mt],
+                      color=METHOD_COLORS[mt], alpha=0.88,
+                      edgecolor="white", linewidth=0.7,
+                      yerr=errs if err_metric else None,
+                      capsize=2.5, error_kw=dict(ecolor="0.25", lw=0.8))
+        if value_fontsize:
+            for bar, v in zip(bars, vals):
+                if not np.isfinite(v): continue
+                yoff = max(abs(v)*0.012, 0.003)
+                ax.text(bar.get_x() + bar.get_width()/2,
+                        bar.get_height() + (yoff if v >= 0 else -yoff),
+                        value_fmt.format(v),
+                        ha="center", va="bottom" if v >= 0 else "top",
+                        fontsize=value_fontsize)
+    if ref_line is not None:
+        ax.axhline(ref_line, color="0.25", ls="--", lw=1.1,
+                   label=ref_label or f"{ref_line}")
+    ax.set_xticks(x)
+    ax.set_xticklabels([short_fn(s) for s in scenarios], fontsize=8.5)
+    ax.set_ylabel(ylabel)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.margins(x=0.02)
 
-    summary = df.groupby(groupby_cols, as_index=False).agg(agg_funcs).rename(columns={
-        'error': 'Bias',
-        'abs_error': 'MAE',
-        'sq_error': 'RMSE',
-        'coverage': 'Coverage',
-        'ci_width': 'CI_Width',
-        'alloc_rate_treatment': 'Alloc_Rate_Treatment',
-        'is_success': 'Success_Rate',
-        'replicate_id': 'N_Replicates'
+
+def _shared_method_legend(fig, loc="upper center", ncol=3, y=1.02):
+    handles = [mpatches.Patch(facecolor=METHOD_COLORS[m], alpha=0.88,
+                              label=METHOD_LABELS[m], edgecolor="white") for m in METHOD_ORDER]
+    fig.legend(handles=handles, loc=loc, ncol=ncol,
+               bbox_to_anchor=(0.5, y), frameon=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 3×2 FACTORIAL FIGURES
+# ═══════════════════════════════════════════════════════════════════
+
+def plot_figure1_allocation(df, scen_order, out_dir):
+    df = df[df.scenario.isin(scen_order)].copy()
+    if df.empty: return
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, 4.8), sharey=True)
+    n_m = len(METHOD_ORDER); w = 0.30; gap = 0.95
+
+    for ax, eff in zip(axes, ["Null", "Power"]):
+        sub = df[df.effect_type == eff]
+        positions, data_list, colors = [], [], []
+        tick_pos, tick_lab = [], []; xc = 0.0
+        for sc in scen_order:
+            for j, mt in enumerate(METHOD_ORDER):
+                vals = sub[(sub.scenario == sc) & (sub.method == mt)]["allocation_ratio"].dropna()
+                if len(vals) == 0: continue
+                positions.append(xc + j*(w+0.04))
+                data_list.append(vals.values)
+                colors.append(METHOD_COLORS[mt])
+            tick_pos.append(xc + (n_m-1)*(w+0.04)/2)
+            tick_lab.append(_scen_short_factorial(sc))
+            xc += n_m*(w+0.04) + gap
+        if not data_list: continue
+        bp = ax.boxplot(data_list, positions=positions, widths=w,
+                        patch_artist=True, showfliers=False,
+                        medianprops=dict(color="black", lw=1.4),
+                        whiskerprops=dict(lw=0.8),
+                        capprops=dict(lw=0.8),
+                        boxprops=dict(lw=0.7))
+        for i, patch in enumerate(bp["boxes"]):
+            patch.set_facecolor(colors[i]); patch.set_alpha(0.78)
+            patch.set_edgecolor("0.25")
+        ax.axhline(0.5, color="0.4", ls=":", lw=1.0)
+        ax.set_xticks(tick_pos); ax.set_xticklabels(tick_lab, fontsize=8.5)
+        ax.set_title(EFFECT_DISPLAY[eff])
+        ax.set_ylim(0.42, 0.72)
+    axes[0].set_ylabel("Allocation Ratio to Treatment Arm")
+    _shared_method_legend(fig, y=1.06)
+    fig.suptitle("Allocation Ratio across Scenarios", y=1.13)
+    plt.tight_layout()
+    _save(fig, out_dir / "plots" / "fig1_allocation_ratio.pdf")
+    print("  [ok] Figure 1: allocation ratio")
+
+
+def plot_figure2_bias_rmse(df, scen_order, out_dir):
+    agg = _aggregate(df, scen_order)
+    if agg.empty: return
+    fig, axes = plt.subplots(2, 2, figsize=(13.2, 8.0))
+    for col, eff in enumerate(["Null", "Power"]):
+        sub = agg[agg.Effect == eff]
+        scen = [s for s in scen_order if s in sub.Scenario.values]
+        ax = axes[0, col]
+        _grouped_bar(ax, sub, scen, "Bias", "Estimation Bias",
+                     ref_line=0, ref_label="zero bias",
+                     err_metric="Bias_se", value_fontsize=7)
+        ax.set_title(f"Bias — {EFFECT_DISPLAY[eff]}")
+        ax = axes[1, col]
+        _grouped_bar(ax, sub, scen, "RMSE", "RMSE", value_fontsize=7)
+        ax.set_title(f"RMSE — {EFFECT_DISPLAY[eff]}")
+    _shared_method_legend(fig, y=1.02)
+    fig.suptitle("Estimation Bias and RMSE", y=1.05)
+    plt.tight_layout()
+    _save(fig, out_dir / "plots" / "fig2_bias_rmse.pdf")
+    print("  [ok] Figure 2: bias / RMSE")
+
+
+def plot_figure3_ci(df, scen_order, out_dir):
+    agg = _aggregate(df, scen_order)
+    if agg.empty: return
+    fig, axes = plt.subplots(2, 2, figsize=(13.2, 8.0))
+    for col, eff in enumerate(["Null", "Power"]):
+        sub = agg[agg.Effect == eff]
+        scen = [s for s in scen_order if s in sub.Scenario.values]
+        ax = axes[0, col]
+        _grouped_bar(ax, sub, scen, "Width", "CI Width",
+                     err_metric="Width_se", value_fontsize=7)
+        ax.set_title(f"CI Width — {EFFECT_DISPLAY[eff]}")
+        ax = axes[1, col]
+        _grouped_bar(ax, sub, scen, "Coverage", "Coverage Probability",
+                     ref_line=0.95, ref_label="nominal 95%",
+                     ylim=(0.55, 1.02), value_fontsize=7)
+        ax.set_title(f"Coverage — {EFFECT_DISPLAY[eff]}")
+    _shared_method_legend(fig, y=1.02)
+    fig.suptitle("Confidence Interval Width and Coverage", y=1.05)
+    plt.tight_layout()
+    _save(fig, out_dir / "plots" / "fig3_ci_width_coverage.pdf")
+    print("  [ok] Figure 3: CI width / coverage")
+
+
+def plot_figure4_testing(df, scen_order, out_dir):
+    agg = _aggregate(df, scen_order)
+    if agg.empty: return
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, 4.6))
+    for ax, eff, ttl in zip(axes, ["Null", "Power"],
+                            ["Type I Error  ($\\Delta=0$)",
+                             "Statistical Power  ($\\Delta=0.5$)"]):
+        sub = agg[agg.Effect == eff]
+        scen = [s for s in scen_order if s in sub.Scenario.values]
+        ref = 0.05 if eff == "Null" else None
+        ref_lab = r"$\alpha = 0.05$" if eff == "Null" else None
+        ylim = (0, max(0.28, sub.Rejection.max()*1.18) if eff=="Null" else None)
+        _grouped_bar(ax, sub, scen, "Rejection",
+                     "Rejection Rate" if eff=="Null" else "Power",
+                     ref_line=ref, ref_label=ref_lab,
+                     err_metric="Rejection_se",
+                     ylim=ylim if eff == "Null" else (0, 1.05),
+                     value_fontsize=7)
+        ax.set_title(ttl)
+    _shared_method_legend(fig, y=1.05)
+    fig.suptitle("Hypothesis Testing Performance", y=1.10)
+    plt.tight_layout()
+    _save(fig, out_dir / "plots" / "fig4_typeI_power.pdf")
+    print("  [ok] Figure 4: type I / power")
+
+
+def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
+    """NEW: showcase how each method borrows. Mean W and mean R_n by scenario."""
+    agg = _aggregate(df, scen_order)
+    if agg.empty: return
+    # use Power runs (richer signal); pattern is similar under Null
+    sub = agg[agg.Effect == "Power"]
+    scen = [s for s in scen_order if s in sub.Scenario.values]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, 4.6))
+    ax = axes[0]
+    _grouped_bar(ax, sub, scen, "Mean_W", r"Mean borrowing weight $\overline{W(x)}$",
+                 ref_line=0, value_fontsize=7,
+                 err_metric="Mean_W_se",
+                 ylim=(0, max(0.28, sub.Mean_W.max()*1.20)))
+    ax.set_title(r"Borrowing Intensity")
+    # add annotation
+    ax.text(0.02, 0.97,
+            "RADISH down-weights\nlow-precision history\n(B2, B4, B6)",
+            transform=ax.transAxes, fontsize=8.5, va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.6", lw=0.6))
+
+    ax = axes[1]
+    _grouped_bar(ax, sub, scen, "Mean_Rn", r"Mean information ratio $\overline{R_n(x)}$",
+                 ref_line=1.0, ref_label=r"$R_n=1$ (no borrowing)",
+                 value_fontsize=7,
+                 ylim=(0.95, max(1.6, sub.Mean_Rn.max()*1.10)))
+    ax.set_title(r"Effective Information Gain")
+
+    _shared_method_legend(fig, y=1.05)
+    fig.suptitle("Borrowing Diagnostics by Scenario  ($\\Delta = 0.5$)", y=1.10)
+    plt.tight_layout()
+    _save(fig, out_dir / "plots" / "fig5_borrowing_diagnostics.pdf")
+    print("  [ok] Figure 5: borrowing diagnostics")
+
+
+def plot_figure6_precision_map(df, scen_order, out_dir):
+    """NEW: 2-D precision-bias map of borrowing weight."""
+    if config is None: return
+    rows = []
+    for sc in scen_order:
+        meta = config.SCENARIOS.get(sc, {})
+        b = meta.get("b_theta"); sh = meta.get("sigma_h")
+        for mt in ["CAHB", "RADISH"]:
+            s = df[(df.scenario==sc)&(df.effect_type=="Power")&(df.method==mt)]
+            if s.empty or "mean_W" not in s: continue
+            rows.append(dict(b_theta=b, sigma_h=sh, method=mt,
+                             W=s.mean_W.mean(skipna=True)))
+    pdat = pd.DataFrame(rows).dropna()
+    if pdat.empty: return
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.5), sharey=True)
+    # Build coordinate axes
+    bvals = sorted(pdat.b_theta.unique())
+    svals = sorted(pdat.sigma_h.unique())
+    for ax, mt in zip(axes, ["CAHB", "RADISH"]):
+        Z = np.full((len(svals), len(bvals)), np.nan)
+        for _, r in pdat[pdat.method == mt].iterrows():
+            i = svals.index(r.sigma_h); j = bvals.index(r.b_theta)
+            Z[i, j] = r.W
+        im = ax.imshow(Z, aspect="auto", origin="lower", cmap="viridis",
+                       vmin=0, vmax=max(0.4, np.nanmax(Z)*1.05))
+        ax.set_xticks(range(len(bvals))); ax.set_xticklabels([f"{b:g}" for b in bvals])
+        ax.set_yticks(range(len(svals))); ax.set_yticklabels([f"{s:g}" for s in svals])
+        ax.set_xlabel(r"Historical bias  $b_\theta$")
+        if mt == "CAHB": ax.set_ylabel(r"Historical noise SD  $\sigma_H$")
+        ax.set_title(f"{mt}: mean $W(x)$")
+        for i in range(Z.shape[0]):
+            for j in range(Z.shape[1]):
+                if np.isfinite(Z[i,j]):
+                    col = "white" if Z[i,j] > 0.18 else "black"
+                    ax.text(j, i, f"{Z[i,j]:.2f}", ha="center", va="center",
+                            fontsize=9, color=col)
+        ax.grid(False)
+    cbar = fig.colorbar(im, ax=axes, fraction=0.045, pad=0.02)
+    cbar.set_label("Mean borrowing weight $\\overline{W}$")
+    fig.suptitle("Precision–Bias Borrowing Map  ($\\Delta = 0.5$)", y=1.02)
+    _save(fig, out_dir / "plots" / "fig6_precision_bias_map.pdf")
+    print("  [ok] Figure 6: precision–bias borrowing map")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PRECISION-GRADIENT FIGURES (mode="precision")
+# ═══════════════════════════════════════════════════════════════════
+
+def _gather_precision(df, scenarios):
+    """Long-format frame with σ_H gradient."""
+    rows = []
+    for sc, meta in scenarios.items():
+        for ef in ["Null", "Power"]:
+            for mt in METHOD_ORDER:
+                s = df[(df.scenario==sc) & (df.effect_type==ef) & (df.method==mt)]
+                if s.empty: continue
+                td = s.true_delta.iloc[0]
+                cov = ((s.ci_low <= td) & (td <= s.ci_high)).astype(int)
+                bias = s.estimation_bias
+                rmse = np.sqrt(((s.estimated_delta - td)**2).mean())
+                rej = s.rejected.mean()
+                rej_se = np.sqrt(rej*(1-rej)/max(len(s),1))
+                W = s.mean_W if "mean_W" in s else pd.Series([np.nan])
+                Rn = s.mean_Rn if "mean_Rn" in s else pd.Series([np.nan])
+                rows.append(dict(
+                    bias_label=meta.get("_grid_bias", ""),
+                    b_theta=meta["b_theta"],
+                    sigma_h=meta["sigma_h"],
+                    effect=ef, method=mt, n=len(s),
+                    bias=bias.mean(),
+                    bias_se=bias.std(ddof=1)/np.sqrt(len(s)),
+                    rmse=rmse,
+                    rejection=rej,
+                    rejection_se=rej_se,
+                    coverage=cov.mean(),
+                    width=(s.ci_high - s.ci_low).mean(),
+                    width_se=(s.ci_high - s.ci_low).std(ddof=1)/np.sqrt(len(s)),
+                    mean_W=W.mean(skipna=True),
+                    mean_W_se=W.std(ddof=1, skipna=True)/np.sqrt(max(W.dropna().shape[0],1)),
+                    mean_Rn=Rn.mean(skipna=True),
+                ))
+    return pd.DataFrame(rows)
+
+
+def _line_panel(ax, dfp, ycol, ylabel, *, ycol_se=None,
+                ylim=None, ref=None, ref_label=None, log_x=True,
+                show_legend=True):
+    for mt in METHOD_ORDER:
+        d = dfp[dfp.method == mt].sort_values("sigma_h")
+        if d.empty: continue
+        y = d[ycol].values; x = d["sigma_h"].values
+        ax.plot(x, y, marker=METHOD_MARKERS[mt],
+                color=METHOD_COLORS[mt], label=METHOD_LABELS[mt],
+                lw=1.9, mec="white", mew=0.7)
+        if ycol_se and ycol_se in d.columns:
+            se = d[ycol_se].values
+            ax.fill_between(x, y - 1.96*se, y + 1.96*se,
+                            color=METHOD_COLORS[mt], alpha=0.14, lw=0)
+    if ref is not None:
+        ax.axhline(ref, color="0.25", ls="--", lw=1.0,
+                   label=ref_label or f"{ref}")
+    if log_x: ax.set_xscale("log")
+    ax.set_xlabel(r"Historical noise SD  $\sigma_H$  (log scale)")
+    ax.set_ylabel(ylabel)
+    if ylim is not None: ax.set_ylim(*ylim)
+    if show_legend:
+        ax.legend(loc="best")
+    # Show actual σ_H values on x-axis
+    xvals = sorted(dfp.sigma_h.unique())
+    ax.set_xticks(xvals)
+    ax.set_xticklabels([f"{v:g}" for v in xvals])
+    ax.minorticks_off()
+
+
+def plot_precision_W(dfp, out_dir):
+    """Fig P1: borrowing weight W vs σ_H — RADISH's signature plot."""
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.6), sharey=True)
+    for ax, blab, ttl in zip(axes, ["unbiased", "modBias"],
+                              [r"Unbiased history  $b_\theta = 0$",
+                               r"Moderately biased  $b_\theta = 0.5$"]):
+        d = dfp[(dfp.bias_label == blab) & (dfp.effect == "Power")]
+        _line_panel(ax, d, "mean_W", r"Mean borrowing weight  $\overline{W(x)}$",
+                    ycol_se="mean_W_se", ylim=(-0.02, max(0.55, d.mean_W.max()*1.15)),
+                    show_legend=(blab=="unbiased"))
+        ax.set_title(ttl)
+    fig.suptitle("Borrowing Weight as a Function of Historical Precision", y=1.03)
+    plt.tight_layout()
+    _save(fig, out_dir / "plots" / "figP1_borrowing_weight_vs_sigmaH.pdf")
+    print("  [ok] Figure P1: W vs σ_H")
+
+
+def plot_precision_Rn(dfp, out_dir):
+    """Fig P2: information ratio."""
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.6), sharey=True)
+    for ax, blab, ttl in zip(axes, ["unbiased", "modBias"],
+                              [r"Unbiased  $b_\theta = 0$",
+                               r"Moderately biased  $b_\theta = 0.5$"]):
+        d = dfp[(dfp.bias_label == blab) & (dfp.effect == "Power")]
+        _line_panel(ax, d, "mean_Rn", r"Mean information ratio  $\overline{R_n(x)}$",
+                    ref=1.0, ref_label="$R_n = 1$",
+                    ylim=(0.95, max(2.5, d.mean_Rn.max()*1.10)),
+                    show_legend=(blab=="unbiased"))
+        ax.set_title(ttl)
+    fig.suptitle("Information Ratio as a Function of Historical Precision", y=1.03)
+    plt.tight_layout()
+    _save(fig, out_dir / "plots" / "figP2_information_ratio_vs_sigmaH.pdf")
+    print("  [ok] Figure P2: R_n vs σ_H")
+
+
+def plot_precision_estimation(dfp, out_dir):
+    """Fig P3: RMSE & coverage vs σ_H, both bias regimes."""
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.0))
+    for col, blab in enumerate(["unbiased", "modBias"]):
+        ttl = r"$b_\theta = 0$" if blab == "unbiased" else r"$b_\theta = 0.5$"
+        d_pow = dfp[(dfp.bias_label == blab) & (dfp.effect == "Power")]
+        d_null = dfp[(dfp.bias_label == blab) & (dfp.effect == "Null")]
+        ax = axes[0, col]
+        _line_panel(ax, d_pow, "rmse", "RMSE  ($\\Delta = 0.5$)",
+                    show_legend=(col == 0))
+        ax.set_title(f"RMSE  —  {ttl}")
+        ax = axes[1, col]
+        _line_panel(ax, d_null, "coverage", "Coverage  ($\\Delta = 0$)",
+                    ref=0.95, ref_label="nominal 95%",
+                    ylim=(0.55, 1.02), show_legend=False)
+        ax.set_title(f"Coverage  —  {ttl}")
+    fig.suptitle("Estimation Quality across the Precision Gradient", y=1.02)
+    plt.tight_layout()
+    _save(fig, out_dir / "plots" / "figP3_rmse_coverage_vs_sigmaH.pdf")
+    print("  [ok] Figure P3: RMSE / coverage vs σ_H")
+
+
+def plot_precision_testing(dfp, out_dir):
+    """Fig P4: Type-I & Power vs σ_H."""
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.0))
+    for col, blab in enumerate(["unbiased", "modBias"]):
+        ttl = r"$b_\theta = 0$" if blab == "unbiased" else r"$b_\theta = 0.5$"
+        d_null = dfp[(dfp.bias_label == blab) & (dfp.effect == "Null")]
+        d_pow  = dfp[(dfp.bias_label == blab) & (dfp.effect == "Power")]
+        ax = axes[0, col]
+        _line_panel(ax, d_null, "rejection",
+                    "Type I Error  ($\\Delta = 0$)",
+                    ycol_se="rejection_se",
+                    ref=0.05, ref_label=r"$\alpha = 0.05$",
+                    ylim=(0, max(0.30, d_null.rejection.max()*1.15)),
+                    show_legend=(col==0))
+        ax.set_title(f"Type I Error  —  {ttl}")
+        ax = axes[1, col]
+        _line_panel(ax, d_pow, "rejection",
+                    "Statistical Power  ($\\Delta = 0.5$)",
+                    ycol_se="rejection_se",
+                    ylim=(0, 1.05), show_legend=False)
+        ax.set_title(f"Power  —  {ttl}")
+    fig.suptitle("Hypothesis Testing across the Precision Gradient", y=1.02)
+    plt.tight_layout()
+    _save(fig, out_dir / "plots" / "figP4_typeI_power_vs_sigmaH.pdf")
+    print("  [ok] Figure P4: Type-I / Power vs σ_H")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Tables
+# ═══════════════════════════════════════════════════════════════════
+
+def write_factorial_table(df, scen_order, out_dir):
+    """Diagnostics-augmented summary table (LaTeX + CSV)."""
+    agg = _aggregate(df, scen_order)
+    cols = ["Scenario", "Effect", "Method", "n",
+            "Bias", "RMSE", "Rejection", "Coverage", "Width",
+            "Mean_W", "Mean_Rn", "Mean_Dpdc", "Alloc"]
+    out = agg[cols].copy()
+    out.to_csv(out_dir / "tables" / "metrics_full.csv", index=False)
+    fmt = {"Bias":"{:.4f}","RMSE":"{:.4f}","Rejection":"{:.3f}",
+           "Coverage":"{:.3f}","Width":"{:.3f}",
+           "Mean_W":"{:.3f}","Mean_Rn":"{:.3f}","Mean_Dpdc":"{:.3f}",
+           "Alloc":"{:.3f}"}
+    for c, f in fmt.items():
+        out[c] = out[c].apply(lambda v: f.format(v) if pd.notna(v) and v != "" else "—")
+    out_tex = out.rename(columns={
+        "Mean_W":  r"$\overline{W}$",
+        "Mean_Rn": r"$\overline{R_n}$",
+        "Mean_Dpdc": r"$\overline{D_{\mathrm{PDC}}}$",
+        "Scenario": "Scenario", "Alloc": "Alloc.\\,Ratio",
     })
-
-    type_key = key_cols.copy()
-    type_i_df = (
-        df[df['tau_0'] == 0.0]
-        .groupby(type_key, as_index=False)['is_success']
-        .mean()
-        .rename(columns={'is_success': 'Type_I_Error'})
-    ) if type_key else pd.DataFrame()
-    power_df = (
-        df[df['tau_0'] == 0.4]
-        .groupby(type_key, as_index=False)['is_success']
-        .mean()
-        .rename(columns={'is_success': 'Power'})
-    ) if type_key else pd.DataFrame()
-    if not type_i_df.empty:
-        summary = pd.merge(summary, type_i_df, on=type_key, how='left')
-    if not power_df.empty:
-        summary = pd.merge(summary, power_df, on=type_key, how='left')
-    summary = summary.sort_values(['scenario_name', 'method']).reset_index(drop=True)
-    outputs['summary'] = summary
-
-    # Allocation trajectories -------------------------------------------------
-    allocation_records = []
-    for row in results_list:
-        path = row.get('allocation_path') or []
-        for point in path:
-            sample_size = point.get('sample_size')
-            if sample_size is None:
-                continue
-            allocation_records.append({
-                'scenario_id': row.get('scenario_id'),
-                'scenario_name': row.get('scenario_name'),
-                'scenario_type': row.get('scenario_type', 'Unknown'),
-                'kappa': row.get('kappa', np.nan),
-                'method': row.get('method'),
-                'tau_0': row.get('tau_0'),
-                'n': row.get('n'),
-                'n_h': row.get('n_h'),
-                'replicate_id': row.get('replicate_id'),
-                'sample_size': sample_size,
-                'prop_treated': point.get('prop_treated'),
-                'R_n': point.get('R_n'),
-                'M': point.get('M'),
-                'w_L': point.get('w_L'),
-                'gamma': point.get('gamma'),
-                'x1': point.get('x1'),
-                'x2': point.get('x2'),
-                'x3': point.get('x3'),
-                'x4': point.get('x4'),
-            })
-
-    if allocation_records:
-        outputs['allocation_path'] = pd.DataFrame(allocation_records)
-
-    # Calibration payload -----------------------------------------------------
-    calibration_records = []
-    for row in results_list:
-        calib = row.get('calibration_samples') or []
-        for entry in calib:
-            calibration_records.append({
-                'scenario_id': row.get('scenario_id'),
-                'scenario_name': row.get('scenario_name'),
-                'scenario_type': row.get('scenario_type', 'Unknown'),
-                'kappa': row.get('kappa', np.nan),
-                'method': row.get('method'),
-                'tau_0': row.get('tau_0'),
-                'n': row.get('n'),
-                'n_h': row.get('n_h'),
-                'replicate_id': row.get('replicate_id'),
-                'sample_size': row.get('n'),
-                'x1': entry.get('x1'),
-                'x2': entry.get('x2'),
-                'x3': entry.get('x3'),
-                'x4': entry.get('x4'),
-                'M_mean': entry.get('M_mean'),
-                'M_ci_low': entry.get('M_ci_low'),
-                'M_ci_high': entry.get('M_ci_high'),
-                'R_n': entry.get('R_n'),
-                'w_L': entry.get('w_L'),
-                'gamma': entry.get('gamma'),
-            })
-
-    if calibration_records:
-        outputs['calibration'] = pd.DataFrame(calibration_records)
-
-    return outputs
-
-
-# =============================================================================
-# Table Generation
-# =============================================================================
-
-def generate_tables(results_obj: dict):
-    """
-    Generates publication-ready tables in CSV and LaTeX formats.
-    
-    Creates:
-        1. estimation_metrics.(csv|tex): Publication-ready estimation summaries
-        2. type_i_error_power.tex: Focused table for error/power results
-    
-    Args:
-        results_obj: Output dictionary returned by process_results()
-    
-    Output Files:
-        - results/tables/estimation_metrics.csv
-        - results/tables/estimation_metrics.tex
-        - results/tables/type_i_error_power.tex
-    """
-    summary_df = results_obj.get('summary', pd.DataFrame())
-
-    if summary_df.empty:
-        warnings.warn("Empty summary DataFrame. No tables generated.")
-        return
-        
-    os.makedirs(config.TABLES_DIR, exist_ok=True)
-    
-    # Final inference stage metrics (Section 3.4)
-    # Includes: Bias, RMSE, Type I Error, Power, 95% CrI Coverage, CI Width
-    # Also includes posterior M and w_L for BRAVE methods (NaN for others)
-    estimation_cols = [
-        'scenario_name', 'method', 'tau_0', 'n', 'n_h', 'scenario_type', 'kappa',
-        'Bias', 'RMSE', 'Coverage', 'CI_Width', 'Alloc_Rate_Treatment',
-        'Type_I_Error', 'Power', 'post_M_mean', 'post_wL_mean'
-    ]
-    estimation_cols = [c for c in estimation_cols if c in summary_df.columns]
-    estimation_df = summary_df[estimation_cols].copy()
-    est_csv = os.path.join(config.TABLES_DIR, 'final_inference_metrics.csv')
-    estimation_df.to_csv(est_csv, index=False, float_format='%.4f')
-    print(f"[+] Final inference metrics table saved: {est_csv}")
-
-    # Publication-ready LaTeX table
-    display_df = estimation_df.copy()
-    method_labels = DEFAULT_METHOD_LABELS.copy()
-    if hasattr(config, 'METHOD_LABELS'):
-        method_labels.update(getattr(config, 'METHOD_LABELS', {}))
-    display_df['method_label'] = display_df['method'].map(method_labels).fillna(display_df['method'])
-
+    out_tex["Scenario"] = out_tex["Scenario"].str.replace("_", "\\_", regex=False)
     try:
-        tex_pivot = display_df.pivot_table(
-            index=['scenario_name', 'tau_0'],
-            columns='method_label',
-            values=['Bias', 'RMSE', 'Coverage', 'CI_Width']
+        body = out_tex.to_latex(index=False, escape=False, longtable=False)
+        tex = (
+            "\\begin{table}[!ht]\n\\centering\n"
+            "\\caption{Operating characteristics across the $3\\times 2$ "
+            "factorial design, including borrowing diagnostics "
+            "($\\overline{W}$, $\\overline{R_n}$, "
+            "$\\overline{D_{\\mathrm{PDC}}}$). "
+            "Each cell is averaged over Monte~Carlo replications.}\n"
+            "\\label{tab:metrics_full}\n"
+            f"{body}\n\\end{{table}}\n"
         )
-        tex_path = os.path.join(config.TABLES_DIR, 'estimation_metrics.tex')
-        with open(tex_path, 'w') as f:
-            f.write("% Estimation metrics table (Bias/RMSE/Coverage/CI Width)\n")
-            tex_pivot.to_latex(
-                f,
-                float_format='%.3f',
-                na_rep='-',
-                bold_rows=True,
-                multicolumn_format='c',
-                escape=False
-            )
-        print(f"[+] LaTeX estimation table saved: {tex_path}")
+        (out_dir / "tables" / "metrics_full.tex").write_text(tex, encoding="utf-8")
     except Exception as e:
-        warnings.warn(f"Failed to build LaTeX estimation table: {e}")
-    
-    # ==== Type I Error and Power Table (Focused) ====
-    
-    if 'Type_I_Error' in summary_df.columns and 'Power' in summary_df.columns:
-        # Extract Type I Error (tau_0 = 0) and Power (tau_0 = 0.4)
-        type_i = summary_df[summary_df['tau_0'] == 0.0][['scenario_name', 'method', 'Type_I_Error']].dropna()
-        power = summary_df[summary_df['tau_0'] == 0.4][['scenario_name', 'method', 'Power']].dropna()
-        
-        # Merge
-        error_power = pd.merge(
-            type_i, power, 
-            on=['scenario_name', 'method'], 
-            how='outer'
+        print(f"  [warn] LaTeX export failed: {e}")
+
+
+def write_precision_table(dfp, out_dir):
+    """Precision-gradient diagnostics table (complementary to figures)."""
+    cols = ["bias_label","b_theta","sigma_h","effect","method","n",
+            "rmse","rejection","coverage","width",
+            "mean_W","mean_Rn"]
+    out = dfp[cols].copy()
+    out = out.rename(columns={
+        "bias_label":"BiasReg","b_theta":"b_theta","sigma_h":"sigma_H",
+        "effect":"Effect","method":"Method",
+        "rmse":"RMSE","rejection":"Reject","coverage":"Coverage",
+        "width":"Width","mean_W":"Mean_W","mean_Rn":"Mean_Rn"})
+    out.to_csv(out_dir / "tables" / "metrics_precision.csv", index=False)
+    fmt = {"RMSE":"{:.4f}","Reject":"{:.3f}","Coverage":"{:.3f}",
+           "Width":"{:.3f}","Mean_W":"{:.3f}","Mean_Rn":"{:.3f}",
+           "b_theta":"{:.2f}","sigma_H":"{:.2f}"}
+    for c, f in fmt.items():
+        out[c] = out[c].apply(lambda v: f.format(v) if pd.notna(v) else "—")
+    out_tex = out.rename(columns={
+        "b_theta":  r"$b_\theta$",
+        "sigma_H":  r"$\sigma_H$",
+        "Mean_W":   r"$\overline{W}$",
+        "Mean_Rn":  r"$\overline{R_n}$",
+        "BiasReg":  "Bias regime",
+    })
+    try:
+        body = out_tex.to_latex(index=False, escape=False)
+        tex = (
+            "\\begin{table}[!ht]\n\\centering\n"
+            "\\caption{Precision-gradient experiment: per-cell operating "
+            "characteristics and borrowing diagnostics across "
+            "$\\sigma_H \\in \\{0.25, 0.5, 1.0, 1.5, 2.5, 4.0\\}$ "
+            "at fixed bias regimes $b_\\theta \\in \\{0, 0.5\\}$.}\n"
+            "\\label{tab:metrics_precision}\n"
+            f"{body}\n\\end{{table}}\n"
         )
-        
-        # Pivot for cleaner presentation
-        try:
-            ep_pivot = error_power.pivot(
-                index='scenario_name',
-                columns='method',
-                values=['Type_I_Error', 'Power']
-            )
-            
-            ep_tex_path = os.path.join(config.TABLES_DIR, 'type_i_error_power.tex')
-            with open(ep_tex_path, 'w') as f:
-                f.write("% Type I Error and Power Results\n")
-                f.write("% Nominal alpha = 0.05 for Type I Error\n\n")
-                ep_pivot.to_latex(
-                    f,
-                    float_format='%.3f',
-                    bold_rows=True,
-                    multicolumn_format='c',
-                    escape=False
-                )
-            print(f"[+] Type I Error/Power table saved: {ep_tex_path}")
-            
-        except Exception as e:
-            warnings.warn(f"Could not create Type I Error/Power pivot table: {e}")
-    
-    print(f"[+] All tables saved to: {config.TABLES_DIR}")
+        (out_dir / "tables" / "metrics_precision.tex").write_text(tex, encoding="utf-8")
+    except Exception as e:
+        print(f"  [warn] LaTeX export failed: {e}")
 
 
-# =============================================================================
-# Plot Generation
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════
+# Main entry point
+# ═══════════════════════════════════════════════════════════════════
 
-def generate_plots(results_obj: dict):
-    """
-    Generate evaluation metrics plots for adaptive allocation stage and final inference stage.
-    
-    Adaptive allocation stage plots:
-    1. Averaged trajectory curves for allocation ratio (all 4 designs)
-    2. Averaged density plots for R_n(X) (all 4 designs, KBCD fixed at 1)
-    3. Averaged density plots for M(X) (BRAVE-IPD and BRAVE-SLD)
-    4. Averaged density plots for w_L(x) (BRAVE-IPD and BRAVE-SLD)
-    5. Individual plots per scenario
-    6. Combined 6×4 grid plots for n_h=400 and 800
-    """
-    alloc_df = results_obj.get('allocation_path', pd.DataFrame())
-    if alloc_df.empty:
-        warnings.warn("Empty allocation diagnostics. No plots generated.")
+def run_analysis(df, out_dir, mode="full"):
+    out_dir = Path(out_dir)
+    (out_dir / "plots").mkdir(parents=True, exist_ok=True)
+    (out_dir / "tables").mkdir(parents=True, exist_ok=True)
+    print(f"Running analysis on {len(df)} results (mode={mode})...")
+
+    # Save metrics summary table from main.metrics if available
+    try:
+        from main import metrics as _metrics
+        scenarios = config.get_mode_scenarios(mode) if config else None
+        tbl = _metrics(df, scenarios)
+        tbl.to_csv(out_dir / "tables" / "metrics_summary.csv", index=False)
+        print("  [ok] metrics_summary.csv")
+    except Exception as e:
+        print(f"  [!!] summary table skipped: {e}")
+
+    if mode == "precision":
+        scenarios = config.get_mode_scenarios("precision")
+        dfp = _gather_precision(df, scenarios)
+        plot_precision_W(dfp, out_dir)
+        plot_precision_Rn(dfp, out_dir)
+        plot_precision_estimation(dfp, out_dir)
+        plot_precision_testing(dfp, out_dir)
+        write_precision_table(dfp, out_dir)
+        print("Precision-gradient analysis complete.")
         return
 
-    os.makedirs(config.PLOTS_DIR, exist_ok=True)
-    colors = configure_plot_style()
-    method_labels = DEFAULT_METHOD_LABELS.copy()
-    if hasattr(config, 'METHOD_LABELS'):
-        method_labels.update(getattr(config, 'METHOD_LABELS', {}))
-
-    scenario_order = [
-        ('S1', 1.0, r'S1 $\kappa$=1.0'),
-        ('S2', 0.7, r'S2 $\kappa$=0.7'),
-        ('S2', 1.3, r'S2 $\kappa$=1.3'),
-        ('S3', 0.7, r'S3 $\kappa$=0.7'),
-        ('S3', 1.3, r'S3 $\kappa$=1.3'),
-        ('S4', 1.3, r'S4 $\kappa$=1.3'),
-    ]
-    label_order = [s[2] for s in scenario_order]
-    label_map = {(stype, float(kappa)): label for stype, kappa, label in scenario_order}
-
-    def _label(method: str) -> str:
-        return method_labels.get(method, method)
-
-    def _scenario_label(row: pd.Series) -> str:
-        stype = row.get('scenario_type')
-        kappa_val = row.get('kappa')
-        try:
-            kappa_key = float(kappa_val)
-        except Exception:
-            kappa_key = kappa_val
-        return label_map.get((stype, kappa_key), f"{stype} $\\kappa$={kappa_val}")
-
-    alloc_df = alloc_df.copy()
-    # Backfill n_h if missing
-    if 'n_h' not in alloc_df.columns or alloc_df['n_h'].isna().all():
-        raw_df = results_obj.get('raw', pd.DataFrame())
-        if not raw_df.empty and 'scenario_id' in alloc_df.columns:
-            nh_map = raw_df[['scenario_id', 'n_h']].drop_duplicates()
-            alloc_df = alloc_df.merge(nh_map, on='scenario_id', how='left', suffixes=('', '_raw'))
-            alloc_df['n_h'] = alloc_df['n_h'].fillna(alloc_df.get('n_h_raw'))
-            if 'n_h_raw' in alloc_df.columns:
-                alloc_df = alloc_df.drop(columns=['n_h_raw'])
-        if alloc_df['n_h'].isna().any() and 'scenario_name' in alloc_df.columns:
-            extracted = alloc_df['scenario_name'].str.extract(r'nh=([0-9]+)')[0]
-            alloc_df['n_h'] = alloc_df['n_h'].fillna(pd.to_numeric(extracted, errors='coerce'))
-
-    alloc_df['scenario_label'] = alloc_df.apply(_scenario_label, axis=1)
-    alloc_df = alloc_df[alloc_df['scenario_label'].isin(label_order)]
-    
-    # Ensure KBCD has R_n = 1.0
-    alloc_df.loc[alloc_df['method'] == 'KBCD', 'R_n'] = 1.0
-
-    # Design order for all plots
-    design_order = ['BRAVE_IPD', 'BRAVE_SLD', 'CAHB', 'KBCD']
-    brave_methods = ['BRAVE_IPD', 'BRAVE_SLD']
-    palette_all = {m: colors.get(m, 'gray') for m in design_order}
-
-    def _label(method: str) -> str:
-        return method_labels.get(method, method)
-    
-    def _safe_filename(label: str) -> str:
-        """Convert scenario label to safe filename."""
-        return label.replace(' ', '_').replace('$', '').replace('\\', '').replace('=', '').replace('{', '').replace('}', '')
-
-    # =====================================================================
-    # 1. Allocation Trajectory Plots (all 4 designs)
-    # =====================================================================
-    def _plot_allocation_trajectories():
-        """Generate averaged trajectory curves for allocation ratio (all 4 designs)."""
-        df = alloc_df.dropna(subset=['prop_treated', 'sample_size']).copy()
-        if df.empty:
-            warnings.warn("No allocation trajectory data available.")
-            return
-        
-        df['scenario_label'] = df.apply(_scenario_label, axis=1)
-        
-        # Average across replicates for each (scenario, method, sample_size, n_h) combination
-        traj_agg = (
-            df.groupby(['scenario_label', 'scenario_type', 'kappa', 'n_h', 'method', 'sample_size'], as_index=False)
-            .agg(prop_treated_mean=('prop_treated', 'mean'))
-        )
-        
-        # Individual plots per scenario
-        for n_h_val in sorted(df['n_h'].dropna().unique()):
-            for scen_label in label_order:
-                sub = traj_agg[(traj_agg['n_h'] == n_h_val) & (traj_agg['scenario_label'] == scen_label)]
-                if sub.empty:
-                    continue
-                
-                fig, ax = plt.subplots(figsize=(7, 5))
-                for method in design_order:
-                    method_data = sub[sub['method'] == method]
-                    if method_data.empty:
-                        continue
-                    ax.plot(
-                        method_data['sample_size'],
-                        method_data['prop_treated_mean'],
-                        color=palette_all.get(method, 'gray'),
-                        label=_label(method),
-                        linewidth=2.0
-                    )
-                ax.set_ylabel('Allocation ratio to treatment', fontsize=11)
-                ax.set_xlabel('Sample size', fontsize=11)
-                ax.set_ylim(0, 1)
-                ax.set_title(f"{scen_label}, $n_h$={int(n_h_val)}", fontsize=12)
-                ax.legend(title='Method', fontsize=9)
-                ax.grid(True, alpha=0.3)
-                fig.tight_layout()
-                safe_label = _safe_filename(scen_label)
-                out = os.path.join(config.PLOTS_DIR, f"traj_alloc_{safe_label}_nh{int(n_h_val)}.pdf")
-                fig.savefig(out)
-                plt.close(fig)
-                print(f"[+] Saved allocation trajectory: {out}")
-    
-    _plot_allocation_trajectories()
-
-    # =====================================================================
-    # 2. Density Plots for R_n(X) (all 4 designs, averaged across replications)
-    # =====================================================================
-    def _plot_rn_density():
-        """Generate averaged density plots for R_n(X) across all designs."""
-        df = alloc_df.dropna(subset=['R_n']).copy()
-        if df.empty:
-            warnings.warn("No R_n data available.")
-            return
-        
-        df['scenario_label'] = df.apply(_scenario_label, axis=1)
-        
-        # Individual plots per scenario
-        for n_h_val in sorted(df['n_h'].dropna().unique()):
-            for scen_label in label_order:
-                sub = df[(df['n_h'] == n_h_val) & (df['scenario_label'] == scen_label)]
-                if sub.empty:
-                    continue
-                
-                fig, ax = plt.subplots(figsize=(7, 5))
-                for method in design_order:
-                    vals = sub[sub['method'] == method]['R_n'].dropna()
-                    if vals.empty:
-                        continue
-                    
-                    # For KBCD, R_n should be exactly 1.0
-                    if method == 'KBCD':
-                        ax.axvline(1.0, color=palette_all.get(method, 'gray'), 
-                                 linestyle='--', linewidth=2.0, label=_label(method))
-                    elif np.nanstd(vals) < 1e-6:
-                        ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
-                                 linestyle='--', linewidth=2.0, label=_label(method))
-                    else:
-                        sns.kdeplot(vals, ax=ax, label=_label(method), 
-                                  color=palette_all.get(method, 'gray'), 
-                                  clip=(0, None), linewidth=2.0)
-                
-                ax.set_xlabel(r'$R_n(\mathbf{X})$', fontsize=11)
-                ax.set_ylabel('Density', fontsize=11)
-                ax.set_title(f"$R_n$ density - {scen_label}, $n_h$={int(n_h_val)}", fontsize=12)
-                ax.legend(title='Method', fontsize=9)
-                ax.grid(True, alpha=0.3)
-                fig.tight_layout()
-                safe_label = _safe_filename(scen_label)
-                out = os.path.join(config.PLOTS_DIR, f"density_rn_{safe_label}_nh{int(n_h_val)}.pdf")
-                fig.savefig(out)
-                plt.close(fig)
-                print(f"[+] Saved R_n density: {out}")
-    
-    _plot_rn_density()
-
-    # =====================================================================
-    # 3. Density Plots for M(X) (BRAVE-IPD and BRAVE-SLD only)
-    # =====================================================================
-    def _plot_M_density():
-        """Generate averaged density plots for M(X) (BRAVE methods only)."""
-        df = alloc_df.dropna(subset=['M']).copy()
-        if df.empty:
-            warnings.warn("No M data available.")
-            return
-        
-        df = df[df['method'].isin(brave_methods)]
-        if df.empty:
-            warnings.warn("No BRAVE method data for M.")
-            return
-        
-        df['scenario_label'] = df.apply(_scenario_label, axis=1)
-        
-        # Individual plots per scenario
-        for n_h_val in sorted(df['n_h'].dropna().unique()):
-            for scen_label in label_order:
-                sub = df[(df['n_h'] == n_h_val) & (df['scenario_label'] == scen_label)]
-                if sub.empty:
-                    continue
-                
-                fig, ax = plt.subplots(figsize=(7, 5))
-                for method in brave_methods:
-                    vals = sub[sub['method'] == method]['M'].dropna()
-                    if vals.empty:
-                        continue
-                    
-                    if np.nanstd(vals) < 1e-6:
-                        ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
-                                 linestyle='--', linewidth=2.0, label=_label(method))
-                    else:
-                        sns.kdeplot(vals, ax=ax, label=_label(method),
-                                  color=palette_all.get(method, 'gray'),
-                                  clip=(0, None), linewidth=2.0)
-                
-                ax.set_xlabel(r'$M(\mathbf{X})$', fontsize=11)
-                ax.set_ylabel('Density', fontsize=11)
-                ax.set_title(f"$M$ density - {scen_label}, $n_h$={int(n_h_val)}", fontsize=12)
-                ax.legend(title='Method', fontsize=9)
-                ax.grid(True, alpha=0.3)
-                fig.tight_layout()
-                safe_label = _safe_filename(scen_label)
-                out = os.path.join(config.PLOTS_DIR, f"density_M_{safe_label}_nh{int(n_h_val)}.pdf")
-                fig.savefig(out)
-                plt.close(fig)
-                print(f"[+] Saved M density: {out}")
-    
-    _plot_M_density()
-
-    # =====================================================================
-    # 4. Density Plots for w_L(x) (BRAVE-IPD and BRAVE-SLD only)
-    # =====================================================================
-    def _plot_wL_density():
-        """Generate averaged density plots for w_L(x) (BRAVE methods only)."""
-        df = alloc_df.dropna(subset=['w_L']).copy()
-        if df.empty:
-            warnings.warn("No w_L data available.")
-            return
-        
-        df = df[df['method'].isin(brave_methods)]
-        if df.empty:
-            warnings.warn("No BRAVE method data for w_L.")
-            return
-        
-        df['scenario_label'] = df.apply(_scenario_label, axis=1)
-        
-        # Individual plots per scenario
-        for n_h_val in sorted(df['n_h'].dropna().unique()):
-            for scen_label in label_order:
-                sub = df[(df['n_h'] == n_h_val) & (df['scenario_label'] == scen_label)]
-                if sub.empty:
-                    continue
-                
-                fig, ax = plt.subplots(figsize=(7, 5))
-                for method in brave_methods:
-                    vals = sub[sub['method'] == method]['w_L'].dropna()
-                    if vals.empty:
-                        continue
-                    
-                    if np.nanstd(vals) < 1e-6:
-                        ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
-                                 linestyle='--', linewidth=2.0, label=_label(method))
-                    else:
-                        sns.kdeplot(vals, ax=ax, label=_label(method),
-                                  color=palette_all.get(method, 'gray'),
-                                  clip=(0, 1), linewidth=2.0)
-                
-                ax.set_xlabel(r'$w_L(\mathbf{x})$', fontsize=11)
-                ax.set_ylabel('Density', fontsize=11)
-                ax.set_title(f"$w_L$ density - {scen_label}, $n_h$={int(n_h_val)}", fontsize=12)
-                ax.legend(title='Method', fontsize=9)
-                ax.grid(True, alpha=0.3)
-                fig.tight_layout()
-                safe_label = _safe_filename(scen_label)
-                out = os.path.join(config.PLOTS_DIR, f"density_wL_{safe_label}_nh{int(n_h_val)}.pdf")
-                fig.savefig(out)
-                plt.close(fig)
-                print(f"[+] Saved w_L density: {out}")
-    
-    _plot_wL_density()
-
-    # =====================================================================
-    # 5. Combined 6×4 Grid Plots for n_h=400 and 800
-    # Each row = scenario, Each column = plot type (allocation, Rn, M, w_L)
-    # =====================================================================
-    def _plot_combined_grids():
-        """Generate combined 6×4 grid plots: 6 scenarios × 4 plot types."""
-        scenarios = [(stype, kappa, label) for stype, kappa, label in scenario_order]
-        plot_types = ['allocation', 'Rn', 'M', 'w_L']
-        
-        for n_h_val in [400, 800]:
-            # Check if we have data for this n_h
-            df_nh = alloc_df[alloc_df['n_h'] == n_h_val].copy()
-            if df_nh.empty:
-                continue
-            
-            df_nh['scenario_label'] = df_nh.apply(_scenario_label, axis=1)
-            
-            # Create 6×4 grid: rows = scenarios, cols = plot types
-            fig, axes = plt.subplots(len(scenarios), len(plot_types),
-                                   figsize=(3.5 * len(plot_types), 2.5 * len(scenarios)),
-                                   sharex=False, sharey=False)
-            axes = np.atleast_2d(axes)
-            
-            for i, (stype, kappa, scen_label) in enumerate(scenarios):
-                scen_sub = df_nh[(df_nh['scenario_type'] == stype) &
-                                (df_nh['kappa'].astype(float) == float(kappa))]
-                
-                if scen_sub.empty:
-                    continue
-                
-                # Column 0: Allocation trajectory
-                ax = axes[i, 0]
-                traj_df = scen_sub.dropna(subset=['prop_treated', 'sample_size']).copy()
-                if not traj_df.empty:
-                    traj_agg = (
-                        traj_df.groupby(['method', 'sample_size'], as_index=False)
-                        .agg(prop_treated_mean=('prop_treated', 'mean'))
-                    )
-                    for method in design_order:
-                        method_data = traj_agg[traj_agg['method'] == method]
-                        if not method_data.empty:
-                            ax.plot(method_data['sample_size'], method_data['prop_treated_mean'],
-                                  color=palette_all.get(method, 'gray'), label=_label(method),
-                                  linewidth=1.5, alpha=0.8)
-                    ax.set_ylim(0, 1)
-                    ax.set_ylabel('Alloc. ratio', fontsize=8)
-                    if i == len(scenarios) - 1:
-                        ax.set_xlabel('Sample size', fontsize=8)
-                    ax.grid(True, alpha=0.3)
-                    if i == 0:
-                        ax.set_title('Allocation', fontsize=9)
-                        ax.legend(fontsize=6, loc='upper right', ncol=2)
-                
-                # Column 1: R_n density
-                ax = axes[i, 1]
-                rn_df = scen_sub.dropna(subset=['R_n']).copy()
-                if not rn_df.empty:
-                    for method in design_order:
-                        vals = rn_df[rn_df['method'] == method]['R_n'].dropna()
-                        if vals.empty:
-                            continue
-                        if method == 'KBCD':
-                            ax.axvline(1.0, color=palette_all.get(method, 'gray'),
-                                     linestyle='--', linewidth=1.5, alpha=0.8)
-                        elif np.nanstd(vals) < 1e-6:
-                            ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
-                                     linestyle='--', linewidth=1.5, alpha=0.8)
-                        else:
-                            sns.kdeplot(vals, ax=ax, color=palette_all.get(method, 'gray'),
-                                      fill=False, clip=(0, None), linewidth=1.5, alpha=0.8)
-                    ax.set_ylabel('Density', fontsize=8)
-                    if i == len(scenarios) - 1:
-                        ax.set_xlabel(r'$R_n$', fontsize=8)
-                    ax.grid(True, alpha=0.3)
-                    if i == 0:
-                        ax.set_title(r'$R_n$ Density', fontsize=9)
-                
-                # Column 2: M density (BRAVE only)
-                ax = axes[i, 2]
-                m_df = scen_sub.dropna(subset=['M']).copy()
-                m_df = m_df[m_df['method'].isin(brave_methods)]
-                if not m_df.empty:
-                    for method in brave_methods:
-                        vals = m_df[m_df['method'] == method]['M'].dropna()
-                        if vals.empty:
-                            continue
-                        if np.nanstd(vals) < 1e-6:
-                            ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
-                                     linestyle='--', linewidth=1.5, alpha=0.8)
-                        else:
-                            sns.kdeplot(vals, ax=ax, color=palette_all.get(method, 'gray'),
-                                      fill=False, clip=(0, None), linewidth=1.5, alpha=0.8)
-                    ax.set_ylabel('Density', fontsize=8)
-                    if i == len(scenarios) - 1:
-                        ax.set_xlabel(r'$M$', fontsize=8)
-                    ax.grid(True, alpha=0.3)
-                    if i == 0:
-                        ax.set_title(r'$M$ Density', fontsize=9)
-                
-                # Column 3: w_L density (BRAVE only)
-                ax = axes[i, 3]
-                wl_df = scen_sub.dropna(subset=['w_L']).copy()
-                wl_df = wl_df[wl_df['method'].isin(brave_methods)]
-                if not wl_df.empty:
-                    for method in brave_methods:
-                        vals = wl_df[wl_df['method'] == method]['w_L'].dropna()
-                        if vals.empty:
-                            continue
-                        if np.nanstd(vals) < 1e-6:
-                            ax.axvline(np.nanmean(vals), color=palette_all.get(method, 'gray'),
-                                     linestyle='--', linewidth=1.5, alpha=0.8)
-                        else:
-                            sns.kdeplot(vals, ax=ax, color=palette_all.get(method, 'gray'),
-                                      fill=False, clip=(0, 1), linewidth=1.5, alpha=0.8)
-                    ax.set_ylabel('Density', fontsize=8)
-                    if i == len(scenarios) - 1:
-                        ax.set_xlabel(r'$w_L$', fontsize=8)
-                    ax.grid(True, alpha=0.3)
-                    if i == 0:
-                        ax.set_title(r'$w_L$ Density', fontsize=9)
-                
-                # Add scenario label on the leftmost axis
-                axes[i, 0].set_ylabel(scen_label, fontsize=9)
-            
-            fig.suptitle(f'Adaptive Allocation Stage Metrics ($n_h$={int(n_h_val)})', 
-                         fontsize=12, y=0.995)
-            fig.tight_layout(rect=[0.05, 0, 1, 0.99])
-            out = os.path.join(config.PLOTS_DIR, f"combined_6x4_grid_nh{int(n_h_val)}.pdf")
-            fig.savefig(out)
-            plt.close(fig)
-            print(f"[+] Saved combined 6×4 grid: {out}")
-    
-    _plot_combined_grids()
-
-    print(f"[+] All plots saved to: {config.PLOTS_DIR}")
-
-# =============================================================================
-# Main Entry Point (for testing)
-# =============================================================================
-
-if __name__ == "__main__":
-    print("analysis.py - Results processing module")
-    print("This module is typically called from main.py")
-    print("\nTo test, run: python main.py")
+    # Default 3×2 factorial figures
+    scen_order = list(config.SCENARIOS.keys()) if config else \
+                 sorted(df.scenario.unique())
+    plot_figure1_allocation(df, scen_order, out_dir)
+    plot_figure2_bias_rmse(df, scen_order, out_dir)
+    plot_figure3_ci(df, scen_order, out_dir)
+    plot_figure4_testing(df, scen_order, out_dir)
+    plot_figure5_borrowing_diagnostics(df, scen_order, out_dir)
+    plot_figure6_precision_map(df, scen_order, out_dir)
+    write_factorial_table(df, scen_order, out_dir)
+    print("Factorial analysis complete.")

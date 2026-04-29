@@ -1,339 +1,113 @@
-﻿"""
-config.py
-
-Configuration file for the BRAVE simulation study.
-
-This module centralizes all simulation parameters, scenario definitions, prior
-specifications, and file paths for the Covariate-Adjusted Historical Borrowing
-with Unit Information Prior (BRAVE) simulation study as described in the manuscript.
-
-The simulation framework evaluates four covariate-adaptive randomization methods:
-    - BRAVE-IPD: Proposed method with individual-patient historical data
-    - BRAVE-SLD: Proposed method for summary-level historical borrowing
-    - CAHB: Jin et al. (2023) - SIM paper
-    - KBCD: Jiang et al. (2018) - kernel-based biased coin design
-
-References:
-    - BRAVE manuscript (references/BRAVE.pdf)
-    - Jin et al. (2023): Statistics in Medicine (references/2023_SIM_CAHB.pdf)
-    - Jiang et al. (2018): KBCD paper (references/KBCD.pdf)
 """
+config.py — Simulation configuration (3×2 factorial design).
 
-import os
+Clean 3×2 factorial grid:
+                    High precision (σ_H=0.5)        Low precision (σ_H=3.0)
+  No bias (b=0)     B1: ideal borrowing              B2: noisy but unbiased
+  Mod bias (b=0.5)  B3: precise bias → CAHB traps    B4: hidden bias in noise
+  Large bias (b=2)  B5: all methods detect            B6: all methods detect
+
+Key B3 vs B4 insight:
+  B3: θ₀(x) precise → CAHB's variance-ratio sees high value + circular trap
+      → OVER-borrows biased data → severe ATE contamination
+  B4: θ₀(x) noisy → less variance reduction value → CAHB borrows less
+      but still cannot detect hidden bias
+  RADISH: limits borrowing in both via PDC (B3) and precision cap (B4)
+"""
 import numpy as np
+from pathlib import Path
 
+# ── Sample sizes & trial structure ────────────────────────────────
+N_HISTORICAL  = 200
+N_CURRENT     = 200
+INTERIM_START = 20
+ALPHA         = 0.05
 
-def _env_flag(var_name: str, default: str = "0") -> bool:
-    """Parses boolean-like environment variables (\"1\", \"true\", \"on\")."""
-    return os.environ.get(var_name, default).strip().lower() in {"1", "true", "yes", "on"}
+# ── Covariate & outcome model ────────────────────────────────────
+COVARIATE_DIM = 2
+COVARIATE_PARAMS = {"p": 2, "disc_idx": [0], "cont_idx": [1]}
+BETA = np.array([0.0, 0.5, 0.5, 0.3])   # μ₀^C(X) = β₀ + β₁X₁ + β₂X₂ + β₃X₁X₂
+SIGMA_0 = 1.0    # control arm noise SD
+SIGMA_1 = 1.2    # treatment arm noise SD (heteroscedastic)
 
-# =============================================================================
-# Core Simulation Settings
-# =============================================================================
+EFFECT_SIZES = {"Null": 0.0, "Power": 0.5}
 
-# Number of Monte Carlo replicates per scenario (Section 3.5 of manuscript)
-# Recommended: 1000 for publication results, reduce for testing
-FULL_RUN_REPLICATES = 1000
+# ── Simulation Scenarios (3×2 factorial) ──────────────────────────
+# Y^H = μ₀^C(X) + b_θ + ε_H,   ε_H ~ N(0, σ_H²)
+#
+# Bias levels:   b = 0.0 (none), 0.5 (moderate), 2.0 (large)
+# Precision:     σ_H = 0.5 (high precision), 3.0 (low precision)
 
-# Fast demonstration mode (smaller replication count, identical settings otherwise)
-FAST_DEMO = 1#_env_flag("CAHB_FAST_DEMO", "0")
-FAST_DEMO_REPLICATES = 10#int(os.environ.get("CAHB_FAST_DEMO_REPS", "50"))
-FAST_DEMO_REPLICATES = max(5, FAST_DEMO_REPLICATES)
-
-if FAST_DEMO:
-    N_REPLICATES = FAST_DEMO_REPLICATES
-else:
-    N_REPLICATES = FULL_RUN_REPLICATES
-
-# Parallel computation settings
-# N_JOBS controls joblib parallelization:
-#   -1: Use all available CPU cores
-#   -2: Use all cores except one
-#   N: Use exactly N cores
-N_JOBS = -1
-
-# Enable checkpointing to avoid re-running completed simulations
-# Cache stored in CACHE_DIR; delete directory to force fresh run
-USE_CACHE = True
-
-# Memory management: maximum memory per worker process (in MB)
-# Adjust based on available RAM to prevent memory overflow
-# None = no limit (use with caution)
-MAX_MEMORY_PER_JOB = 2000  # 2GB per worker
-
-# =============================================================================
-# Trial Design Parameters (Section 3.4)
-# =============================================================================
-
-# Burn-in phase: initial subjects enrolled with balanced allocation
-# before adaptive randomization begins
-N_INIT = 40
-
-# Sequential allocation monitoring grid (for allocation diagnostics figure)
-SEQ_MONITOR_START = N_INIT
-SEQ_MONITOR_STEP = 20
-
-# Allocation probability during burn-in (0.5 = balanced 1:1 randomization)
-ALLOC_BURN_IN = 0.5
-
-# Batch size for parallel processing to manage memory
-# Larger batches = faster but more memory usage
-BATCH_SIZE = 100
-
-# =============================================================================
-# Method Comparison Configuration (Section 3.3)
-# =============================================================================
-
-# Methods to evaluate in the simulation study
-# Each method name must correspond to a class in methods.py
-METHODS_TO_RUN = [
-    'BRAVE_IPD',  # Proposed method with IPD-driven borrowing
-    'BRAVE_SLD',  # Proposed method using summary-level historical borrowing
-    'CAHB',       # Jin et al. (2023) - baseline borrowing method
-    'KBCD',       # Jiang et al. (2018) - no borrowing benchmark
-]
-
-# Method display names for tables and figures
-METHOD_LABELS = {
-    'BRAVE_IPD': 'BRAVE-IPD',
-    'BRAVE_SLD': 'BRAVE-SLD',
-    'CAHB': 'CAHB',
-    'KBCD': 'KBCD',
+SCENARIOS = {
+    "B1_noBias_highPrec":  {"b_theta": 0.0, "sigma_h": 0.5,
+        "description": "Ideal: unbiased, precise — maximum borrowing benefit"},
+    "B2_noBias_lowPrec":   {"b_theta": 0.0, "sigma_h": 3.0,
+        "description": "Unbiased but noisy — limited borrowing value"},
+    "B3_mdBias_highPrec":  {"b_theta": 0.5, "sigma_h": 0.5,
+        "description": "Moderate bias, precise — CAHB over-borrows via circular trap"},
+    "B4_mdBias_lowPrec":   {"b_theta": 0.5, "sigma_h": 3.0,
+        "description": "Moderate bias, noisy — bias hidden; less borrowing but still contaminated"},
+    "B5_lgBias_highPrec":  {"b_theta": 2.0, "sigma_h": 0.5,
+        "description": "Large bias, precise — all methods detect conflict"},
+    "B6_lgBias_lowPrec":   {"b_theta": 2.0, "sigma_h": 3.0,
+        "description": "Large bias, noisy — all methods detect conflict"},
 }
 
-# =============================================================================
-# File and Directory Structure
-# =============================================================================
+# ── Kernel bandwidths ────────────────────────────────────────────
+KERNEL_BANDWIDTH_BINARY     = 1.1    # Epanechnikov allocation kernel
+KERNEL_BANDWIDTH_CONTINUOUS = 1.3
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Cache directory for checkpointing simulation replicates
-CACHE_DIR = os.path.join(BASE_DIR, 'simulation_cache')
-
-# Results directory structure
-RESULTS_DIR = os.path.join(BASE_DIR, 'results')
-PLOTS_DIR = os.path.join(RESULTS_DIR, 'plots')
-TABLES_DIR = os.path.join(RESULTS_DIR, 'tables')
-RAW_DATA_DIR = os.path.join(RESULTS_DIR, 'raw_data')
-
-# =============================================================================
-# Prior Hyperparameters (Section 2.5)
-# =============================================================================
-
+# ── Method hyperparameters ───────────────────────────────────────
 PRIORS = {
-    # Inverse-Gamma priors for variance parameters (weakly informative)
-    'variance_ig_a': 1e-3,     # IG shape parameter (alpha)
-    'variance_ig_b': 1e-3,     # IG scale parameter (beta)
-    # Bootstrap iterations for methods that rely on resampling (CAHB, KBCD)
-    'bootstrap_iterations': 500,
-
-    # BRAVE hyperparameters
-    'uip_gamma_alpha': 2.0,    # Prior shape for the amount parameter M(x)
-    'uip_coord_iter': 100,      # Max coordinate-ascent iterations
-    'uip_coord_tol': 1e-4,     # Convergence tolerance for coordinate-ascent
-    'post_gibbs_iter': 1500,    # Gibbs iterations per evaluation point
-    'post_gibbs_burn': 500,    # Burn-in draws per evaluation point
-
-    # CAHB tuning parameter (Jin et al. 2023, Section 4)
-    # Controls borrowing strength via compatibility measure
-    'cahb_gamma': np.sqrt(3.0),  # gamma = sqrt(3)
-    'cahb_lambda': 300.0,         # lambda_2 baseline (use 300*log n)
-    'cahb_lambda_quantile': 0.10,  # lambda_1 quantile (Algorithm 2)
-    'cahb_invgam2': 1.0/3.0,        # 1/gamma^2 term in Eq. (9), gamma=sqrt(3)
+    # RADISH (proposed)
+    "radish_nc_stabilizer":    5.0,   # N_c floor for Stage II
+    "radish_n_min_discrepancy": 3.0,
+    "radish_n0_final":         5.0,   # N_c floor for Stage III
+    # CAHB (Jin et al., 2023)
+    "cahb_lambda":            300.0, # L1 projection radius
+    "cahb_gamma":             0.25,  # τ prior scale
 }
 
-# =============================================================================
-# Evaluation Metrics Configuration (Section 3.5)
-# =============================================================================
+# ── Precision-gradient scenarios (showcases RADISH τ²_H awareness) ──
+# Hold b_θ fixed and sweep σ_H over a fine grid. Tests whether each
+# method correctly down-weights low-precision historical data even
+# when no bias is present — RADISH's R_n explicitly contains τ²_H.
+PRECISION_GRID = [0.25, 0.5, 1.0, 1.5, 2.5, 4.0]
+PRECISION_BIAS_LEVELS = {"unbiased": 0.0, "modBias": 0.5}
 
-# Confidence interval significance level (two-sided)
-ALPHA = 0.05
+def _build_precision_scenarios():
+    out = {}
+    for blab, bv in PRECISION_BIAS_LEVELS.items():
+        for sh in PRECISION_GRID:
+            key = f"P_{blab}_sH{sh:g}".replace(".", "p")
+            out[key] = {"b_theta": float(bv), "sigma_h": float(sh),
+                        "description": f"Precision sweep b={bv}, σ_H={sh}",
+                        "_grid_bias": blab, "_grid_sigma": float(sh)}
+    return out
 
-# Posterior probability threshold for declaring treatment success
-# Trial deemed successful if Pr(delta > 0 | Data) > DECISION_THRESHOLD
-DECISION_THRESHOLD = 0.975
+PRECISION_SCENARIOS = _build_precision_scenarios()
 
-# Calibration diagnostics: per-replicate subsample size for discount summaries
-CALIBRATION_MAX_SAMPLES = 32
+# ── Replications ─────────────────────────────────────────────────
+N_REPS_DEMO       = 10
+N_REPS_FULL       = 500
+N_REPS_PRECISION  = 200   # finer grid (12 cells) → moderate reps per cell
+def get_mode_replications(mode):
+    return {"demo": N_REPS_DEMO,
+            "full": N_REPS_FULL,
+            "precision": N_REPS_PRECISION}[mode]
 
-# Effective sample size constraints (for numerical stability)
-MIN_ESS = 1e-6      # Minimum effective sample size
-MAX_ESS = 1e6       # Maximum effective sample size (clip to prevent overflow)
+def get_mode_scenarios(mode):
+    """Return the scenario dict for a given mode."""
+    if mode == "precision":
+        return PRECISION_SCENARIOS
+    return SCENARIOS
 
-# =============================================================================
-# Simulation Scenario Definitions (Sections 3.1-3.2)
-# =============================================================================
+# ── Output & Runtime ─────────────────────────────────────────────
+RESULTS_ROOT   = "results"
+N_JOBS         = 4
+SCENARIO_ORDER = list(SCENARIOS.keys())
+METHOD_ORDER   = ["KBCD", "CAHB", "RADISH"]
+EFFECT_ORDER   = ["Null", "Power"]
 
-def delta0_no_bias(_: np.ndarray) -> float:
-    """Scenario bias function: perfectly compatible historical data."""
-    return 0.0
-
-
-def delta0_constant_bias(_: np.ndarray) -> float:
-    """Scenario bias function: fixed 0.4 mean shift across all covariates."""
-    return 0.4
-
-
-def delta0_subgroup_bias(x: np.ndarray) -> float:
-    """Scenario bias: 0.6 shift for the high-risk region (X4 > 1)."""
-    x_arr = np.asarray(x).ravel()
-    if x_arr.size <= 3:
-        return 0.0
-    return 0.6 if x_arr[3] > 1.0 else 0.0
-
-
-def get_scenario_definitions():
-    """
-    Generates the full factorial grid of simulation scenarios.
-    
-    The simulation study evaluates 16 scenarios resulting from the factorial
-    combination of:
-        - Current trial sample sizes: n ∈ {200}
-        - Historical trial sample sizes: n_h ∈ {400, 800}
-        - Base treatment effects: tau_0 ∈ {0.0, 0.4}
-        - Data generating mechanisms: S1, S2, S3, S4
-    
-    Scenario Definitions (Section 3.2):
-    -----------------------------------
-    S1: Ideal case - no historical bias, homoscedastic variance
-        - Delta_0(x) = 0 (perfect historical-current compatibility)
-        - kappa = 1.0 (identical variance structure)
-        - Tests borrowing under best conditions
-    
-    S2: Variance heterogeneity - no mean shift but variance mismatch
-        - Delta_0(x) = 0 (compatible means)
-        - kappa = 1.3 (historical controls have inflated variance)
-        - Tests robustness to variance mismatch
-    
-    S3: Constant mean shift with variance heterogeneity
-        - Delta_0(x) = 0.4 (constant historical bias)
-        - kappa = 1.3 (variance mismatch)
-        - Tests ability to detect and discount incompatible historical data
-    
-    S4: Covariate-dependent historical bias
-        - Delta_0(x) = 0.6 * I(X4 = 2) (bias only for specific subgroup)
-        - kappa = 1.3 (variance mismatch)
-        - Tests local borrowing adaptivity
-    
-    Returns:
-        list[dict]: List of scenario dictionaries, each containing:
-            - id: Unique scenario identifier (0 to 15)
-            - name: Human-readable scenario name
-            - n: Current trial sample size
-            - n_h: Historical trial sample size
-            - tau_0: Base treatment effect (0 = Type I error, 0.4 = Power)
-            - kappa: Historical variance inflation factor
-            - Delta_0_func: Function x -> Delta_0(x) defining historical bias
-            - scenario_type: Scenario label (S1, S2, S3, S4)
-    
-    Notes:
-        - tau_0 = 0.0: scenarios for evaluating Type I error control
-        - tau_0 = 0.4: scenarios for evaluating power
-        - Each scenario replicated N_REPLICATES times
-    """
-    
-    # Factorial design grid
-    n_list = [200]                   # Current trial sample sizes
-    n_h_list = [400, 800]            # Historical trial sample sizes  
-    tau_0_list = [0.0, 0.4]          # Base treatment effects
-    
-    # Data-generating mechanism specifications (Section 3.2)
-    scenario_params = {
-        'S1': {
-            'Delta_0_func': delta0_no_bias,
-            'kappa_values': [1.0],
-            'description': 'Ideal: no bias, homoscedastic'
-        },
-        'S2': {
-            'Delta_0_func': delta0_no_bias,
-            'kappa_values': [0.7, 1.3],
-            'description': 'Variance mismatch only'
-        },
-        'S3': {
-            'Delta_0_func': delta0_constant_bias,
-            'kappa_values': [0.7, 1.3],
-            'description': 'Constant bias + variance mismatch'
-        },
-        'S4': {
-            'Delta_0_func': delta0_subgroup_bias,
-            'kappa_values': [1.3],
-            'description': 'Local bias (X4>1 region)'
-        }
-    }
-    
-    scenarios = []
-    scenario_id = 0
-    
-    # Generate full factorial combination
-    for n in n_list:
-        for n_h in n_h_list:
-            for tau_0 in tau_0_list:
-                for s_name in ['S1', 'S2', 'S3', 'S4']:  # Ordered for consistency
-                    s_params = scenario_params[s_name]
-                    for kappa in s_params['kappa_values']:
-                        scenarios.append({
-                            'id': scenario_id,
-                            'name': f"n={n}_nh={n_h}_tau0={tau_0}_{s_name}_kappa={kappa}",
-                            'n': n,
-                            'n_h': n_h,
-                            'tau_0': tau_0,
-                            'kappa': kappa,
-                            'Delta_0_func': s_params['Delta_0_func'],
-                            'scenario_type': s_name,
-                            'description': s_params['description']
-                        })
-                        scenario_id += 1
-    
-    return scenarios
-
-
-# =============================================================================
-# Derived Parameters (computed from above settings)
-# =============================================================================
-
-def get_total_simulations():
-    """
-    Computes the total number of simulation runs.
-    
-    Returns:
-        int: Total number of (scenario × method × replicate) combinations
-    """
-    n_scenarios = len(get_scenario_definitions())
-    n_methods = len(METHODS_TO_RUN)
-    return n_scenarios * n_methods * N_REPLICATES
-
-
-# =============================================================================
-# Validation Functions
-# =============================================================================
-
-def validate_config():
-    """
-    Validates configuration parameters and prints warnings if needed.
-    
-    Checks for:
-        - Reasonable parameter ranges
-        - Directory creation capability
-        - Memory settings vs available RAM
-    """
-    import warnings
-    
-    # Check replicate count
-    if N_REPLICATES < 100:
-        warnings.warn(
-            f"N_REPLICATES={N_REPLICATES} is low for reliable results. "
-            "Consider N_REPLICATES >= 1000 for publication.",
-            UserWarning
-        )
-    
-    # Check if results directory is writable
-    try:
-        os.makedirs(RESULTS_DIR, exist_ok=True)
-    except OSError as e:
-        warnings.warn(f"Cannot create results directory: {e}", UserWarning)
-    
-    # Print configuration summary
-    n_sims = get_total_simulations()
-    print(f"Configuration validated. Total simulations: {n_sims:,}")
-    
-    return True
+def get_mode_output_dir(mode):
+    return Path(RESULTS_ROOT) / mode
