@@ -87,19 +87,42 @@ def _build_precision_scenarios():
 
 PRECISION_SCENARIOS = _build_precision_scenarios()
 
+# ── Bias-gradient scenarios — direct test of Theorem 1 ────────────
+# Theorem 1 predicts D_PDC ≥ c1·N_H·h̄·b² + c2·log N. Sweep b_θ on a
+# fine grid at fixed σ_H = 0.5 to verify the quadratic-in-b growth
+# of D_PDC and the exponential collapse of W in the unsaturated
+# regime (i.e. before D_PDC hits the −log(ε_p) ≈ 27.6 cap).
+BIAS_GRID = [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50]
+BIAS_GRID_SIGMA_H = 0.5
+
+def _build_bias_scenarios():
+    out = {}
+    for b in BIAS_GRID:
+        key = f"G_b{b:g}".replace(".", "p")
+        out[key] = {"b_theta": float(b), "sigma_h": float(BIAS_GRID_SIGMA_H),
+                    "description": f"Bias gradient b={b}, σ_H={BIAS_GRID_SIGMA_H}",
+                    "_grid_bias_value": float(b)}
+    return out
+
+BIAS_SCENARIOS = _build_bias_scenarios()
+
 # ── Replications ─────────────────────────────────────────────────
 N_REPS_DEMO       = 10
-N_REPS_FULL       = 500
-N_REPS_PRECISION  = 200   # finer grid (12 cells) → moderate reps per cell
+N_REPS_FULL       = 1000
+N_REPS_PRECISION  = 500   # 12 cells × 500 reps = 6000 trials/method
+N_REPS_BIAS       = 500   # 10 cells × 500 reps
 def get_mode_replications(mode):
     return {"demo": N_REPS_DEMO,
             "full": N_REPS_FULL,
-            "precision": N_REPS_PRECISION}[mode]
+            "precision": N_REPS_PRECISION,
+            "bias":  N_REPS_BIAS}[mode]
 
 def get_mode_scenarios(mode):
     """Return the scenario dict for a given mode."""
     if mode == "precision":
         return PRECISION_SCENARIOS
+    if mode == "bias":
+        return BIAS_SCENARIOS
     return SCENARIOS
 
 # ── Output & Runtime ─────────────────────────────────────────────

@@ -159,7 +159,7 @@ def metrics(df, scenarios=None):
 # ── CLI ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["demo","full","precision"], default="demo")
+    ap.add_argument("--mode", choices=["demo","full","precision","bias"], default="demo")
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--jobs", type=int, default=config.N_JOBS)
     args = ap.parse_args()

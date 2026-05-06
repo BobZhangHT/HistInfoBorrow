@@ -93,14 +93,27 @@ def allocation_bandwidths(p, disc_idx=(0,), cont_idx=(1,)):
 # =====================================================================
 
 def estimate_ate(X_eval, X0, Y0, X1, Y1, X_H, Y_H, h, W_vec, alpha=0.05):
-    """
-    Linearized ATE estimator with borrowing weight vector W.
+    """Kernel g-formula Stage III estimator.
+
+    Robins (1986) g-computation in nonparametric kernel-regression form
+    (Snowden et al. 2011, AJE; Vansteelandt & Keiding 2011, AJE):
+
+        Δ̂ = (1/n_eval) Σ_i [m̂₁(X_i) − m̂₀(X_i)]
+
+    with borrowing-augmented control regression m̂₀(x) = (1−W(x)) m̂₀^C(x) +
+    W(x) m̂₀^H(x).  Algebraically equivalent to the weighted-Y form
+    Δ̂ = a₁'Y₁ − a₀'Y₀ − a_H'Y_H with influence vectors
+        a_z = (1/n_eval) Σ_i [W-modulated] S_z[i, ·].
+
+    Variance: M-estimator sandwich for a kernel-regression projection
+    (Härdle 1990 §4.2; Wand & Jones 1995 §3.4.4),
+        V̂ = v̂₁ ‖a₁‖² + v̂₀ ‖a₀‖² + v̂_H ‖a_H‖²,
+    with σ̂²_z(Y|X,Z=z) from a kernel smoother and the second-order DoF
+    correction dof = n − 2 tr(S) + tr(S'S).
 
     Parameters
     ----------
-    W_vec : (n_eval,) array
-        Borrowing weight at each evaluation point.
-        W=0 means no borrowing (KBCD), W>0 means borrowing (CAHB/RADISH).
+    W_vec : (n_eval,) per-point borrowing weight (0 ⇒ KBCD; >0 ⇒ borrow).
 
     Returns
     -------
@@ -127,15 +140,15 @@ def estimate_ate(X_eval, X0, Y0, X1, Y1, X_H, Y_H, h, W_vec, alpha=0.05):
     ate = float(a1 @ Y1 - a0 @ Y0 - aH @ Y_H)
 
     # ── Residual variance σ̂²(Y|X,Z) via kernel regression ──────────
-    # The paper's "within-arm sample variances" σ̂₁², σ̂₀², σ̂_H² must be
-    # the CONDITIONAL variance Var(Y|X,Z), NOT the marginal Var(Y|Z).
-    # Using np.var(Y,ddof=1) inflates the estimate by Var(μ(X)) — the
-    # covariate-driven mean variation — producing CIs that are 20%+ too
-    # wide, coverage > 95%, and Type-I error << 0.05.
-    #
-    # Fix: fit a kernel smoother Ŷ = S·Y within each arm and estimate
-    # σ̂² = ||Y - SY||² / (n - tr(S)), where tr(S) accounts for the
-    # effective degrees of freedom consumed by the smoother.
+    # σ̂²_z must estimate Var(Y|X,Z=z), the CONDITIONAL variance, not
+    # the marginal Var(Y|Z) (which inflates the estimate by Var{μ_z(X)},
+    # producing over-wide CIs and over-coverage).  Fit Ŷ = S·Y within
+    # each arm; use second-order effective degrees of freedom
+    #     dof = n − 2·tr(S) + tr(S'S)            (Wand & Jones 1995 §3.4.4)
+    # rather than n − tr(S), which under-estimates Var(Y|X,Z) by ignoring
+    # smoother curvature — the residual contains stochastic noise AND a
+    # smoothing-bias component, and the additional tr(S'S) term pays for
+    # the latter.
     def _resid_var(X_arm, Y_arm):
         na = len(Y_arm)
         if na < 3:
@@ -143,7 +156,8 @@ def estimate_ate(X_eval, X0, Y0, X1, Y1, X_H, Y_H, h, W_vec, alpha=0.05):
         S_self = normalise_rows(gaussian_weight_matrix(X_arm, X_arm, h))
         resid = Y_arm - S_self @ Y_arm
         tr_S = np.trace(S_self)
-        dof = max(na - tr_S, 1.0)
+        tr_StS = float(np.sum(S_self * S_self))   # ‖S‖_F²
+        dof = max(na - 2.0 * tr_S + tr_StS, 1.0)
         return max(float(np.sum(resid**2) / dof), _EPS)
 
     v1 = _resid_var(X1, Y1)
@@ -158,24 +172,89 @@ def estimate_ate(X_eval, X0, Y0, X1, Y1, X_H, Y_H, h, W_vec, alpha=0.05):
 # RADISH helper: PDC discrepancy
 # =====================================================================
 
-def _pdc_discrepancy(theta_H, tau2_H, ybar0):
-    """Z_n, p_n, D_PDC = -log(p_n)."""
-    tau = np.sqrt(max(tau2_H, _EPS))
-    Z = np.clip((ybar0 - theta_H) / tau, -1e10, 1e10)
+def _pdc_discrepancy(theta_H, tau2_H, ybar0, sigma2_0c=0.0, Nc=1.0):
+    """Z_n, p_n, D_PDC computed under the canonical PDC standardization
+    of Evans & Moshonov (2006, Example 1) and Nott et al. (2020):
+
+        SE^2 = tau2_H + sigma2_{0,c} / N_c
+        Z_n  = (ȳ_c − θ) / SE
+        p_n  = 2 min{Φ(Z), 1 − Φ(Z)}
+        D_PDC = −log p_n
+
+    Including the data sampling variance sigma2_{0,c}/N_c in the
+    denominator calibrates Z to N(0,1) under H0 by the CLT, removing
+    the kernel-smoothing miscalibration that inflated the empirical
+    surprisal in earlier versions. The default sigma2_0c=0, Nc=1
+    recovers the original (uncalibrated) statistic.
+    """
+    se2 = max(tau2_H + sigma2_0c / max(Nc, 1.0), _EPS)
+    se = np.sqrt(se2)
+    Z = np.clip((ybar0 - theta_H) / se, -1e10, 1e10)
     pu = float(norm.cdf(Z))
     pn = max(2.0 * min(pu, 1.0 - pu), _EPS)
     return Z, pn, float(-np.log(pn))
 
-def _compute_borrowing_weight(theta, tau2_H, ybar, sigma2_0c, Nc, nc_floor):
+def _global_pdc_surprisal(Y0, Y_H):
+    """Trial-level (root-node) PDC surprisal D_global = −log p_global.
+
+    For the normal–normal hierarchical model, the Marshall–Spiegelhalter
+    (2007, Test) node-split conflict p-value at the root mean parameter is
+    the two-sided Welch p-value with
+
+        Z_g = (ȳ_H − ȳ_C) / sqrt(s²_C/n_C + s²_H/n_H),
+        p_g = 2 min{Φ(Z_g), 1 − Φ(Z_g)}.
+
+    Under no conflict (H0) p_g ~ Uniform(0,1), so D_global = −log p_g is
+    calibrated to add coherently to the local leaf-node surprisal via
+    Fisher's combination on the surprisal scale (Presanis et al. 2013,
+    Stat Sci §4 — multi-node combination in directed acyclic graphs).
+    """
+    n0 = len(Y0); nH = len(Y_H)
+    if n0 < 2 or nH < 2:
+        return 0.0
+    m0 = float(np.mean(Y0));  s0 = float(np.var(Y0, ddof=1))
+    mH = float(np.mean(Y_H)); sH = float(np.var(Y_H, ddof=1))
+    se = np.sqrt(s0 / n0 + sH / nH)
+    if se < _EPS:
+        return 0.0
+    Zg = (mH - m0) / se
+    pu = float(norm.cdf(np.clip(Zg, -1e10, 1e10)))
+    pg = max(2.0 * min(pu, 1.0 - pu), _EPS)
+    return float(-np.log(pg))
+
+
+def _compute_borrowing_weight(theta, tau2_H, ybar, sigma2_0c, Nc, nc_floor,
+                              Dg=0.0):
     """Compute R_n and borrowing weight W = (R_n-1)/R_n.
 
-    Implements eq. (7) of the paper:
-        R_n(x) = 1 + sigma2_{0,c}(x) / [N_c(x) * tau2_H(x) * exp(D_PDC(x))]
+    Local (leaf-node) PDC standardization (Evans & Moshonov 2006 §2,
+    Example 1; Nott et al. 2020):
+
+        SE^2 = tau2_H + sigma2_{0,c} / N_c
+        Z    = (ȳ_c − θ) / SE,    p_n = 2 min{Φ(Z), 1−Φ(Z)}
+        D_local = −log p_n
+
+    Hierarchical PDC: combine the local leaf-node surprisal with a trial-
+    level (root-node) surprisal D_global via Fisher (1925) addition on the
+    −log p scale (Marshall & Spiegelhalter 2007; Presanis et al. 2013):
+
+        D_PDC = D_local + D_global
+
+    The discount M(x) = exp(−D_PDC) modulates the prior precision under
+    the working Gaussian model so that the posterior precision of μ_0 is
+    Π_post = M/τ²_H + N_c/σ²_{0,c}, giving
+
+        R_n = 1 + [σ²_{0,c}/N_c · exp(−D_PDC)] / SE²,    W = (R_n−1)/R_n.
+
+    Pass Dg=0 for allocation-time (leaf-only) computation; pass the
+    precomputed trial-level surprisal for Stage III.
     """
     Nc_s = max(Nc, nc_floor)
-    _, _, Dn = _pdc_discrepancy(theta, tau2_H, ybar)
-    gD = np.exp(Dn)
-    PiH = 1.0 / max(tau2_H * gD, _EPS)
+    se2 = max(tau2_H + sigma2_0c / Nc_s, _EPS)
+    _, _, Dn = _pdc_discrepancy(theta, tau2_H, ybar, sigma2_0c, Nc_s)
+    gD = np.exp(Dn + Dg)
+    # Coherent R_n with combined SE² as the prior-precision denominator
+    PiH = 1.0 / max(se2 * gD, _EPS)
     PiC = max(Nc_s / sigma2_0c, _EPS)
     Rn = max(1.0, min(1.0 + PiH / PiC, 1e4))
     return Rn, (Rn - 1.0) / Rn
@@ -396,7 +475,7 @@ class CAHB:
                                 {"R_n": Rn, "method": "CAHB"})
 
     def estimate_treatment_effect(self, X, Y, Z):
-        """Stage III: linearized ATE with CAHB variance-ratio W(x)."""
+        """Stage III: kernel g-formula with CAHB variance-ratio W(x)."""
         X = _as_2d(X); Y = np.asarray(Y, float); Z = np.asarray(Z, int)
         if (Z == 0).sum() < 2 or (Z == 1).sum() < 2:
             return float(Y[Z==1].mean() - Y[Z==0].mean()), np.nan, np.nan, 0.5
@@ -485,13 +564,15 @@ class RADISH:
                                      "method": "RADISH"})
 
     def estimate_treatment_effect(self, X, Y, Z):
-        """Stage III: linearized ATE with PDC-based W(x)."""
+        """Stage III: kernel g-formula with hierarchical-PDC W(x)."""
         X = _as_2d(X); Y = np.asarray(Y, float); Z = np.asarray(Z, int)
         i0, i1 = np.where(Z == 0)[0], np.where(Z == 1)[0]
         if len(i0) < 2 or len(i1) < 2:
             return float(np.nanmean(Y[i1]) - np.nanmean(Y[i0])), np.nan, np.nan, 0.5
         X0, Y0 = X[i0], Y[i0]; h = self.h_fit; n = X.shape[0]
-        # Batch historical kernel for speed
+        # Trial-level (root-node) PDC surprisal, computed once and folded
+        # uniformly into every local D_PDC via Fisher-style addition.
+        Dg = _global_pdc_surprisal(Y0, self.Y_h)
         KH = gaussian_weight_matrix(self.X_h, X, h)
         Wv = np.zeros(n)
         for i in range(n):
@@ -510,7 +591,8 @@ class RADISH:
                 s2c = max(float(np.sum(w0*(Y0-yb)**2)/Nc), _EPS)
             else:
                 yb, s2c = 0.0, 1.0
-            _, Wv[i] = _compute_borrowing_weight(th, t2, yb, s2c, Nc, self.n0_fin)
+            _, Wv[i] = _compute_borrowing_weight(th, t2, yb, s2c, Nc,
+                                                 self.n0_fin, Dg=Dg)
         return estimate_ate(X, X0, Y0, X[i1], Y[i1],
                             self.X_h, self.Y_h, h, Wv, self.alpha)
 
@@ -522,6 +604,7 @@ class RADISH:
             return {"mean_W": np.nan, "mean_Rn": np.nan,
                     "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
         X0, Y0 = X[i0], Y[i0]; h = self.h_fit; n = X.shape[0]
+        Dg = _global_pdc_surprisal(Y0, self.Y_h)
         KH = gaussian_weight_matrix(self.X_h, X, h)
         Rns = np.zeros(n); Ws = np.zeros(n); Ds = np.zeros(n); T2 = np.zeros(n)
         for i in range(n):
@@ -540,8 +623,10 @@ class RADISH:
                 s2c = max(float(np.sum(w0*(Y0-yb)**2)/Nc), _EPS)
             else:
                 yb, s2c = 0.0, 1.0
-            _, _, Ds[i] = _pdc_discrepancy(th, t2, yb)
-            Rns[i], Ws[i] = _compute_borrowing_weight(th, t2, yb, s2c, Nc, self.n0_fin)
+            _, _, Dl = _pdc_discrepancy(th, t2, yb, s2c, max(Nc, self.n0_fin))
+            Ds[i] = Dl + Dg
+            Rns[i], Ws[i] = _compute_borrowing_weight(th, t2, yb, s2c, Nc,
+                                                     self.n0_fin, Dg=Dg)
             T2[i] = t2
         return {"mean_W": float(np.mean(Ws)),
                 "mean_Rn": float(np.mean(Rns)),

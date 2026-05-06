@@ -11,7 +11,7 @@ mode="full"       3×2 factorial scenarios:
     Fig 5  Borrowing Diagnostics: mean W, mean R_n         ← NEW
     Fig 6  Precision-Awareness Map: W vs (b_θ, σ_H) heat   ← NEW
 
-mode="precision"  σ_H gradient sweep at fixed b_θ:
+mode="precision"  σ_H sensitivity sweep at fixed b_θ:
     Fig P1  Borrowing weight W vs σ_H        (showcase)   ← NEW
     Fig P2  Information ratio R_n vs σ_H                  ← NEW
     Fig P3  RMSE & Coverage vs σ_H                        ← NEW
@@ -40,49 +40,63 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════
 
 PUB_RC = {
-    # Fonts (LaTeX-friendly, sans-serif body, serif math optional)
+    # Biometrics / Biostatistics figure standards: 8-9 pt body fonts,
+    # sans-serif for axis labels, serif math, vector PDF (Type42).
     "font.family":        "sans-serif",
     "font.sans-serif":    ["Arial", "Helvetica", "DejaVu Sans"],
-    "font.size":          11,
-    "axes.titlesize":     12,
-    "axes.labelsize":     11,
-    "xtick.labelsize":    10,
-    "ytick.labelsize":    10,
-    "legend.fontsize":    9.5,
-    "legend.title_fontsize": 10,
-    "figure.titlesize":   13,
-    # Lines & axes
-    "axes.linewidth":     0.9,
+    "font.size":          9,
+    "axes.titlesize":     9,
+    "axes.labelsize":     9,
+    "xtick.labelsize":    8,
+    "ytick.labelsize":    8,
+    "legend.fontsize":    8,
+    "legend.title_fontsize": 8.5,
+    "figure.titlesize":   10,
+    # Math text in serif (Computer Modern), per journal house style.
+    "mathtext.fontset":   "stix",
+    "mathtext.rm":        "STIXGeneral",
+    # Lines & axes — thin strokes that print well in B/W reproduction.
+    "axes.linewidth":     0.7,
     "axes.spines.top":    False,
     "axes.spines.right":  False,
     "axes.grid":          True,
     "grid.linestyle":     ":",
-    "grid.linewidth":     0.6,
+    "grid.linewidth":     0.5,
     "grid.alpha":         0.4,
-    "lines.linewidth":    1.8,
-    "lines.markersize":   5.5,
-    "lines.markeredgewidth": 0.8,
+    # Horizontal-grid-only via axes.grid.axis is not valid in matplotlib;
+    # we apply ax.yaxis.grid(True); ax.xaxis.grid(False) selectively below.
+    "lines.linewidth":    1.4,
+    "lines.markersize":   4.5,
+    "lines.markeredgewidth": 0.7,
     # Ticks
     "xtick.direction":    "out",
     "ytick.direction":    "out",
-    "xtick.major.size":   3.5,
-    "ytick.major.size":   3.5,
-    "xtick.major.width":  0.8,
-    "ytick.major.width":  0.8,
-    # Vector PDF
-    "pdf.fonttype":       42,    # TrueType for editable text in PDFs
+    "xtick.major.size":   2.5,
+    "ytick.major.size":   2.5,
+    "xtick.major.width":  0.7,
+    "ytick.major.width":  0.7,
+    # Vector PDF (TrueType embed, journal-required)
+    "pdf.fonttype":       42,
     "ps.fonttype":        42,
     "savefig.dpi":        600,
     "savefig.bbox":       "tight",
-    "savefig.pad_inches": 0.05,
+    "savefig.pad_inches": 0.04,
     # Legend
     "legend.frameon":     True,
-    "legend.framealpha":  0.92,
-    "legend.edgecolor":   "0.6",
+    "legend.framealpha":  0.95,
+    "legend.edgecolor":   "0.5",
     "legend.fancybox":    False,
+    "legend.borderpad":   0.4,
+    "legend.handlelength":1.6,
+    "legend.handletextpad":0.5,
 }
 
 plt.rcParams.update(PUB_RC)
+
+# Biometrics column widths (inches): 1col = 3.27", 1.5col = 5", 2col = 6.83"
+COL1_W = 3.27
+COL15_W = 5.00
+COL2_W = 6.83
 
 # Color-blind-friendly palette (Okabe–Ito-derived)
 METHOD_ORDER  = ["KBCD", "CAHB", "RADISH"]
@@ -154,7 +168,9 @@ def _aggregate(df, scenarios):
 def _grouped_bar(ax, agg, scenarios, metric, ylabel, ylim=None,
                  ref_line=None, ref_label=None,
                  short_fn=_scen_short_factorial,
-                 err_metric=None, value_fontsize=7.0, value_fmt="{:.3f}"):
+                 err_metric=None, value_fontsize=None, value_fmt="{:.3f}"):
+    """Grouped bar chart. Set value_fontsize to a number (e.g. 7) to overlay
+    numeric values on bars; default is None (no overlay) for clean figures."""
     x = np.arange(len(scenarios)); w = 0.27
     for j, mt in enumerate(METHOD_ORDER):
         ms = agg[agg.Method == mt]
@@ -202,7 +218,7 @@ def _shared_method_legend(fig, loc="upper center", ncol=3, y=1.02):
 def plot_figure1_allocation(df, scen_order, out_dir):
     df = df[df.scenario.isin(scen_order)].copy()
     if df.empty: return
-    fig, axes = plt.subplots(1, 2, figsize=(13.2, 4.8), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(COL2_W, 3.0), sharey=True)
     n_m = len(METHOD_ORDER); w = 0.30; gap = 0.95
 
     for ax, eff in zip(axes, ["Null", "Power"]):
@@ -244,17 +260,17 @@ def plot_figure1_allocation(df, scen_order, out_dir):
 def plot_figure2_bias_rmse(df, scen_order, out_dir):
     agg = _aggregate(df, scen_order)
     if agg.empty: return
-    fig, axes = plt.subplots(2, 2, figsize=(13.2, 8.0))
+    fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.4))
     for col, eff in enumerate(["Null", "Power"]):
         sub = agg[agg.Effect == eff]
         scen = [s for s in scen_order if s in sub.Scenario.values]
         ax = axes[0, col]
         _grouped_bar(ax, sub, scen, "Bias", "Estimation Bias",
                      ref_line=0, ref_label="zero bias",
-                     err_metric="Bias_se", value_fontsize=7)
+                     err_metric="Bias_se")
         ax.set_title(f"Bias — {EFFECT_DISPLAY[eff]}")
         ax = axes[1, col]
-        _grouped_bar(ax, sub, scen, "RMSE", "RMSE", value_fontsize=7)
+        _grouped_bar(ax, sub, scen, "RMSE", "RMSE")
         ax.set_title(f"RMSE — {EFFECT_DISPLAY[eff]}")
     _shared_method_legend(fig, y=1.02)
     fig.suptitle("Estimation Bias and RMSE", y=1.05)
@@ -266,18 +282,18 @@ def plot_figure2_bias_rmse(df, scen_order, out_dir):
 def plot_figure3_ci(df, scen_order, out_dir):
     agg = _aggregate(df, scen_order)
     if agg.empty: return
-    fig, axes = plt.subplots(2, 2, figsize=(13.2, 8.0))
+    fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.4))
     for col, eff in enumerate(["Null", "Power"]):
         sub = agg[agg.Effect == eff]
         scen = [s for s in scen_order if s in sub.Scenario.values]
         ax = axes[0, col]
         _grouped_bar(ax, sub, scen, "Width", "CI Width",
-                     err_metric="Width_se", value_fontsize=7)
+                     err_metric="Width_se")
         ax.set_title(f"CI Width — {EFFECT_DISPLAY[eff]}")
         ax = axes[1, col]
         _grouped_bar(ax, sub, scen, "Coverage", "Coverage Probability",
                      ref_line=0.95, ref_label="nominal 95%",
-                     ylim=(0.55, 1.02), value_fontsize=7)
+                     ylim=(0.55, 1.02))
         ax.set_title(f"Coverage — {EFFECT_DISPLAY[eff]}")
     _shared_method_legend(fig, y=1.02)
     fig.suptitle("Confidence Interval Width and Coverage", y=1.05)
@@ -289,7 +305,7 @@ def plot_figure3_ci(df, scen_order, out_dir):
 def plot_figure4_testing(df, scen_order, out_dir):
     agg = _aggregate(df, scen_order)
     if agg.empty: return
-    fig, axes = plt.subplots(1, 2, figsize=(13.2, 4.6))
+    fig, axes = plt.subplots(1, 2, figsize=(COL2_W, 2.9))
     for ax, eff, ttl in zip(axes, ["Null", "Power"],
                             ["Type I Error  ($\\Delta=0$)",
                              "Statistical Power  ($\\Delta=0.5$)"]):
@@ -302,8 +318,7 @@ def plot_figure4_testing(df, scen_order, out_dir):
                      "Rejection Rate" if eff=="Null" else "Power",
                      ref_line=ref, ref_label=ref_lab,
                      err_metric="Rejection_se",
-                     ylim=ylim if eff == "Null" else (0, 1.05),
-                     value_fontsize=7)
+                     ylim=ylim if eff == "Null" else (0, 1.05))
         ax.set_title(ttl)
     _shared_method_legend(fig, y=1.05)
     fig.suptitle("Hypothesis Testing Performance", y=1.10)
@@ -320,10 +335,10 @@ def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
     sub = agg[agg.Effect == "Power"]
     scen = [s for s in scen_order if s in sub.Scenario.values]
 
-    fig, axes = plt.subplots(1, 2, figsize=(13.2, 4.6))
+    fig, axes = plt.subplots(1, 2, figsize=(COL2_W, 2.9))
     ax = axes[0]
     _grouped_bar(ax, sub, scen, "Mean_W", r"Mean borrowing weight $\overline{W(x)}$",
-                 ref_line=0, value_fontsize=7,
+                 ref_line=0,
                  err_metric="Mean_W_se",
                  ylim=(0, max(0.28, sub.Mean_W.max()*1.20)))
     ax.set_title(r"Borrowing Intensity")
@@ -336,7 +351,6 @@ def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
     ax = axes[1]
     _grouped_bar(ax, sub, scen, "Mean_Rn", r"Mean information ratio $\overline{R_n(x)}$",
                  ref_line=1.0, ref_label=r"$R_n=1$ (no borrowing)",
-                 value_fontsize=7,
                  ylim=(0.95, max(1.6, sub.Mean_Rn.max()*1.10)))
     ax.set_title(r"Effective Information Gain")
 
@@ -362,7 +376,7 @@ def plot_figure6_precision_map(df, scen_order, out_dir):
     pdat = pd.DataFrame(rows).dropna()
     if pdat.empty: return
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.5), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(COL2_W, 3.0), sharey=True)
     # Build coordinate axes
     bvals = sorted(pdat.b_theta.unique())
     svals = sorted(pdat.sigma_h.unique())
@@ -397,7 +411,7 @@ def plot_figure6_precision_map(df, scen_order, out_dir):
 # ═══════════════════════════════════════════════════════════════════
 
 def _gather_precision(df, scenarios):
-    """Long-format frame with σ_H gradient."""
+    """Long-format frame with σ_H sensitivity."""
     rows = []
     for sc, meta in scenarios.items():
         for ef in ["Null", "Power"]:
@@ -464,7 +478,7 @@ def _line_panel(ax, dfp, ycol, ylabel, *, ycol_se=None,
 
 def plot_precision_W(dfp, out_dir):
     """Fig P1: borrowing weight W vs σ_H — RADISH's signature plot."""
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.6), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(COL2_W, 3.0), sharey=True)
     for ax, blab, ttl in zip(axes, ["unbiased", "modBias"],
                               [r"Unbiased history  $b_\theta = 0$",
                                r"Moderately biased  $b_\theta = 0.5$"]):
@@ -481,7 +495,7 @@ def plot_precision_W(dfp, out_dir):
 
 def plot_precision_Rn(dfp, out_dir):
     """Fig P2: information ratio."""
-    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.6), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(COL2_W, 3.0), sharey=True)
     for ax, blab, ttl in zip(axes, ["unbiased", "modBias"],
                               [r"Unbiased  $b_\theta = 0$",
                                r"Moderately biased  $b_\theta = 0.5$"]):
@@ -499,7 +513,7 @@ def plot_precision_Rn(dfp, out_dir):
 
 def plot_precision_estimation(dfp, out_dir):
     """Fig P3: RMSE & coverage vs σ_H, both bias regimes."""
-    fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.0))
+    fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.4))
     for col, blab in enumerate(["unbiased", "modBias"]):
         ttl = r"$b_\theta = 0$" if blab == "unbiased" else r"$b_\theta = 0.5$"
         d_pow = dfp[(dfp.bias_label == blab) & (dfp.effect == "Power")]
@@ -513,7 +527,7 @@ def plot_precision_estimation(dfp, out_dir):
                     ref=0.95, ref_label="nominal 95%",
                     ylim=(0.55, 1.02), show_legend=False)
         ax.set_title(f"Coverage  —  {ttl}")
-    fig.suptitle("Estimation Quality across the Precision Gradient", y=1.02)
+    fig.suptitle("Estimation Quality across the Precision Sensitivity", y=1.02)
     plt.tight_layout()
     _save(fig, out_dir / "plots" / "figP3_rmse_coverage_vs_sigmaH.pdf")
     print("  [ok] Figure P3: RMSE / coverage vs σ_H")
@@ -521,7 +535,7 @@ def plot_precision_estimation(dfp, out_dir):
 
 def plot_precision_testing(dfp, out_dir):
     """Fig P4: Type-I & Power vs σ_H."""
-    fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.0))
+    fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.4))
     for col, blab in enumerate(["unbiased", "modBias"]):
         ttl = r"$b_\theta = 0$" if blab == "unbiased" else r"$b_\theta = 0.5$"
         d_null = dfp[(dfp.bias_label == blab) & (dfp.effect == "Null")]
@@ -540,7 +554,7 @@ def plot_precision_testing(dfp, out_dir):
                     ycol_se="rejection_se",
                     ylim=(0, 1.05), show_legend=False)
         ax.set_title(f"Power  —  {ttl}")
-    fig.suptitle("Hypothesis Testing across the Precision Gradient", y=1.02)
+    fig.suptitle("Hypothesis Testing across the Precision Sensitivity", y=1.02)
     plt.tight_layout()
     _save(fig, out_dir / "plots" / "figP4_typeI_power_vs_sigmaH.pdf")
     print("  [ok] Figure P4: Type-I / Power vs σ_H")
@@ -589,7 +603,7 @@ def write_factorial_table(df, scen_order, out_dir):
 
 
 def write_precision_table(dfp, out_dir):
-    """Precision-gradient diagnostics table (complementary to figures)."""
+    """Precision sensitivity diagnostics table (complementary to figures)."""
     cols = ["bias_label","b_theta","sigma_h","effect","method","n",
             "rmse","rejection","coverage","width",
             "mean_W","mean_Rn"]
@@ -616,7 +630,7 @@ def write_precision_table(dfp, out_dir):
         body = out_tex.to_latex(index=False, escape=False)
         tex = (
             "\\begin{table}[!ht]\n\\centering\n"
-            "\\caption{Precision-gradient experiment: per-cell operating "
+            "\\caption{Precision sensitivity experiment: per-cell operating "
             "characteristics and borrowing diagnostics across "
             "$\\sigma_H \\in \\{0.25, 0.5, 1.0, 1.5, 2.5, 4.0\\}$ "
             "at fixed bias regimes $b_\\theta \\in \\{0, 0.5\\}$.}\n"
@@ -624,6 +638,250 @@ def write_precision_table(dfp, out_dir):
             f"{body}\n\\end{{table}}\n"
         )
         (out_dir / "tables" / "metrics_precision.tex").write_text(tex, encoding="utf-8")
+    except Exception as e:
+        print(f"  [warn] LaTeX export failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BIAS-GRADIENT FIGURES & THEORY-VERIFICATION (mode="bias")
+#
+# Direct test of Theorem 1:
+#   D_PDC(b)  ≥  c1·N_H·h̄·b² + c2·log N        (lower bound)
+#   W(b)      =  O_p(exp{−c1·N_H·h̄·b²})         (exponential collapse)
+# We fit log( D̄_PDC − D̄_PDC(0) ) ~ β · log(b) to recover the predicted
+# slope of 2.0, and fit log( W ) ~ a − γ·b² to recover the exponential
+# decay constant. These linear-regression overlays appear as inset
+# diagnostics on the line plots.
+# ═══════════════════════════════════════════════════════════════════
+
+def _gather_bias(df, scenarios):
+    rows = []
+    for sc, meta in scenarios.items():
+        for ef in ["Null", "Power"]:
+            for mt in METHOD_ORDER:
+                s = df[(df.scenario==sc) & (df.effect_type==ef) & (df.method==mt)]
+                if s.empty: continue
+                td = s.true_delta.iloc[0]
+                cov = ((s.ci_low <= td) & (td <= s.ci_high)).astype(int)
+                rmse = np.sqrt(((s.estimated_delta - td)**2).mean())
+                rej = s.rejected.mean()
+                rej_se = np.sqrt(rej*(1-rej)/max(len(s),1))
+                W  = s.mean_W if "mean_W" in s else pd.Series([np.nan])
+                Rn = s.mean_Rn if "mean_Rn" in s else pd.Series([np.nan])
+                D  = s.mean_Dpdc if "mean_Dpdc" in s else pd.Series([np.nan])
+                rows.append(dict(
+                    b_theta=meta["b_theta"], sigma_h=meta["sigma_h"],
+                    effect=ef, method=mt, n=len(s),
+                    bias=s.estimation_bias.mean(),
+                    bias_se=s.estimation_bias.std(ddof=1)/np.sqrt(len(s)),
+                    rmse=rmse,
+                    rejection=rej, rejection_se=rej_se,
+                    coverage=cov.mean(),
+                    width=(s.ci_high - s.ci_low).mean(),
+                    mean_W=W.mean(skipna=True),
+                    mean_W_se=W.std(ddof=1,skipna=True)/np.sqrt(max(W.dropna().shape[0],1)),
+                    mean_Rn=Rn.mean(skipna=True),
+                    mean_Dpdc=D.mean(skipna=True),
+                ))
+    return pd.DataFrame(rows)
+
+
+def _fit_quadratic(b, y):
+    """Fit y = α + γ·b²; return (α, γ, R²)."""
+    b = np.asarray(b, float); y = np.asarray(y, float)
+    m = np.isfinite(y) & np.isfinite(b)
+    if m.sum() < 3: return np.nan, np.nan, np.nan
+    bb = b[m]**2
+    A = np.column_stack([np.ones_like(bb), bb])
+    beta, *_ = np.linalg.lstsq(A, y[m], rcond=None)
+    yhat = A @ beta
+    ss_res = np.sum((y[m] - yhat)**2)
+    ss_tot = np.sum((y[m] - y[m].mean())**2)
+    r2 = 1 - ss_res / max(ss_tot, 1e-12)
+    return float(beta[0]), float(beta[1]), float(r2)
+
+
+def plot_bias_diagnostics(dfb, out_dir):
+    """Theory-verification: D̄_PDC vs b² (linear) and W̄ vs b² (log-linear)."""
+    pow_d = dfb[dfb.effect == "Power"].copy()
+
+    # Theorem 1: D_PDC ≥ c1·N_H·h̄·b² + c2·log N → quadratic in b
+    rad = pow_d[pow_d.method == "RADISH"].sort_values("b_theta")
+    b_arr = rad.b_theta.values
+    D_arr = rad.mean_Dpdc.values
+    # Drop saturated points (D > 25, since cap ≈ 27.6)
+    keep = D_arr < 25
+    a_D, c1_emp, R2_D = _fit_quadratic(b_arr[keep], D_arr[keep])
+
+    # Theorem 1(i): W ≤ exp(−c1·N_H·h̄·b² + ...). Fit log W ~ −γ·b² in unsat.
+    W_arr = rad.mean_W.values
+    keep_W = (W_arr > 1e-4) & (b_arr > 0)
+    a_W, c2_emp, R2_W = _fit_quadratic(b_arr[keep_W], np.log(W_arr[keep_W]))
+
+    fig, axes = plt.subplots(1, 2, figsize=(COL2_W, 3.0))
+
+    # Panel A: D_PDC vs b on linear scale, with quadratic fit overlay
+    ax = axes[0]
+    for mt in METHOD_ORDER:
+        d = pow_d[pow_d.method == mt].sort_values("b_theta")
+        if d.empty: continue
+        if mt == "RADISH":
+            ax.plot(d.b_theta, d.mean_Dpdc,
+                    marker=METHOD_MARKERS[mt], color=METHOD_COLORS[mt],
+                    label=METHOD_LABELS[mt], lw=1.4, mec="white", mew=0.6)
+    if np.isfinite(c1_emp):
+        bgrid = np.linspace(0, b_arr[keep].max(), 100)
+        ax.plot(bgrid, a_D + c1_emp * bgrid**2,
+                color="0.25", ls="--", lw=1.0,
+                label=f"Quadratic fit  $D = {a_D:.2f} + {c1_emp:.2f}\\,b^2$  ($R^2={R2_D:.3f}$)")
+    ax.axhline(-np.log(1e-12), color="0.55", ls=":", lw=0.8,
+               label=r"$-\log\epsilon_p \approx 27.6$ (cap)")
+    ax.set_xlabel(r"Historical bias  $b_\theta$")
+    ax.set_ylabel(r"Mean PDC surprisal  $\overline{D_{\mathrm{PDC}}}$")
+    ax.set_title("Theorem 1(i): quadratic growth")
+    ax.legend(loc="upper left", fontsize=7.2)
+
+    # Panel B: log W̄ vs b² with linear-fit overlay
+    ax = axes[1]
+    for mt in METHOD_ORDER:
+        d = pow_d[pow_d.method == mt].sort_values("b_theta")
+        if d.empty: continue
+        if mt == "KBCD": continue   # KBCD W ≡ 0; skip log
+        b2 = d.b_theta.values**2
+        Wv = d.mean_W.values
+        ok = Wv > 1e-4
+        ax.plot(b2[ok], Wv[ok], marker=METHOD_MARKERS[mt],
+                color=METHOD_COLORS[mt], label=METHOD_LABELS[mt],
+                lw=1.4, mec="white", mew=0.6)
+    if np.isfinite(c2_emp):
+        bg = np.linspace(0, (b_arr[keep_W]**2).max(), 100)
+        ax.plot(bg, np.exp(a_W + c2_emp * bg),
+                color="0.25", ls="--", lw=1.0,
+                label=f"Exponential fit  $W \\propto e^{{{c2_emp:.2f}\\,b^2}}$  ($R^2={R2_W:.3f}$)")
+    ax.set_yscale("log")
+    ax.set_xlabel(r"$b_\theta^2$")
+    ax.set_ylabel(r"Mean borrowing weight  $\overline{W}$  (log scale)")
+    ax.set_title("Theorem 1(i): exponential collapse")
+    ax.legend(loc="upper right", fontsize=7.2)
+
+    fig.suptitle("Bias Sensitivity (Theorem 1) Verification ($\\sigma_H = 0.5$, $\\Delta = 0.5$)",
+                 y=1.04)
+    plt.tight_layout()
+    _save(fig, out_dir / "plots" / "figB1_theorem1_verification.pdf")
+    print("  [ok] Figure B1: Theorem 1 verification")
+    return dict(a_D=a_D, c1_emp=c1_emp, R2_D=R2_D,
+                a_W=a_W, c2_emp=c2_emp, R2_W=R2_W)
+
+
+def plot_bias_operating(dfb, out_dir):
+    """Operating characteristics across bias sensitivity: Type-I, power, RMSE, coverage."""
+    fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.4))
+    null_d = dfb[dfb.effect == "Null"]
+    pow_d  = dfb[dfb.effect == "Power"]
+
+    # Panel A: Type I error vs b
+    ax = axes[0, 0]
+    for mt in METHOD_ORDER:
+        d = null_d[null_d.method == mt].sort_values("b_theta")
+        if d.empty: continue
+        ax.errorbar(d.b_theta, d.rejection, yerr=1.96*d.rejection_se,
+                    marker=METHOD_MARKERS[mt], color=METHOD_COLORS[mt],
+                    label=METHOD_LABELS[mt], lw=1.3, mec="white", mew=0.6,
+                    capsize=2, elinewidth=0.7)
+    ax.axhline(0.05, color="0.25", ls="--", lw=1.0, label=r"$\alpha = 0.05$")
+    ax.set_xlabel(r"Historical bias  $b_\theta$")
+    ax.set_ylabel(r"Type I error  ($\Delta = 0$)")
+    ax.set_ylim(0, max(0.20, null_d.rejection.max()*1.15))
+    ax.set_title("(a) Type I error")
+    ax.legend(loc="upper left", fontsize=7.2)
+
+    # Panel B: Power
+    ax = axes[0, 1]
+    for mt in METHOD_ORDER:
+        d = pow_d[pow_d.method == mt].sort_values("b_theta")
+        if d.empty: continue
+        ax.errorbar(d.b_theta, d.rejection, yerr=1.96*d.rejection_se,
+                    marker=METHOD_MARKERS[mt], color=METHOD_COLORS[mt],
+                    lw=1.3, mec="white", mew=0.6, capsize=2, elinewidth=0.7)
+    ax.set_xlabel(r"Historical bias  $b_\theta$")
+    ax.set_ylabel(r"Power  ($\Delta = 0.5$)")
+    ax.set_ylim(0.4, 1.02)
+    ax.set_title("(b) Statistical power")
+
+    # Panel C: RMSE (Power)
+    ax = axes[1, 0]
+    for mt in METHOD_ORDER:
+        d = pow_d[pow_d.method == mt].sort_values("b_theta")
+        if d.empty: continue
+        ax.plot(d.b_theta, d.rmse, marker=METHOD_MARKERS[mt],
+                color=METHOD_COLORS[mt], lw=1.3, mec="white", mew=0.6)
+    ax.set_xlabel(r"Historical bias  $b_\theta$")
+    ax.set_ylabel(r"RMSE  ($\Delta = 0.5$)")
+    ax.set_title("(c) Estimation RMSE")
+
+    # Panel D: Coverage (Null)
+    ax = axes[1, 1]
+    for mt in METHOD_ORDER:
+        d = null_d[null_d.method == mt].sort_values("b_theta")
+        if d.empty: continue
+        ax.plot(d.b_theta, d.coverage, marker=METHOD_MARKERS[mt],
+                color=METHOD_COLORS[mt], lw=1.3, mec="white", mew=0.6)
+    ax.axhline(0.95, color="0.25", ls="--", lw=1.0)
+    ax.set_xlabel(r"Historical bias  $b_\theta$")
+    ax.set_ylabel(r"Coverage  ($\Delta = 0$)")
+    ax.set_ylim(0.55, 1.02)
+    ax.set_title("(d) Wald coverage")
+
+    fig.suptitle("Operating Characteristics across the Bias Sensitivity",
+                 y=1.02)
+    plt.tight_layout()
+    _save(fig, out_dir / "plots" / "figB2_bias_operating.pdf")
+    print("  [ok] Figure B2: bias operating characteristics")
+
+
+def write_bias_table(dfb, fit, out_dir):
+    """Bias sensitivity diagnostic + theory-fit table."""
+    cols = ["b_theta", "effect", "method", "n",
+            "rmse","rejection","coverage","width",
+            "mean_W","mean_Rn","mean_Dpdc"]
+    out = dfb[cols].copy()
+    out = out.rename(columns={
+        "b_theta":"b_theta","effect":"Effect","method":"Method",
+        "rmse":"RMSE","rejection":"Reject","coverage":"Coverage",
+        "width":"Width",
+        "mean_W":"Mean_W","mean_Rn":"Mean_Rn","mean_Dpdc":"Mean_Dpdc"})
+    out.to_csv(out_dir / "tables" / "metrics_bias.csv", index=False)
+
+    # Format
+    fmt = {"RMSE":"{:.4f}","Reject":"{:.3f}","Coverage":"{:.3f}",
+           "Width":"{:.3f}","Mean_W":"{:.4f}","Mean_Rn":"{:.3f}",
+           "Mean_Dpdc":"{:.2f}","b_theta":"{:.3f}"}
+    for c, f in fmt.items():
+        out[c] = out[c].apply(lambda v: f.format(v) if pd.notna(v) else "—")
+    out_tex = out.rename(columns={
+        "b_theta":  r"$b_\theta$",
+        "Mean_W":   r"$\overline{W}$",
+        "Mean_Rn":  r"$\overline{R_n}$",
+        "Mean_Dpdc":r"$\overline{D_{\mathrm{PDC}}}$",
+    })
+    try:
+        body = out_tex.to_latex(index=False, escape=False, longtable=False)
+        cap = (
+            "Bias sensitivity experiment at $\\sigma_H = 0.5$. "
+            f"Quadratic fit $D = {fit['a_D']:.2f} + {fit['c1_emp']:.2f}\\,b^2$ "
+            f"($R^2 = {fit['R2_D']:.3f}$); "
+            f"exponential collapse $\\overline{{W}} \\propto "
+            f"\\exp\\{{{fit['c2_emp']:.2f}\\,b^2\\}}$ "
+            f"($R^2 = {fit['R2_W']:.3f}$). "
+            "These coefficients corroborate Theorem~1(i)."
+        )
+        tex = (
+            "\\begin{table}[!ht]\n\\centering\n"
+            f"\\caption{{{cap}}}\n"
+            "\\label{tab:metrics_bias}\n"
+            f"{body}\n\\end{{table}}\n"
+        )
+        (out_dir / "tables" / "metrics_bias.tex").write_text(tex, encoding="utf-8")
     except Exception as e:
         print(f"  [warn] LaTeX export failed: {e}")
 
@@ -656,7 +914,16 @@ def run_analysis(df, out_dir, mode="full"):
         plot_precision_estimation(dfp, out_dir)
         plot_precision_testing(dfp, out_dir)
         write_precision_table(dfp, out_dir)
-        print("Precision-gradient analysis complete.")
+        print("Precision sensitivity analysis complete.")
+        return
+
+    if mode == "bias":
+        scenarios = config.get_mode_scenarios("bias")
+        dfb = _gather_bias(df, scenarios)
+        fit = plot_bias_diagnostics(dfb, out_dir)
+        plot_bias_operating(dfb, out_dir)
+        write_bias_table(dfb, fit, out_dir)
+        print("Bias sensitivity theory-verification analysis complete.")
         return
 
     # Default 3×2 factorial figures

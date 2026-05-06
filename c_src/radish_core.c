@@ -46,6 +46,36 @@ static inline double phi_cdf(double z) {
     return 0.5 * erfc(-z * 0.7071067811865475);  /* z / sqrt(2) */
 }
 
+/* Inverse standard-normal CDF via Acklam's rational approximation
+ * (P. Acklam 2003). Accurate to ~1.15e-9; sufficient for CI z-quantiles. */
+static double inv_normal_cdf(double q) {
+    static const double a_[6] = {-3.969683028665376e+01, 2.209460984245205e+02,
+                                 -2.759285104469687e+02, 1.383577518672690e+02,
+                                 -3.066479806614716e+01, 2.506628277459239e+00};
+    static const double b_[5] = {-5.447609879822406e+01, 1.615858368580409e+02,
+                                 -1.556989798598866e+02, 6.680131188771972e+01,
+                                 -1.328068155288572e+01};
+    static const double c_[6] = {-7.784894002430293e-03, -3.223964580411365e-01,
+                                 -2.400758277161838e+00, -2.549732539343734e+00,
+                                 4.374664141464968e+00,  2.938163982698783e+00};
+    static const double d_[4] = {7.784695709041462e-03,  3.224671290700398e-01,
+                                 2.445134137142996e+00,  3.754408661907416e+00};
+    const double pl = 0.02425, ph = 1.0 - pl;
+    if (q < pl) {
+        double r = sqrt(-2.0*log(q));
+        return (((((c_[0]*r+c_[1])*r+c_[2])*r+c_[3])*r+c_[4])*r+c_[5]) /
+               ((((d_[0]*r+d_[1])*r+d_[2])*r+d_[3])*r+1.0);
+    } else if (q <= ph) {
+        double r = q - 0.5; double r2 = r*r;
+        return (((((a_[0]*r2+a_[1])*r2+a_[2])*r2+a_[3])*r2+a_[4])*r2+a_[5])*r /
+               (((((b_[0]*r2+b_[1])*r2+b_[2])*r2+b_[3])*r2+b_[4])*r2+1.0);
+    } else {
+        double r = sqrt(-2.0*log(1.0-q));
+        return -(((((c_[0]*r+c_[1])*r+c_[2])*r+c_[3])*r+c_[4])*r+c_[5]) /
+                ((((d_[0]*r+d_[1])*r+d_[2])*r+d_[3])*r+1.0);
+    }
+}
+
 /* ---------- Squared scaled distance for product Gaussian kernel:
  *   d2(Xa[i], Xb[j]) = sum_k ((Xa[i,k] - Xb[j,k]) / h[k])^2          */
 static inline double squared_scaled_dist(
@@ -201,8 +231,18 @@ static void build_normalized_S(
     normalize_rows(S, n_eval, n_ref);
 }
 
-/* Residual variance for one arm (matches methods._resid_var).
- * Returns max(_EPS, sum((Y - SY)^2) / (n - tr(S))).                  */
+/* Residual variance for one arm with second-order degrees-of-freedom
+ * correction (Hardle 1990, §4.2; Wand & Jones 1995, §3.4.4):
+ *
+ *     dof = n − 2·tr(S) + tr(S'S)
+ *     σ̂² = ‖Y − S Y‖² / dof
+ *
+ * The plain n − tr(S) formula systematically under-estimates Var(Y|X,Z)
+ * because it does not account for the curvature of the smoother — the
+ * residual Y − SY contains both stochastic noise AND a smoothing-bias
+ * component, and the additional tr(S'S) term pays for the latter. The
+ * second-order DoF makes the estimator approximately unbiased and is
+ * the standard correction in kernel-regression inference.            */
 static double residual_variance(
     const double *Xa, const double *Ya, int na,
     int p, const double *h)
@@ -220,18 +260,22 @@ static double residual_variance(
     double *S = (double *)malloc(sizeof(double) * (size_t)na * (size_t)na);
     if (!S) return EPS;
     build_normalized_S(Xa, na, Xa, na, p, h, S);
-    double tr = 0.0;
+    double tr_S = 0.0;
+    double tr_StS = 0.0;
     double sse = 0.0;
     for (int i = 0; i < na; ++i) {
         double *row = S + (size_t)i * na;
-        tr += row[i];
+        tr_S += row[i];
+        /* tr(S'S) = sum_{i,j} S_{ij}^2  (Frobenius norm of S squared) */
+        for (int j = 0; j < na; ++j) tr_StS += row[j] * row[j];
         double pred = 0.0;
         for (int j = 0; j < na; ++j) pred += row[j] * Ya[j];
         double r = Ya[i] - pred;
         sse += r * r;
     }
     free(S);
-    double dof = (double)na - tr;
+    /* Second-order effective degrees of freedom */
+    double dof = (double)na - 2.0 * tr_S + tr_StS;
     if (dof < 1.0) dof = 1.0;
     double v = sse / dof;
     return v > EPS ? v : EPS;
@@ -246,6 +290,27 @@ typedef struct {
     double V;
 } ATEResult;
 
+/* Kernel g-formula Stage III estimator.
+ *
+ * Robins (1986) g-computation in nonparametric kernel-regression form
+ * (Snowden et al. 2011, AJE; Vansteelandt & Keiding 2011, AJE):
+ *
+ *     Δ̂ = (1/n) Σ_i [m̂₁(X_i) − m̂₀(X_i)]
+ *
+ * with borrowing-augmented control regression
+ *     m̂₀(x) = (1−W(x)) m̂₀^C(x) + W(x) m̂₀^H(x).
+ *
+ * Algebraically equivalent to weighted-Y form ate = a₁'Y₁ − a₀'Y₀ − a_H'Y_H
+ * with influence vectors a_z = (1/n_eval) Σ_i [W-modulated] S_z[i, ·].
+ *
+ * Variance: M-estimator sandwich for a kernel-regression projection
+ * (Härdle 1990 §4.2; Wand & Jones 1995 §3.4.4; Ruppert et al. 2003 §3.13):
+ *
+ *     V̂ = v̂₁ ‖a₁‖² + v̂₀ ‖a₀‖² + v̂_H ‖a_H‖²
+ *
+ * with σ̂²_z(Y|X,Z=z) estimated via a kernel smoother and the second-order
+ * effective DoF correction dof = n − 2·tr(S) + tr(S'S), the standard
+ * adjustment for kernel-regression residuals (Wand & Jones 1995 §3.4.4). */
 EXPORT void estimate_ate_c(
     const double *Xeval, int n_eval, int p,
     const double *X0, const double *Y0, int n0,
@@ -314,38 +379,8 @@ EXPORT void estimate_ate_c(
     double V = v1*n1n + v0*n0n + vH*nHn;
     if (V < EPS) V = EPS;
     double se = sqrt(V);
-    /* z = invPhi(1 - alpha/2) — caller passes 1.96 via alpha=0.05 */
-    /* compute standard normal inverse for 1 - alpha/2 */
-    /* Use Wichura’s algorithm AS 241 — but we only need a few alpha values.
-     * We accept a small library: use the Beasley-Springer-Moro approximation. */
-    double q = 1.0 - alpha / 2.0;
-    /* Acklam's inverse cdf approximation */
-    double a_[6] = {-3.969683028665376e+01, 2.209460984245205e+02,
-                    -2.759285104469687e+02, 1.383577518672690e+02,
-                    -3.066479806614716e+01, 2.506628277459239e+00};
-    double b_[5] = {-5.447609879822406e+01, 1.615858368580409e+02,
-                    -1.556989798598866e+02, 6.680131188771972e+01,
-                    -1.328068155288572e+01};
-    double c_[6] = {-7.784894002430293e-03, -3.223964580411365e-01,
-                    -2.400758277161838e+00, -2.549732539343734e+00,
-                    4.374664141464968e+00,  2.938163982698783e+00};
-    double d_[4] = {7.784695709041462e-03,  3.224671290700398e-01,
-                    2.445134137142996e+00,  3.754408661907416e+00};
-    double pl = 0.02425, ph = 1.0 - pl;
-    double z;
-    if (q < pl) {
-        double r = sqrt(-2.0*log(q));
-        z = (((((c_[0]*r+c_[1])*r+c_[2])*r+c_[3])*r+c_[4])*r+c_[5]) /
-            ((((d_[0]*r+d_[1])*r+d_[2])*r+d_[3])*r+1.0);
-    } else if (q <= ph) {
-        double r = q - 0.5; double r2 = r*r;
-        z = (((((a_[0]*r2+a_[1])*r2+a_[2])*r2+a_[3])*r2+a_[4])*r2+a_[5])*r /
-            (((((b_[0]*r2+b_[1])*r2+b_[2])*r2+b_[3])*r2+b_[4])*r2+1.0);
-    } else {
-        double r = sqrt(-2.0*log(1.0-q));
-        z = -(((((c_[0]*r+c_[1])*r+c_[2])*r+c_[3])*r+c_[4])*r+c_[5]) /
-             ((((d_[0]*r+d_[1])*r+d_[2])*r+d_[3])*r+1.0);
-    }
+
+    double z = inv_normal_cdf(1.0 - alpha / 2.0);
     *out_ate = ate;
     *out_lo  = ate - z*se;
     *out_hi  = ate + z*se;
@@ -361,16 +396,24 @@ EXPORT void estimate_ate_c(
  * ================================================================= */
 
 /* Compute (R_n, W, D_PDC, tau²_H) at a single evaluation point.
- * Mirrors RADISH per-iteration computation in methods.py.
- *   R_n = 1 + sigma2_0c / (Nc * tau2_H * exp(D_pdc))
- *   W   = (R_n - 1) / R_n
- * with safeguards: Nc_s = max(Nc, nc_floor), R_n clipped to [1, 1e4].
+ *
+ * The PDC surprisal at x is the Fisher (1925) combination of the local
+ * (per-x) Marshall–Spiegelhalter (2007) leaf-node conflict and the trial-
+ * level (root-node) conflict, both calibrated under H0 to standard normal:
+ *
+ *   D_PDC(x) = D_local(x) + D_global,  D_local = −log p_local,  D_global = −log p_global
+ *
+ * The discount enters R_n multiplicatively as exp(D_PDC):
+ *   R_n = 1 + (σ²_{0,c}/N_c) / (SE² · exp(D_PDC))
+ *
+ * Caller passes D_global; pass 0 to use the leaf-only (allocation-time)
+ * surprisal, or the precomputed trial-level surprisal for Stage III.
  */
 static void radish_single_eval(
     const double *X0, const double *Y0, int n0,
     const double *Xh, const double *Yh, int nh,
     int p, const double *h,
-    const double *x_eval, double nc_floor,
+    const double *x_eval, double nc_floor, double Dg,
     double *out_Rn, double *out_W,
     double *out_Dpdc, double *out_tau2H)
 {
@@ -429,8 +472,17 @@ static void radish_single_eval(
     }
     free(w0);
 
-    /* PDC discrepancy */
-    double tau = sqrt(tau2H > EPS ? tau2H : EPS);
+    /* PDC discrepancy with canonical Evans–Moshonov (2006) standardization:
+     *   SE^2 = tau2H + s2c / Nc_s
+     *   Z    = (ȳ_c − θ) / SE
+     * The data sampling variance s2c/Nc_s is included so that under H0
+     * (no conflict) Z ~ N(0,1) by the CLT, calibrating the surprisal to
+     * its theoretical baseline E[D_PDC] ≈ 1 under H0 rather than the
+     * inflated value (~5) that arises from omitting this term.        */
+    double Nc_s = Nc > nc_floor ? Nc : nc_floor;
+    double se2 = tau2H + s2c / Nc_s;
+    if (se2 < EPS) se2 = EPS;
+    double tau = sqrt(se2);
     double Z = (ybar - theta) / tau;
     if (Z >  1e10) Z =  1e10;
     if (Z < -1e10) Z = -1e10;
@@ -440,21 +492,66 @@ static void radish_single_eval(
     if (pn < EPS) pn = EPS;
     double Dn = -log(pn);
 
-    /* Information ratio + W */
-    double Nc_s = Nc > nc_floor ? Nc : nc_floor;
-    double gD = exp(Dn);
-    double PiH = 1.0 / dmax(tau2H * gD, EPS);
+    /* Hierarchical PDC: combine leaf-node (local) and root-node (trial-level)
+     * surprisal via Fisher (1925) addition on the −log p scale.  Marshall &
+     * Spiegelhalter (2007) show each node-level conflict p-value is calibrated
+     * Uniform under H0; Presanis et al. (2013) combine them additively in
+     * surprisal form to obtain a single coherent conflict statistic.        */
+    double Dpdc = Dn + Dg;
+
+    /* Coherent R_n with combined SE² as prior-precision denominator
+     * (Bayesian-coherent: posterior precision of μ_0 given (θ, ȳ_c)). */
+    double gD = exp(Dpdc);
+    double PiH = 1.0 / dmax(se2 * gD, EPS);
     double PiC = dmax(Nc_s / s2c, EPS);
     double Rn = 1.0 + PiH / PiC;
     if (Rn < 1.0) Rn = 1.0;
     if (Rn > 1e4) Rn = 1e4;
     double W = (Rn - 1.0) / Rn;
 
-    *out_Rn = Rn; *out_W = W; *out_Dpdc = Dn; *out_tau2H = tau2H;
+    *out_Rn = Rn; *out_W = W; *out_Dpdc = Dpdc; *out_tau2H = tau2H;
 }
 
-/* Batch version: produces R_n[i], W[i], D_pdc[i], tau²_H[i] for each X[i].
- * Pass NULL for any output you don't need.                             */
+/* Trial-level (root-node) PDC surprisal D_global = −log p_global, where
+ * p_global = 2 min{Φ(Z_g), 1 − Φ(Z_g)} and
+ *
+ *     Z_g = (ȳ_H − ȳ_C) / sqrt(s²_C/n_C + s²_H/n_H).
+ *
+ * For the normal-normal hierarchical model this is the Marshall–Spiegelhalter
+ * (2007, Test) node-split conflict p-value at the root mean parameter,
+ * calibrated to Uniform(0,1) under no-conflict (H0).  Returned in surprisal
+ * form so it adds to the leaf-node local surprisal via Fisher (1925)
+ * combination — see Presanis et al. (2013, Stat Sci) for the multi-node
+ * combination framework in DAGs.                                          */
+static double global_pdc_surprisal(
+    const double *Y0, int n0,
+    const double *YH, int nH)
+{
+    if (n0 < 2 || nH < 2) return 0.0;
+    double m0 = 0.0, mH = 0.0;
+    for (int i = 0; i < n0; ++i) m0 += Y0[i]; m0 /= n0;
+    for (int j = 0; j < nH; ++j) mH += YH[j]; mH /= nH;
+    double s0 = 0.0, sH = 0.0;
+    for (int i = 0; i < n0; ++i) { double d = Y0[i] - m0; s0 += d*d; }
+    for (int j = 0; j < nH; ++j) { double d = YH[j] - mH; sH += d*d; }
+    s0 /= (double)(n0 - 1);
+    sH /= (double)(nH - 1);
+    double se = sqrt(s0 / (double)n0 + sH / (double)nH);
+    if (se < EPS) return 0.0;
+    double Zg = (mH - m0) / se;
+    if (Zg >  1e10) Zg =  1e10;
+    if (Zg < -1e10) Zg = -1e10;
+    double pu = phi_cdf(Zg);
+    double pmin = pu < (1.0 - pu) ? pu : (1.0 - pu);
+    double pg = 2.0 * pmin;
+    if (pg < EPS) pg = EPS;
+    return -log(pg);
+}
+
+/* Batch version: produces R_n[i], W[i], D_pdc[i], tau²_H[i] for each X[i],
+ * with the trial-level surprisal D_global folded uniformly into every D_pdc[i]
+ * via Fisher addition — replacing the prior version's binary Welch gate with
+ * a continuous, literature-grounded conflict statistic.                    */
 EXPORT void radish_diagnostics_batch(
     const double *X, int n,
     const double *X0, const double *Y0, int n0,
@@ -463,10 +560,11 @@ EXPORT void radish_diagnostics_batch(
     double *out_Rn, double *out_W,
     double *out_Dpdc, double *out_tau2H)
 {
+    double Dg = global_pdc_surprisal(Y0, n0, Yh, nh);
     for (int i = 0; i < n; ++i) {
         double Rn, W, D, t2;
         radish_single_eval(X0, Y0, n0, Xh, Yh, nh, p, h,
-                           X + (size_t)i * p, nc_floor,
+                           X + (size_t)i * p, nc_floor, Dg,
                            &Rn, &W, &D, &t2);
         if (out_Rn)    out_Rn[i]    = Rn;
         if (out_W)     out_W[i]     = W;
@@ -502,9 +600,12 @@ EXPORT double radish_allocation_prob(
         }
     }
 
+    /* Allocation-time: use leaf-only surprisal (Dg=0).  The trial-level
+     * conflict signal needs accumulated trial data and only enters at
+     * Stage III via radish_diagnostics_batch.                           */
     double Rn, W, D, t2;
     radish_single_eval(X0, Y0, n0, Xh, Yh, nh, p, h_fit, x_new,
-                       nc_floor, &Rn, &W, &D, &t2);
+                       nc_floor, 0.0, &Rn, &W, &D, &t2);
     free(X0); free(Y0);
 
     /* Allocation: epanechnikov-weighted local arm sizes */

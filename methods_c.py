@@ -160,7 +160,13 @@ def allocation_bandwidths(p, disc_idx=(0,), cont_idx=(1,)):
 
 
 def _estimate_ate_c(Xeval, X0, Y0, X1, Y1, Xh, Yh, h, W_vec, alpha):
-    """C-backed Stage III; returns (ate, lo, hi, prob_pos)."""
+    """C-backed kernel g-formula Stage III; returns (ate, lo, hi, prob_pos).
+
+    Robins (1986) g-computation with kernel-regression plug-ins; variance is
+    the standard M-estimator sandwich for kernel projections (Härdle 1990
+    §4.2; Wand & Jones 1995 §3.4.4).  Borrowing enters via the augmented
+    control regression m̂₀(x) = (1−W) m̂₀^C(x) + W·m̂₀^H(x).
+    """
     Xeval = _arr(_as_2d(Xeval))
     X0    = _arr(_as_2d(X0));   Y0 = _arr(Y0)
     X1    = _arr(_as_2d(X1));   Y1 = _arr(Y1)
