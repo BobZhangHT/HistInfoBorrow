@@ -1,90 +1,71 @@
 # =============================================================================
-# BRAVE Simulation Study - Git Ignore Rules
+# RADISH — Git Ignore Rules
 # =============================================================================
-#
-# Excludes generated files, caches, and large reference materials from version control.
-# Only source code (.py files) and documentation are tracked.
+# Track:   source code (.py), c_src/, build_c.py, README, LICENSE, requirements
+# Ignore:  generated results, raw data, caches, editors, PDFs, build artefacts
 
-# =============================================================================
-# Python Generated Files
-# =============================================================================
-
-# Byte-compiled / optimized / DLL files
+# ── Python byte-code & caches ────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.pyo
 *.pyd
-
-# C extensions
 *.so
+*.nbi
+*.nbc
 
-# Distribution / packaging
-.Python
+# ── Build / packaging ────────────────────────────────────────────────────────
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
-MANIFEST
-
-# PyInstaller
+.eggs/
 *.manifest
 *.spec
 
-# =============================================================================
-# Simulation Artifacts (DO NOT COMMIT)
-# =============================================================================
-
-# Generated results (tables, plots, raw data)
+# ── Generated outputs & caches ───────────────────────────────────────────────
 results/
 output/
-*.csv
-*.tex
-*.pdf
-
-# Simulation cache (for checkpointing)
-.simulation_cache/
+tune_results/
 cache/
+.simulation_cache/
+simulation_cache/
 *.joblib
-
-# Temporary data files
 *.npy
 *.npz
 *.pkl
 *.pickle
-
-# =============================================================================
-# Reference Papers and Large Files (DO NOT COMMIT)
-# =============================================================================
-
-# Reference PDFs should not be in version control (copyright)
-references/
-papers/
-R Codes/
-simulation_cache/
-real_data/
-*.pdf
-
-# Large data files
 *.h5
 *.hdf5
 *.mat
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
 
-# =============================================================================
-# Virtual Environments
-# =============================================================================
+# ── Reference material / data (DO NOT COMMIT) ────────────────────────────────
+references/
+papers/
+R Codes/
+docs/
+scripts/
+*.pdf
+*.csv
+*.tex
+*.Rdata
+*.rda
+*.rds
+*.rtf
 
+# `real_data/` holds non-redistributable HORIZON/FIT data + outputs.
+# Track only the Python reproduction scripts (data must be obtained
+# independently — see README §"Real-data application").
+real_data/*
+!real_data/*.py
+
+# ── Virtual environments ─────────────────────────────────────────────────────
 .env/
 .venv/
 env/
@@ -92,48 +73,25 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
-# Conda environments
-conda-env/
 .conda/
+conda-env/
 
-# =============================================================================
-# IDE and Editor Files
-# =============================================================================
-
-# VS Code
+# ── Editors / IDEs ───────────────────────────────────────────────────────────
 .vscode/
 *.code-workspace
-
-# PyCharm
 .idea/
 *.iml
-
-# Jupyter Notebook
 .ipynb_checkpoints/
 *.ipynb
-
-# Spyder
 .spyderproject
 .spyproject
-
-# cursor
 .cursor/
-
-# claude
 .claude/
 
-
-# =============================================================================
-# Operating System Files
-# =============================================================================
-
-# macOS
+# ── OS junk ──────────────────────────────────────────────────────────────────
 .DS_Store
 .AppleDouble
 .LSOverride
-
-# Windows
 Thumbs.db
 Thumbs.db:encryptable
 ehthumbs.db
@@ -141,69 +99,19 @@ ehthumbs_vista.db
 *.stackdump
 [Dd]esktop.ini
 $RECYCLE.BIN/
-
-# Linux
 *~
 .nfs*
 
-# =============================================================================
-# Logs and Temporary Files
-# =============================================================================
-
-*.log
-*.tmp
-*.temp
-*.bak
-*.swp
-*.swo
-*~
-
-# =============================================================================
-# Documentation Build Files
-# =============================================================================
-
-docs/_build/
-docs/_static/
-docs/_templates/
-docs/
-
-# =============================================================================
-# Testing and Coverage
-# =============================================================================
-
+# ── Testing ──────────────────────────────────────────────────────────────────
 .pytest_cache/
 .coverage
 htmlcov/
 .tox/
 .hypothesis/
-scripts/
-tune_results/
 
-# =============================================================================
-# Keep These Files (Negative Patterns)
-# =============================================================================
-
-# Keep README and requirements
+# ── Allowlist (top-level repo essentials) ────────────────────────────────────
 !README.md
+!LICENSE
 !requirements.txt
-
-# Keep all Python source files
-!*.py
-
-# Keep configuration files
 !.gitignore
 !.gitattributes
-
-# =============================================================================
-# Additional Notes
-# =============================================================================
-#
-# To clean up ignored files locally:
-#   git clean -fdX
-#
-# To see what would be removed:
-#   git clean -fdXn
-#
-# To force-add an ignored file (if really needed):
-#   git add -f filename
-#
