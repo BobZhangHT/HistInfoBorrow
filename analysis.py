@@ -342,11 +342,6 @@ def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
                  err_metric="Mean_W_se",
                  ylim=(0, max(0.28, sub.Mean_W.max()*1.20)))
     ax.set_title(r"Borrowing Intensity")
-    # add annotation
-    ax.text(0.02, 0.97,
-            "RADISH down-weights\nlow-precision history\n(B2, B4, B6)",
-            transform=ax.transAxes, fontsize=8.5, va="top",
-            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.6", lw=0.6))
 
     ax = axes[1]
     _grouped_bar(ax, sub, scen, "Mean_Rn", r"Mean information ratio $\overline{R_n(x)}$",
