@@ -10,9 +10,14 @@ RADISH is a covariate-adaptive randomisation design that borrows from
 external historical controls through a local prior-data-conflict (PDC)
 discount. Borrowing is information-ratio driven and degrades gracefully
 to a non-borrowing baseline when the historical and concurrent cohorts
-disagree. The repository reproduces every figure and table in the paper:
-the 3×2 bias-by-precision Monte Carlo factorial (§4) and the
-HORIZON–FIT real-data application (§5).
+disagree. All local quantities (the historical prior, the concurrent
+control summaries, the allocation counts, and the final estimator) are
+computed with a **single Gaussian product kernel** whose per-dimension
+bandwidth follows **Scott's rule of thumb**; there is no separate
+fitting/allocation kernel and no hand-tuned bandwidth. The repository
+reproduces every figure and table in the paper: the 3×2
+bias-by-precision simulation study (§3) and the HORIZON–FIT real-data
+application (§4).
 
 ---
 
@@ -38,9 +43,9 @@ falls back to the pure-Python implementation if it is absent. Set
 
 ---
 
-## 2. Reproducing the simulation study (§4)
+## 2. Reproducing the simulation study (§3)
 
-The simulation uses a 3 (bias) × 2 (precision) factorial in
+The simulation uses a 3 (bias) × 2 (precision) design in
 `config.py::SCENARIOS`:
 
 |              | High precision (σ_H = 0.5) | Low precision (σ_H = 3.0) |
@@ -67,18 +72,23 @@ Outputs land under `results/<mode>/`:
 
 ```
 results/<mode>/
-├── raw_results.csv      # per-trial draw, with allocation + diagnostics
-├── metrics.csv          # bias / RMSE / coverage / power, per cell
-├── tables/              # publication LaTeX + CSV
-└── plots/               # six paper figures (vector PDF)
+├── raw_results.csv      # per-trial draws (allocation + borrowing diagnostics)
+├── metrics.csv          # summary metrics per cell
+├── tables/              # metrics_full.{csv,tex}, metrics_summary.csv
+└── plots/               # six paper figures, fig1–fig6 (vector PDF)
 ```
+
+The paper's Tables 1–3 are built from `tables/metrics_full.csv`; the
+four main-text figures are `plots/fig1_allocation_ratio.pdf`,
+`fig2_bias_rmse.pdf`, `fig4_typeI_power.pdf`, and
+`fig5_borrowing_diagnostics.pdf`.
 
 Reproducing the paper's wall-clock numbers requires `--mode full
 --jobs N`; running times scale roughly linearly in `--jobs`.
 
 ---
 
-## 3. Reproducing the real-data application (§5)
+## 3. Reproducing the real-data application (§4)
 
 The real-data application is anchored to two non-redistributable
 trials:
@@ -102,7 +112,7 @@ python real_data/real_run.py            # (ξ × η × method × effect × rep) 
 python real_data/real_figures.py        # F1–F3 + Table 1
 ```
 
-The ξ (bias) × η (precision/sample-size) factorial mirrors the
+The ξ (bias) × η (precision/sample-size) grid mirrors the
 synthetic design but with HORIZON-fitted subgroup coefficients and
 FIT-KDE covariate distributions; see `real_data/real_scenarios.py`.
 
@@ -112,13 +122,14 @@ FIT-KDE covariate distributions; see `real_data/real_scenarios.py`.
 
 | Method        | File / class                | Borrowing rule                     |
 |---------------|-----------------------------|------------------------------------|
-| **RADISH**    | `methods.py::RADISH`        | PDC-adaptive: `R_n = 1 + Nh/(τ_H² · Nc · exp(D_PDC))` |
+| **RADISH**    | `methods.py::RADISH`        | PDC discount `M = exp(-D_PDC)`; `R_n = 1 + σ²₀c /(Ñc·SE²·exp(D_PDC))`, `SE² = τ_H² + σ²₀c/Nc` |
 | CAHB          | `methods.py::CAHB`          | Variance-ratio with τ(x) coordinate ascent |
 | KBCD          | `methods.py::KBCD`          | No borrowing (`R_n ≡ 1`) — baseline |
 
-All three share the linearised ATE estimator with a sandwich variance
-defined in §3 of the paper. C-backed counterparts live in
-`methods_c.py` and load `radish_core.{dll,so}` via `ctypes`.
+All three share the single Gaussian/Scott kernel
+(`methods.py::kernel_bandwidths`) and the linearised ATE estimator with
+a sandwich variance defined in §2 of the paper. C-backed counterparts
+live in `methods_c.py` and load `radish_core.{dll,so}` via `ctypes`.
 
 ---
 
@@ -131,11 +142,11 @@ defined in §3 of the paper. C-backed counterparts live in
 ├── methods_c.py          # ctypes bindings to radish_core
 ├── c_src/radish_core.c   # C kernel (Stage I / II hot loops)
 ├── build_c.py            # Compiler-agnostic shared-library build
-├── main.py               # Monte Carlo simulation runner
+├── main.py               # Simulation runner
 ├── analysis.py           # Publication figures + LaTeX tables
-├── real_data/            # Real-data application code (§5)
+├── real_data/            # Real-data application code (§4)
 │   ├── real_setup.py     #   fit working model on HORIZON / FIT
-│   ├── real_scenarios.py #   ξ × η factorial definition
+│   ├── real_scenarios.py #   ξ × η grid definition
 │   ├── real_run.py       #   simulation sweep on real-anchored DGP
 │   └── real_figures.py   #   F1–F3 + Table 1
 ├── requirements.txt

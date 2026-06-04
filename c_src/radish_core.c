@@ -608,9 +608,10 @@ EXPORT double radish_allocation_prob(
                        nc_floor, 0.0, &Rn, &W, &D, &t2);
     free(X0); free(Y0);
 
-    /* Allocation: epanechnikov-weighted local arm sizes */
+    /* Allocation: Gaussian-weighted local arm sizes (single kernel; the
+     * bandwidth h_alloc passed in equals the shared Scott-ROT bandwidth). */
     double *wa = (double *)malloc(sizeof(double)*(size_t)n_curr);
-    kernel_epan_vec(X_curr, n_curr, p, x_new, h_alloc, wa);
+    kernel_gauss_vec(X_curr, n_curr, p, x_new, h_alloc, wa);
     double N0 = 0.0, N1 = 0.0;
     for (int i = 0; i < n_curr; ++i) {
         if (Z_curr[i] == 0) N0 += wa[i];
@@ -629,7 +630,8 @@ EXPORT double radish_allocation_prob(
 
 /* =================================================================
  * KBCD allocation probability
- *   No borrowing; just balances local arm sizes using Epanechnikov.
+ *   No borrowing; just balances local arm sizes using the single
+ *   Gaussian kernel.
  * ================================================================= */
 EXPORT double kbcd_allocation_prob(
     const double *X_curr, const int *Z_curr, int n_curr, int p,
@@ -637,7 +639,7 @@ EXPORT double kbcd_allocation_prob(
 {
     if (n_curr < 2) return 0.5;
     double *wa = (double *)malloc(sizeof(double)*(size_t)n_curr);
-    kernel_epan_vec(X_curr, n_curr, p, x_new, h_alloc, wa);
+    kernel_gauss_vec(X_curr, n_curr, p, x_new, h_alloc, wa);
     double N0 = 0.0, N1 = 0.0;
     for (int i = 0; i < n_curr; ++i) {
         if (Z_curr[i] == 0) N0 += wa[i];
@@ -1020,9 +1022,9 @@ EXPORT double cahb_allocation_prob(
                       mu0, tau, &phi, theta0);
     if (rc != 0) { free(mu0); free(tau); free(theta0); return 0.5; }
 
-    /* allocation kernel weights */
+    /* allocation kernel weights (single Gaussian kernel) */
     double *wa = (double *)malloc(sizeof(double)*(size_t)n_curr);
-    kernel_epan_vec(X_curr, n_curr, p, x_new, h_alloc, wa);
+    kernel_gauss_vec(X_curr, n_curr, p, x_new, h_alloc, wa);
     double N0 = 0.0, N1 = 0.0;
     for (int i = 0; i < n_curr; ++i) {
         if (Z_curr[i] == 0.0) N0 += wa[i];

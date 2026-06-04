@@ -315,28 +315,33 @@ def make_F1(params):
     for j in range(nx):
         ax.plot([j] * ny, range(ny), ":", color="#4a7ab2",
                 lw=0.5, alpha=0.35, zorder=2)
-    # Empirical real-subgroup anchors — map empirical |bias|/σ_C onto
-    # the normalised dial ξ_dial = (|bias|/σ_C) / XI_RAW_MAX.  Real
-    # subgroups sg1 and sg2 share an identical bias level (1.30·σ_C);
-    # we y-jitter the two so both are individually visible.
-    sigma_curr = params["sigma_curr"]
-    bias_emp = np.abs(params["bias_per_sg"])      # (4,)
+    # Empirical real-subgroup markers.
+    #   x : empirical bias mapped onto the ξ dial, ξ_dial = (|bias|/σ_C)/XI_RAW_MAX.
+    #   y : the COHORT-EQUIVALENT historical size n_H_eq = n_h_per_sg / sg_dist_hist,
+    #       i.e. the total external cohort whose LOCAL historical density at that
+    #       subgroup matches the real FIT subgroup, mapped onto the n_H axis.
+    # This places each subgroup at the precision it actually contributes to local
+    # borrowing (n_H_eq ≈ 194–243 here), rather than pinning all four to the
+    # full-cohort top row.
+    sigma_curr   = params["sigma_curr"]
+    bias_emp     = np.abs(params["bias_per_sg"])                  # (4,)
+    n_h_per_sg   = np.asarray(params["n_h_per_sg"], float)        # (4,)
+    sg_dist_hist = np.asarray(params["sg_dist_hist"], float)      # (4,)
+    nH_eq        = n_h_per_sg / np.maximum(sg_dist_hist, 1e-12)   # cohort-equiv n_H
+    nH_vals      = np.array([n_H_of_eta(e) for e in ETA_GRID], float)
     xi_axis_vals = np.array(XI_GRID, float)
-    SG_OFFSETS = [0.0, 0.18, 0.0, 0.0]            # nudge sg2 up by 0.18
     for k in range(4):
         xi_dial_anchor = (bias_emp[k] / sigma_curr) / XI_RAW_MAX
         x_grid = float(np.interp(np.clip(xi_dial_anchor, XI_GRID[0], XI_GRID[-1]),
                                  xi_axis_vals, np.arange(nx)))
-        # Real anchors all sit on η=1 row (FIT historical with full N_H,
-        # which is the highest-precision row in the grid); place them at
-        # the η=1 cell with the small jitter so sg1 and sg2 don't collide.
-        y_grid = (ny - 1) + SG_OFFSETS[k]
+        y_grid = float(np.interp(np.clip(nH_eq[k], nH_vals[0], nH_vals[-1]),
+                                 nH_vals, np.arange(ny)))
         ax.scatter(x_grid, y_grid, s=200, marker="*",
                    facecolor=SUBGROUP_COLORS[k], edgecolor="black",
                    lw=1.4, zorder=5)
-        # Bend annotation offset so sg2 (jittered up) reads above and
-        # sg1 reads below to keep colours and labels disjoint.
-        annot_dy = 16 if SG_OFFSETS[k] > 0 else -16
+        # Alternate label above/below so subgroups that share an x (sg1, sg2)
+        # keep their colours and labels disjoint.
+        annot_dy = 12 if (k % 2 == 1) else -14
         ax.annotate(f"real-sg{k+1}", (x_grid, y_grid),
                     xytext=(8, annot_dy), textcoords="offset points",
                     fontsize=8.5, fontweight="bold",
@@ -353,8 +358,8 @@ def make_F1(params):
                   r"  ($b_{\theta} = \xi \cdot 2\sigma_C$, additive shift)")
     ax.set_ylabel(r"Precision level  $\eta \in [0, 1]$"
                   r"  ($n_H$: 30 → 350)")
-    ax.set_title(rf"Bias × Precision factorial: {nx}×{ny} cells (blue), "
-                 r"real-data subgroup anchors (★)",
+    ax.set_title(rf"Bias × precision grid: {nx}×{ny} cells (blue), "
+                 r"real-data subgroup positions (★)",
                  fontsize=10.5)
     ax.spines[["top", "right"]].set_visible(False)
     ax.grid(True, axis="both", alpha=0.15, lw=0.4)
@@ -373,8 +378,8 @@ def make_F1(params):
               loc="upper center", bbox_to_anchor=(0.5, -0.22),
               ncol=2, frameon=True, framealpha=0.93)
 
-    fig.suptitle("Real-data-anchored simulation scenarios — "
-                 "ξ (bias) × η (precision) factorial",
+    fig.suptitle("Real-data-calibrated simulation scenarios: "
+                 "ξ (bias) × η (precision) grid",
                  fontsize=12, y=0.995)
     out = FIG_DIR / "F1_scenario_exploratory.pdf"
     fig.savefig(out, bbox_inches="tight")

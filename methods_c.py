@@ -131,32 +131,13 @@ def _as_2d(a):
     return a.reshape(1, -1) if a.ndim == 1 else a
 
 
-def fitting_bandwidths(X_pool, disc_idx=(0,), cont_idx=(1,)):
-    """Identical to methods.fitting_bandwidths."""
+def kernel_bandwidths(X_pool):
+    """Identical to methods.kernel_bandwidths (single Gaussian kernel,
+    Scott's rule of thumb h_j = n^{-1/(p+4)} * sigma_j on every dimension)."""
     X = _as_2d(X_pool); n, p = X.shape
-    h = np.ones(p)
-    for k in disc_idx:
-        h[k] = 0.1
-    if cont_idx:
-        Xc = X[:, list(cont_idx)]
-        sig = np.std(Xc, axis=0, ddof=1); sig[sig < 1e-12] = 1.0
-        f = n ** (-1.0 / (Xc.shape[1] + 4.0))
-        for j, k in enumerate(cont_idx):
-            h[k] = max(f * sig[j], 1e-12)
-    return np.maximum(h, 1e-12)
-
-
-def allocation_bandwidths(p, disc_idx=(0,), cont_idx=(1,)):
-    try:
-        import config as _c
-        hb = float(getattr(_c, "KERNEL_BANDWIDTH_BINARY", 1.1))
-        hc = float(getattr(_c, "KERNEL_BANDWIDTH_CONTINUOUS", 1.3))
-    except ImportError:
-        hb, hc = 1.1, 1.3
-    h = np.full(p, hc)
-    for k in disc_idx:
-        h[k] = hb
-    return h
+    sig = np.std(X, axis=0, ddof=1); sig[sig < 1e-12] = 1.0
+    f = n ** (-1.0 / (p + 4.0))
+    return np.maximum(f * sig, 1e-12)
 
 
 def _estimate_ate_c(Xeval, X0, Y0, X1, Y1, Xh, Yh, h, W_vec, alpha):
@@ -201,10 +182,7 @@ class KBCD:
     def __init__(self, historical_data, scenario_params, priors):
         self.X_h = _arr(_as_2d(historical_data["X_h"]))
         self.Y_h = _arr(historical_data["Y_h"])
-        d = scenario_params.get("disc_idx", [0])
-        c = scenario_params.get("cont_idx", [1])
-        self.h_fit   = _arr(fitting_bandwidths(self.X_h, d, c))
-        self.h_alloc = _arr(allocation_bandwidths(self.X_h.shape[1], d, c))
+        self.h = _arr(kernel_bandwidths(self.X_h))
         try:
             import config; self.alpha = config.ALPHA
         except ImportError:
@@ -217,7 +195,7 @@ class KBCD:
         Z  = _arr(np.asarray(Z_curr).ravel(), dtype=np.int32)
         x  = _arr(np.asarray(X_new, float).ravel())
         pi = _lib.kbcd_allocation_prob(Xc, Z, Xc.shape[0], Xc.shape[1],
-                                       self.h_alloc, x)
+                                       self.h, x)
         return AllocationResult(float(pi), {"R_n": 1.0, "method": "KBCD"})
 
     def estimate_treatment_effect(self, X, Y, Z):
@@ -225,7 +203,7 @@ class KBCD:
         i0, i1 = np.where(Z == 0)[0], np.where(Z == 1)[0]
         W = np.zeros(X.shape[0])
         return _estimate_ate_c(X, X[i0], Y[i0], X[i1], Y[i1],
-                               self.X_h, self.Y_h, self.h_fit, W, self.alpha)
+                               self.X_h, self.Y_h, self.h, W, self.alpha)
 
     def compute_diagnostics(self, X, Y, Z):
         return {"mean_W": 0.0, "mean_Rn": 1.0,
@@ -243,17 +221,9 @@ class CAHB:
     def __init__(self, historical_data, scenario_params, priors):
         self.X_h = _arr(_as_2d(historical_data["X_h"]))
         self.Y_h = _arr(historical_data["Y_h"])
-        d = scenario_params.get("disc_idx", [0])
-        c = scenario_params.get("cont_idx", [1])
-        self.h_fit   = _arr(fitting_bandwidths(self.X_h, d, c))
-        self.h_alloc = _arr(allocation_bandwidths(self.X_h.shape[1], d, c))
+        self.h = _arr(kernel_bandwidths(self.X_h))
         self.gamma   = float(priors.get("cahb_gamma", np.sqrt(3.0)))
         self.lam     = float(priors.get("cahb_lambda", 300.0))
-        # Silverman bandwidth for hist mean
-        n, p = self.X_h.shape
-        s = np.std(self.X_h, axis=0, ddof=1); s[s < 1e-12] = 1.0
-        f = (4.0/(p+2.0))**(1.0/(p+4.0)) * n**(-1.0/(p+4.0))
-        self.h_hist = _arr(np.maximum(f * s, 1e-12))
         try:
             import config; self.alpha = config.ALPHA
         except ImportError:
@@ -270,7 +240,7 @@ class CAHB:
         x  = _arr(np.asarray(X_new, float).ravel())
         pi = _lib.cahb_allocation_prob(
             Xc, Y, Z, n, self.X_h, self.Y_h, self.X_h.shape[0], p,
-            self.h_fit, self.h_hist, self.h_alloc,
+            self.h, self.h, self.h,
             self.gamma, self.lam, self.max_iter, x,
         )
         return AllocationResult(float(pi), {"R_n": np.nan, "method": "CAHB"})
@@ -284,7 +254,7 @@ class CAHB:
         theta0 = np.zeros(n); phi = np.zeros(1)
         rc = _lib.cahb_fit(
             Xc, Y, Z, n, p, self.X_h, self.Y_h, self.X_h.shape[0],
-            self.h_fit, self.h_hist, self.gamma, self.lam, self.max_iter,
+            self.h, self.h, self.gamma, self.lam, self.max_iter,
             mu0, tau, phi, theta0,
         )
         if rc != 0: return None
@@ -302,10 +272,10 @@ class CAHB:
         # R_n at every patient → W
         Rn = np.zeros(m["n"])
         _lib.cahb_Rn_batch(Xc, m["n"], Xc, m["Z"], m["n"], m["p"],
-                           m["tau"], m["phi"], self.h_fit, Rn)
+                           m["tau"], m["phi"], self.h, Rn)
         W = (Rn - 1.0) / np.maximum(Rn, 1e-12)
         return _estimate_ate_c(Xc, Xc[i0], Y[i0], Xc[i1], Y[i1],
-                               self.X_h, self.Y_h, self.h_fit, W, self.alpha)
+                               self.X_h, self.Y_h, self.h, W, self.alpha)
 
     def compute_diagnostics(self, X, Y, Z):
         Xc = _arr(_as_2d(X)); Y = _arr(Y); Z = np.asarray(Z, int)
@@ -318,7 +288,7 @@ class CAHB:
                     "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
         Rn = np.zeros(m["n"])
         _lib.cahb_Rn_batch(Xc, m["n"], Xc, m["Z"], m["n"], m["p"],
-                           m["tau"], m["phi"], self.h_fit, Rn)
+                           m["tau"], m["phi"], self.h, Rn)
         W = (Rn - 1.0) / np.maximum(Rn, 1e-12)
         return {"mean_W": float(W.mean()), "mean_Rn": float(Rn.mean()),
                 "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
@@ -335,10 +305,7 @@ class RADISH:
     def __init__(self, historical_data, scenario_params, priors):
         self.X_h = _arr(_as_2d(historical_data["X_h"]))
         self.Y_h = _arr(historical_data["Y_h"])
-        d = scenario_params.get("disc_idx", [0])
-        c = scenario_params.get("cont_idx", [1])
-        self.h_fit   = _arr(fitting_bandwidths(self.X_h, d, c))
-        self.h_alloc = _arr(allocation_bandwidths(self.X_h.shape[1], d, c))
+        self.h = _arr(kernel_bandwidths(self.X_h))
         self.nc_stab = float(priors.get("radish_nc_stabilizer", 5.0))
         self.n0_fin  = float(priors.get("radish_n0_final", 5.0))
         try:
@@ -356,7 +323,7 @@ class RADISH:
         pi = _lib.radish_allocation_prob(
             Xc, Y, Z, Xc.shape[0],
             self.X_h, self.Y_h, self.X_h.shape[0],
-            Xc.shape[1], self.h_fit, self.h_alloc, x, self.nc_stab,
+            Xc.shape[1], self.h, self.h, x, self.nc_stab,
         )
         return AllocationResult(float(pi),
                                 {"R_n": np.nan, "method": "RADISH"})
@@ -372,11 +339,11 @@ class RADISH:
             Xc, n,
             _arr(Xc[i0]), _arr(Y[i0]), len(i0),
             self.X_h, self.Y_h, self.X_h.shape[0],
-            Xc.shape[1], self.h_fit, self.n0_fin,
+            Xc.shape[1], self.h, self.n0_fin,
             Rn, W, D, T2,
         )
         return _estimate_ate_c(Xc, Xc[i0], Y[i0], Xc[i1], Y[i1],
-                               self.X_h, self.Y_h, self.h_fit, W, self.alpha)
+                               self.X_h, self.Y_h, self.h, W, self.alpha)
 
     def compute_diagnostics(self, X, Y, Z):
         Xc = _arr(_as_2d(X)); Y = _arr(Y); Z = np.asarray(Z, int)
@@ -390,7 +357,7 @@ class RADISH:
             Xc, n,
             _arr(Xc[i0]), _arr(Y[i0]), len(i0),
             self.X_h, self.Y_h, self.X_h.shape[0],
-            Xc.shape[1], self.h_fit, self.n0_fin,
+            Xc.shape[1], self.h, self.n0_fin,
             Rn, W, D, T2,
         )
         return {"mean_W": float(W.mean()), "mean_Rn": float(Rn.mean()),

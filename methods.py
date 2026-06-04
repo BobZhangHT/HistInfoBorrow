@@ -53,40 +53,18 @@ def gaussian_weight_matrix(X_ref, X_eval, h):
 def normalise_rows(W):
     return W / np.maximum(W.sum(axis=1, keepdims=True), _EPS)
 
-def epanechnikov_weights(X_ref, x_star, h):
-    """Product Epanechnikov kernel (used for allocation)."""
-    X_ref = _as_2d(X_ref)
-    x = np.asarray(x_star, float).ravel()
-    u = (X_ref - x) / np.maximum(np.asarray(h, float), _EPS)
-    k = np.maximum(0.0, 1.0 - u**2) * 0.75
-    return np.prod(k, axis=1)
+def kernel_bandwidths(X_pool):
+    """Single Gaussian product-kernel bandwidth by Scott's rule of thumb.
 
-def fitting_bandwidths(X_pool, disc_idx=(0,), cont_idx=(1,)):
-    """Stage I/III fitting: binary h=0.1, continuous via Scott's ROT."""
+    Scott (1992): h_j = n^{-1/(p+4)} * sigma_j, applied to every covariate
+    dimension (binary and continuous alike). This is the one and only
+    kernel bandwidth used across Stage I/II/III and the allocation rule;
+    there is no separate fitting vs. allocation kernel.
+    """
     X = _as_2d(X_pool); n, p = X.shape
-    h = np.ones(p)
-    for k in disc_idx:
-        h[k] = 0.1
-    if cont_idx:
-        Xc = X[:, list(cont_idx)]
-        sig = np.std(Xc, axis=0, ddof=1); sig[sig < _EPS] = 1.0
-        f = n ** (-1.0 / (Xc.shape[1] + 4.0))
-        for j, k in enumerate(cont_idx):
-            h[k] = max(f * sig[j], _EPS)
-    return np.maximum(h, _EPS)
-
-def allocation_bandwidths(p, disc_idx=(0,), cont_idx=(1,)):
-    """Broad allocation kernel: binary 1.1, continuous 1.3."""
-    try:
-        import config as _c
-        hb = float(getattr(_c, "KERNEL_BANDWIDTH_BINARY", 1.1))
-        hc = float(getattr(_c, "KERNEL_BANDWIDTH_CONTINUOUS", 1.3))
-    except ImportError:
-        hb, hc = 1.1, 1.3
-    h = np.full(p, hc)
-    for k in disc_idx:
-        h[k] = hb
-    return h
+    sig = np.std(X, axis=0, ddof=1); sig[sig < _EPS] = 1.0
+    f = n ** (-1.0 / (p + 4.0))
+    return np.maximum(f * sig, _EPS)
 
 # =====================================================================
 # Unified linearized ATE (Stage III for ALL methods)
@@ -291,10 +269,7 @@ class KBCD:
         self.X_h = _as_2d(historical_data["X_h"])
         self.Y_h = np.asarray(historical_data["Y_h"], float)
         self.name = "KBCD"
-        d = scenario_params.get("disc_idx", [0])
-        c = scenario_params.get("cont_idx", [1])
-        self.h_fit = fitting_bandwidths(self.X_h, d, c)
-        self.h_alloc = allocation_bandwidths(self.X_h.shape[1], d, c)
+        self.h = kernel_bandwidths(self.X_h)
         try:
             import config; self.alpha = config.ALPHA
         except ImportError:
@@ -304,7 +279,7 @@ class KBCD:
         if len(X_curr) < 2:
             return AllocationResult(0.5, {"R_n": 1.0, "method": "KBCD"})
         X_curr = _as_2d(X_curr); Z = np.asarray(Z_curr, float).ravel()
-        w = epanechnikov_weights(X_curr, X_new, self.h_alloc)
+        w = gaussian_weights(X_curr, X_new, self.h)
         n0 = float(w @ (1.0 - Z)); n1 = float(w @ Z)
         return AllocationResult(phi_from_counts(n0, n1),
                                 {"R_n": 1.0, "method": "KBCD"})
@@ -314,7 +289,7 @@ class KBCD:
         i0, i1 = np.where(Z == 0)[0], np.where(Z == 1)[0]
         W = np.zeros(X.shape[0])
         return estimate_ate(X, X[i0], Y[i0], X[i1], Y[i1],
-                            self.X_h, self.Y_h, self.h_fit, W, self.alpha)
+                            self.X_h, self.Y_h, self.h, W, self.alpha)
 
     def compute_diagnostics(self, X, Y, Z):
         """Borrowing diagnostics: KBCD never borrows."""
@@ -338,18 +313,10 @@ class CAHB:
         self.X_h = _as_2d(historical_data["X_h"])
         self.Y_h = np.asarray(historical_data["Y_h"], float)
         self.name = "CAHB"
-        d = scenario_params.get("disc_idx", [0])
-        c = scenario_params.get("cont_idx", [1])
-        self.h_fit = fitting_bandwidths(self.X_h, d, c)
-        self.h_alloc = allocation_bandwidths(self.X_h.shape[1], d, c)
+        self.h = kernel_bandwidths(self.X_h)
         self.gamma = float(priors.get("cahb_gamma", np.sqrt(3.0)))
         self.lam   = float(priors.get("cahb_lambda", 300.0))
         self.invg2 = 1.0 / max(self.gamma**2, _EPS)
-        # Silverman bandwidth for historical kernel mean
-        n, p = self.X_h.shape
-        s = np.std(self.X_h, axis=0, ddof=1); s[s < _EPS] = 1.0
-        f = (4/(p+2))**(1/(p+4)) * n**(-1/(p+4))
-        self.h_hist = np.maximum(f * s, _EPS)
         try:
             import config; self.alpha = config.ALPHA
         except ImportError:
@@ -357,7 +324,7 @@ class CAHB:
 
     # ── Gaussian kernel matrix (fitting bandwidth) ──
     def _km(self, Xa, Xb):
-        h = self.h_fit
+        h = self.h
         ci = np.diag(1.0 / np.maximum(h, 1e-3)**2)
         ld = np.sum(np.log(np.maximum(h, 1e-3)**2))
         p = Xa.shape[1]
@@ -368,7 +335,7 @@ class CAHB:
     def _hist_mean(self, Xe):
         Xe = _as_2d(Xe); out = np.zeros(Xe.shape[0])
         for i in range(Xe.shape[0]):
-            w = gaussian_weights(self.X_h, Xe[i], self.h_hist)
+            w = gaussian_weights(self.X_h, Xe[i], self.h)
             s = w.sum()
             out[i] = float(w @ self.Y_h / s) if s > _EPS else 0.0
         return out
@@ -468,7 +435,7 @@ class CAHB:
         m = self._fit(X_curr, Y_curr, np.asarray(Z_curr, float))
         if m is None:
             return AllocationResult(0.5, {"R_n": 1.0, "method": "CAHB"})
-        w = epanechnikov_weights(m.X, X_new, self.h_alloc)
+        w = gaussian_weights(m.X, X_new, self.h)
         n0 = float(m.sZ @ w); n1 = float(m.Z @ w)
         Rn = self._Rn(m, X_new)
         return AllocationResult(phi_from_counts(Rn * n0, n1),
@@ -488,7 +455,7 @@ class CAHB:
             W[i] = (Rn - 1.0) / max(Rn, 1.0)
         i0, i1 = np.where(Z == 0)[0], np.where(Z == 1)[0]
         return estimate_ate(X, X[i0], Y[i0], X[i1], Y[i1],
-                            self.X_h, self.Y_h, self.h_fit, W, self.alpha)
+                            self.X_h, self.Y_h, self.h, W, self.alpha)
 
     def compute_diagnostics(self, X, Y, Z):
         """Mean borrowing weight & R_n averaged over enrolled subjects."""
@@ -523,10 +490,7 @@ class RADISH:
         self.X_h = _as_2d(historical_data["X_h"])
         self.Y_h = np.asarray(historical_data["Y_h"], float)
         self.name = "RADISH"
-        d = scenario_params.get("disc_idx", [0])
-        c = scenario_params.get("cont_idx", [1])
-        self.h_fit = fitting_bandwidths(self.X_h, d, c)
-        self.h_alloc = allocation_bandwidths(self.X_h.shape[1], d, c)
+        self.h = kernel_bandwidths(self.X_h)
         self.nc_stab = float(priors.get("radish_nc_stabilizer", 5.0))
         self.n0_fin  = float(priors.get("radish_n0_final", 5.0))
         try:
@@ -544,10 +508,10 @@ class RADISH:
         X0 = X_curr[i0] if i0.size else np.zeros((0, X_curr.shape[1]))
         Y0 = Y[i0] if i0.size else np.zeros(0)
         # Stage I
-        th, t2 = radish_stage1(X_new, self.X_h, self.Y_h, self.h_fit)
+        th, t2 = radish_stage1(X_new, self.X_h, self.Y_h, self.h)
         # Stage II control summary
         w0 = gaussian_weights(_as_2d(X0), np.asarray(X_new, float).ravel(),
-                              self.h_fit) if X0.shape[0] > 0 else np.zeros(0)
+                              self.h) if X0.shape[0] > 0 else np.zeros(0)
         Nc = float(w0.sum())
         if Nc > _EPS:
             yb = float(w0 @ Y0 / Nc)
@@ -556,7 +520,7 @@ class RADISH:
             yb, s2c = 0.0, 1.0
         Rn, W = _compute_borrowing_weight(th, t2, yb, s2c, Nc, self.nc_stab)
         # Allocation
-        wa = epanechnikov_weights(X_curr, X_new, self.h_alloc)
+        wa = gaussian_weights(X_curr, X_new, self.h)
         N0 = float(wa @ (1.0 - Z.astype(float)))
         N1 = float(wa @ Z.astype(float))
         pi = phi_from_counts(Rn * N0, N1)
@@ -569,7 +533,7 @@ class RADISH:
         i0, i1 = np.where(Z == 0)[0], np.where(Z == 1)[0]
         if len(i0) < 2 or len(i1) < 2:
             return float(np.nanmean(Y[i1]) - np.nanmean(Y[i0])), np.nan, np.nan, 0.5
-        X0, Y0 = X[i0], Y[i0]; h = self.h_fit; n = X.shape[0]
+        X0, Y0 = X[i0], Y[i0]; h = self.h; n = X.shape[0]
         # Trial-level (root-node) PDC surprisal, computed once and folded
         # uniformly into every local D_PDC via Fisher-style addition.
         Dg = _global_pdc_surprisal(Y0, self.Y_h)
@@ -603,7 +567,7 @@ class RADISH:
         if len(i0) < 2:
             return {"mean_W": np.nan, "mean_Rn": np.nan,
                     "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
-        X0, Y0 = X[i0], Y[i0]; h = self.h_fit; n = X.shape[0]
+        X0, Y0 = X[i0], Y[i0]; h = self.h; n = X.shape[0]
         Dg = _global_pdc_surprisal(Y0, self.Y_h)
         KH = gaussian_weight_matrix(self.X_h, X, h)
         Rns = np.zeros(n); Ws = np.zeros(n); Ds = np.zeros(n); T2 = np.zeros(n)

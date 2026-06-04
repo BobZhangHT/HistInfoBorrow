@@ -11,8 +11,9 @@ Configured to match CAHB §5.2.1 (Fig 2) paper text:
                     (X3 standardised menyrs, X4 standardised Y0).
   • CAHB algorithm hyperparams (paper §4 defaults):
                     γ = √3, λ_2 = 300·log(N), λ_1 from Algorithm 2,
-                    H_fit = diag(0.1, 0.1, w1, w2) Scott rule,
-                    h_alloc = (1.1, 1.1, 1.3, 1.3) Epanechnikov.
+                    single Gaussian kernel with Scott ROT
+                    h_j = n^{-1/(p+4)}·σ_j across all 4 covariates
+                    (no separate fitting/allocation kernel).
   • θ_0:            CAHB §5.2.1 idealisation — passed as the noiseless
                     historical mean function evaluated at the sampled
                     covariates (no ε_h additive noise).

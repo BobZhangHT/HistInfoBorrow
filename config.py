@@ -53,9 +53,11 @@ SCENARIOS = {
         "description": "Large bias, noisy — all methods detect conflict"},
 }
 
-# ── Kernel bandwidths ────────────────────────────────────────────
-KERNEL_BANDWIDTH_BINARY     = 1.1    # Epanechnikov allocation kernel
-KERNEL_BANDWIDTH_CONTINUOUS = 1.3
+# ── Kernel ───────────────────────────────────────────────────────
+# A single Gaussian product kernel is used for every stage (Stage I/II/III
+# and the allocation rule).  Its per-dimension bandwidth is set by Scott's
+# rule of thumb h_j = n^{-1/(p+4)} * sigma_j (see methods.kernel_bandwidths);
+# there is no separate fitting/allocation kernel and no hand-tuned bandwidth.
 
 # ── Method hyperparameters ───────────────────────────────────────
 PRIORS = {
