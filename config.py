@@ -113,11 +113,18 @@ N_REPS_DEMO       = 10
 N_REPS_FULL       = 1000
 N_REPS_PRECISION  = 500   # 12 cells × 500 reps = 6000 trials/method
 N_REPS_BIAS       = 500   # 10 cells × 500 reps
+N_REPS_HIST_SIZE  = 1000
+
+# Historical-sample-size sensitivity analysis. The larger case doubles the
+# historical cohort while holding the concurrent trial size fixed at N=200.
+HISTORICAL_SIZE_GRID = [N_HISTORICAL, 2 * N_HISTORICAL]
+
 def get_mode_replications(mode):
     return {"demo": N_REPS_DEMO,
             "full": N_REPS_FULL,
             "precision": N_REPS_PRECISION,
-            "bias":  N_REPS_BIAS}[mode]
+            "bias":  N_REPS_BIAS,
+            "hist_size": N_REPS_HIST_SIZE}[mode]
 
 def get_mode_scenarios(mode):
     """Return the scenario dict for a given mode."""

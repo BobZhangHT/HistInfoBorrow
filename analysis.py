@@ -251,7 +251,6 @@ def plot_figure1_allocation(df, scen_order, out_dir):
         ax.set_ylim(0.42, 0.72)
     axes[0].set_ylabel("Allocation Ratio to Treatment Arm")
     _shared_method_legend(fig, y=1.06)
-    fig.suptitle("Allocation Ratio across Scenarios", y=1.13)
     plt.tight_layout()
     _save(fig, out_dir / "plots" / "fig1_allocation_ratio.pdf")
     print("  [ok] Figure 1: allocation ratio")
@@ -268,12 +267,11 @@ def plot_figure2_bias_rmse(df, scen_order, out_dir):
         _grouped_bar(ax, sub, scen, "Bias", "Estimation Bias",
                      ref_line=0, ref_label="zero bias",
                      err_metric="Bias_se")
-        ax.set_title(f"Bias — {EFFECT_DISPLAY[eff]}")
+        ax.set_title(f"Bias: {EFFECT_DISPLAY[eff]}")
         ax = axes[1, col]
         _grouped_bar(ax, sub, scen, "RMSE", "RMSE")
-        ax.set_title(f"RMSE — {EFFECT_DISPLAY[eff]}")
+        ax.set_title(f"RMSE: {EFFECT_DISPLAY[eff]}")
     _shared_method_legend(fig, y=1.02)
-    fig.suptitle("Estimation Bias and RMSE", y=1.05)
     plt.tight_layout()
     _save(fig, out_dir / "plots" / "fig2_bias_rmse.pdf")
     print("  [ok] Figure 2: bias / RMSE")
@@ -289,12 +287,12 @@ def plot_figure3_ci(df, scen_order, out_dir):
         ax = axes[0, col]
         _grouped_bar(ax, sub, scen, "Width", "CI Width",
                      err_metric="Width_se")
-        ax.set_title(f"CI Width — {EFFECT_DISPLAY[eff]}")
+        ax.set_title(f"CI Width: {EFFECT_DISPLAY[eff]}")
         ax = axes[1, col]
         _grouped_bar(ax, sub, scen, "Coverage", "Coverage Probability",
                      ref_line=0.95, ref_label="nominal 95%",
                      ylim=(0.55, 1.02))
-        ax.set_title(f"Coverage — {EFFECT_DISPLAY[eff]}")
+        ax.set_title(f"Coverage: {EFFECT_DISPLAY[eff]}")
     _shared_method_legend(fig, y=1.02)
     fig.suptitle("Confidence Interval Width and Coverage", y=1.05)
     plt.tight_layout()
@@ -321,7 +319,6 @@ def plot_figure4_testing(df, scen_order, out_dir):
                      ylim=ylim if eff == "Null" else (0, 1.05))
         ax.set_title(ttl)
     _shared_method_legend(fig, y=1.05)
-    fig.suptitle("Hypothesis Testing Performance", y=1.10)
     plt.tight_layout()
     _save(fig, out_dir / "plots" / "fig4_typeI_power.pdf")
     print("  [ok] Figure 4: type I / power")
@@ -350,7 +347,6 @@ def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
     ax.set_title(r"Effective Information Gain")
 
     _shared_method_legend(fig, y=1.05)
-    fig.suptitle("Borrowing Diagnostics by Scenario  ($\\Delta = 0.5$)", y=1.10)
     plt.tight_layout()
     _save(fig, out_dir / "plots" / "fig5_borrowing_diagnostics.pdf")
     print("  [ok] Figure 5: borrowing diagnostics")

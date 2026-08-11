@@ -27,6 +27,14 @@ Outputs: real_data/real_run_results.csv
 """
 from __future__ import annotations
 import os, sys, time, pickle
+
+# Avoid nested BLAS threads inside the process-level simulation workers.
+for _thread_var in (
+    "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ[_thread_var] = "1"
+
 from pathlib import Path
 import numpy as np
 import pandas as pd

@@ -57,12 +57,34 @@ def build_msvc(debug: bool):
     return r.returncode == 0 and OUT.exists()
 
 
+def _find_gnu_compiler():
+    """Find clang/gcc on PATH or in common Conda locations."""
+    configured = os.environ.get("CC")
+    candidates = [
+        configured,
+        shutil.which("clang"),
+        shutil.which("gcc"),
+        str(Path(sys.prefix) / "Library" / "mingw-w64" / "bin" / "gcc.exe"),
+        str(Path(sys.prefix) / "Library" / "bin" / "gcc.exe"),
+    ]
+    return next((c for c in candidates if c and Path(c).exists()), None)
+
+
 def build_unix(debug: bool):
-    cc = shutil.which("clang") or shutil.which("gcc")
-    if not cc: return False
-    flags = ["-O0", "-g"] if debug else ["-O3", "-march=native", "-ffast-math"]
-    cmd = [cc, "-shared", "-fPIC", *flags, "-o", str(OUT), str(SRC), "-lm"]
-    return subprocess.run(cmd).returncode == 0
+    cc = _find_gnu_compiler()
+    if not cc:
+        return False
+    # Avoid -march=native: older Conda MinGW assemblers can fail on newer
+    # host CPUs, and a portable shared library is preferable for this repo.
+    flags = ["-O0", "-g"] if debug else ["-O3", "-ffast-math"]
+    platform_flags = ["-static-libgcc"] if os.name == "nt" else ["-fPIC"]
+    # Use paths relative to ROOT so older MinGW builds do not have to parse
+    # non-ASCII characters that may occur in the repository's parent path.
+    cmd = [cc, "-shared", *platform_flags, *flags,
+           "-o", OUT.name, str(SRC.relative_to(ROOT)), "-lm"]
+    env = os.environ.copy()
+    env["PATH"] = str(Path(cc).parent) + os.pathsep + env.get("PATH", "")
+    return subprocess.run(cmd, cwd=str(ROOT), env=env).returncode == 0
 
 
 def main():

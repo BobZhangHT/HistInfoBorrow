@@ -378,9 +378,6 @@ def make_F1(params):
               loc="upper center", bbox_to_anchor=(0.5, -0.22),
               ncol=2, frameon=True, framealpha=0.93)
 
-    fig.suptitle("Real-data-calibrated simulation scenarios: "
-                 "ξ (bias) × η (precision) grid",
-                 fontsize=12, y=0.995)
     out = FIG_DIR / "F1_scenario_exploratory.pdf"
     fig.savefig(out, bbox_inches="tight")
     fig.savefig(out.with_suffix(".png"), dpi=200, bbox_inches="tight")
@@ -408,7 +405,7 @@ def make_F2():
 
     metrics = [("alloc_overall", "Allocation ratio",                                (0.42, 0.62)),
                ("rmse_h1",       r"RMSE  $\sqrt{\mathbb{E}(\hat\delta-\delta)^2}$",  None),
-               ("power",         f"Calibrated power  (δ_test = {DELTA_TEST:g})",     (0.5, 1.0))]
+               ("power",         f"Calibrated power  (δ_test = {DELTA_TEST:g})",     (0.4, 1.0))]
 
     # ---- Top row: vs ξ marginalised over η ----
     for j, (col, ylab, ylim) in enumerate(metrics):
@@ -454,9 +451,6 @@ def make_F2():
                          loc="left", fontsize=10.5)
             ax.legend(fontsize=9, frameon=False, loc="upper left")
 
-    fig.suptitle("Marginal effects of bias (ξ) and precision (η) "
-                 "on allocation, RMSE, and power",
-                 fontsize=12, y=0.99)
     out = FIG_DIR / "F2_marginal_effects.pdf"
     fig.savefig(out, bbox_inches="tight")
     fig.savefig(out.with_suffix(".png"), dpi=200, bbox_inches="tight")
@@ -583,9 +577,6 @@ def make_F3():
                  fontsize=10)
     fig.colorbar(im, ax=ax, shrink=0.85, pad=0.02)
 
-    fig.suptitle("ξ × η interaction maps — RADISH precision-aware "
-                 "borrowing yields uniformly controlled RMSE at no power loss",
-                 fontsize=12)
     out = FIG_DIR / "F3_xi_eta_interaction.pdf"
     fig.savefig(out, bbox_inches="tight")
     fig.savefig(out.with_suffix(".png"), dpi=200, bbox_inches="tight")

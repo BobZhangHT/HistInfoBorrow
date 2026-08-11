@@ -1,165 +1,135 @@
-# RADISH: Robust Adaptive Discrepancy-Informed Shrinkage for Historical Borrowing in Clinical Trials
+# RADISH
 
-Reference implementation and reproduction code for the manuscript
+Reference implementation for **Robust Adaptive Discrepancy-Informed Shrinkage for Historical Borrowing in Clinical Trials** by Hengtao Zhang, Yuanke Qu, and Huaqing Jin.
 
-> **RADISH: Robust Adaptive Discrepancy-Informed Shrinkage for Historical
-> Borrowing in Clinical Trials.**
-> Hengtao Zhang, Yuanke Qu, and Huaqing Jin.
+RADISH is a covariate-adaptive randomized design that borrows information from external controls only where historical and concurrent controls are locally compatible. A single Gaussian product kernel is used throughout planning, sequential allocation, and final estimation. Historical borrowing is discounted by a local historical-concurrent conflict diagnostic and falls back toward the concurrent-only KBCD design when the sources disagree.
 
-RADISH is a covariate-adaptive randomisation design that borrows from
-external historical controls through a local prior-data-conflict (PDC)
-discount. Borrowing is information-ratio driven and degrades gracefully
-to a non-borrowing baseline when the historical and concurrent cohorts
-disagree. All local quantities (the historical prior, the concurrent
-control summaries, the allocation counts, and the final estimator) are
-computed with a **single Gaussian product kernel** whose per-dimension
-bandwidth follows **Scott's rule of thumb**; there is no separate
-fitting/allocation kernel and no hand-tuned bandwidth. The repository
-reproduces every figure and table in the paper: the 3×2
-bias-by-precision simulation study (§3) and the HORIZON–FIT real-data
-application (§4).
+## Installation
 
----
-
-## 1. Installation
+Python 3.9 or newer is recommended.
 
 ```bash
-git clone https://github.com/BobZhangHT/HistInfoBorrow.git
-cd HistInfoBorrow
-pip install -r requirements.txt
+git clone https://github.com/BobZhangHT/CAHB-PP.git
+cd CAHB-PP
+python -m pip install -r requirements.txt
 ```
 
-Requirements: Python ≥ 3.9, `numpy`, `scipy`, `pandas`, `joblib`, `matplotlib`.
-
-### Optional C backend (≈ 5–8× faster)
+The pure-Python implementation works without compilation. An optional C backend accelerates the main simulation loops:
 
 ```bash
-python build_c.py        # MSVC on Windows; gcc/clang on Linux/macOS
+python build_c.py
 ```
 
-Produces `radish_core.{dll,so}`. `main.py` auto-detects the library and
-falls back to the pure-Python implementation if it is absent. Set
-`RADISH_BACKEND=python` to force the Python path.
-
----
-
-## 2. Reproducing the simulation study (§3)
-
-The simulation uses a 3 (bias) × 2 (precision) design in
-`config.py::SCENARIOS`:
-
-|              | High precision (σ_H = 0.5) | Low precision (σ_H = 3.0) |
-|:------------:|:--------------------------:|:-------------------------:|
-| No bias (b=0)    | B1                     | B2                    |
-| Moderate (b=0.5) | B3                     | B4                    |
-| Large (b=2)      | B5                     | B6                    |
+On Windows with MinGW, use:
 
 ```bash
-# Quick smoke test (10 reps, ≈ 2 min on 4 cores)
+python build_c.py --mingw
+```
+
+The build creates `radish_core.dll` or `radish_core.so` beside `methods_c.py`. `main.py` detects the library automatically and otherwise uses `methods.py`. Set `RADISH_BACKEND=python` to force the reference implementation or `RADISH_BACKEND=c` to require the compiled backend.
+
+## Synthetic simulation study
+
+The primary experiment is a three-by-two bias and precision design. The historical mean shift is `b_H ∈ {0, 0.5, 2.0}`, and the historical outcome standard deviation is `σ_H ∈ {0.5, 3.0}`. The concurrent and default historical sample sizes are both 200.
+
+| Scenario | Historical bias | Historical SD | Interpretation |
+|:--|--:|--:|:--|
+| B1 | 0.0 | 0.5 | Compatible and precise |
+| B2 | 0.0 | 3.0 | Compatible but noisy |
+| B3 | 0.5 | 0.5 | Moderate conflict, precise history |
+| B4 | 0.5 | 3.0 | Moderate conflict, noisy history |
+| B5 | 2.0 | 0.5 | Severe conflict, precise history |
+| B6 | 2.0 | 3.0 | Severe conflict, noisy history |
+
+Run from the repository root:
+
+```bash
+# Ten-replication smoke test
 python main.py --mode demo --jobs 4
 
-# Full paper grid (1000 reps × 6 scenarios × 2 effects × 3 methods)
-python main.py --mode full      --jobs 8
+# Main paper experiment, 1000 replications per cell
+python main.py --mode full --jobs 8
 
-# Supplementary precision-gradient sweep (Fig. P1–P4)
+# Supplementary precision-gradient experiment
 python main.py --mode precision --jobs 8
 
-# Supplementary bias-gradient sweep (Theorem 1 verification)
-python main.py --mode bias      --jobs 8
+# Supplementary bias-gradient experiment
+python main.py --mode bias --jobs 8
+
+# Paired historical-size sensitivity, N_H = 200 versus 400
+python main.py --mode hist_size --jobs 8
 ```
 
-Outputs land under `results/<mode>/`:
-
-```
-results/<mode>/
-├── raw_results.csv      # per-trial draws (allocation + borrowing diagnostics)
-├── metrics.csv          # summary metrics per cell
-├── tables/              # metrics_full.{csv,tex}, metrics_summary.csv
-└── plots/               # six paper figures, fig1–fig6 (vector PDF)
-```
-
-The paper's Tables 1–3 are built from `tables/metrics_full.csv`; the
-four main-text figures are `plots/fig1_allocation_ratio.pdf`,
-`fig2_bias_rmse.pdf`, `fig4_typeI_power.pdf`, and
-`fig5_borrowing_diagnostics.pdf`.
-
-Reproducing the paper's wall-clock numbers requires `--mode full
---jobs N`; running times scale roughly linearly in `--jobs`.
-
----
-
-## 3. Reproducing the real-data application (§4)
-
-The real-data application is anchored to two non-redistributable
-trials:
-
-- **HORIZON Pivotal Fracture Trial** (zoledronic acid; current trial)
-- **Fracture Intervention Trial — FIT** vertebral and clinical
-  sub-cohorts (historical controls)
-
-Both must be obtained from the original investigators or NHLBI BioLINCC
-under their respective data-use agreements. **The data are not
-included in this repository.** Once obtained:
-
-1. Merge HORIZON and FIT into a single subject-level table named
-   `real_data/dat_merge.csv` with the columns expected by
-   `real_data/real_setup.py` (see the docstring there for the schema).
-2. Run the pipeline:
+All modes use seed 2026 by default. Set `--seed` to change it. `--reps` is available for short `hist_size` checks, for example:
 
 ```bash
-python real_data/real_setup.py          # fit working model, dump real_params.pkl
-python real_data/real_run.py            # (ξ × η × method × effect × rep) sweep
-python real_data/real_figures.py        # F1–F3 + Table 1
+python main.py --mode hist_size --reps 2 --jobs 2
 ```
 
-The ξ (bias) × η (precision/sample-size) grid mirrors the
-synthetic design but with HORIZON-fitted subgroup coefficients and
-FIT-KDE covariate distributions; see `real_data/real_scenarios.py`.
+Results are written to `results/<mode>/`:
 
----
-
-## 4. Methods
-
-| Method        | File / class                | Borrowing rule                     |
-|---------------|-----------------------------|------------------------------------|
-| **RADISH**    | `methods.py::RADISH`        | PDC discount `M = exp(-D_PDC)`; `R_n = 1 + σ²₀c /(Ñc·SE²·exp(D_PDC))`, `SE² = τ_H² + σ²₀c/Nc` |
-| CAHB          | `methods.py::CAHB`          | Variance-ratio with τ(x) coordinate ascent |
-| KBCD          | `methods.py::KBCD`          | No borrowing (`R_n ≡ 1`) — baseline |
-
-All three share the single Gaussian/Scott kernel
-(`methods.py::kernel_bandwidths`) and the linearised ATE estimator with
-a sandwich variance defined in §2 of the paper. C-backed counterparts
-live in `methods_c.py` and load `radish_core.{dll,so}` via `ctypes`.
-
----
-
-## 5. Repository layout
-
+```text
+results/<mode>/
+|-- raw_results.csv
+|-- metrics.csv
+|-- plots/
+`-- tables/
 ```
+
+The historical-size mode uses nested historical cohorts and common random-number streams within each paired comparison. Its dedicated summaries and figures are generated by `historical_size_analysis.py` and include the RADISH sensitivity plot and the B3/B4 robustness plot.
+
+## Real-data-calibrated study
+
+The application uses HORIZON and FIT participant-level data. These data are restricted and are not distributed in this repository. After obtaining access under the applicable data-use agreements, place the merged file at `real_data/dat_merge.csv`. The required schema is documented in `real_data/real_setup.py`.
+
+Run the pipeline in order:
+
+```bash
+python real_data/real_setup.py
+python real_data/real_run.py
+python real_data/real_figures.py
+```
+
+The first command estimates the working-model parameters, the second runs the calibrated simulation, and the third creates the figures and scenario table.
+
+## Methods and implementation
+
+| Method | Implementation | Historical borrowing |
+|:--|:--|:--|
+| RADISH | `methods.py::RADISH` | Local conflict-discounted borrowing |
+| CAHB | `methods.py::CAHB` | Variance-ratio borrowing |
+| KBCD | `methods.py::KBCD` | Concurrent-only baseline |
+
+`methods.py` is the reference implementation. `methods_c.py` exposes matching C-backed classes through `ctypes`, and `c_src/radish_core.c` contains the native kernels. `analysis.py` generates the main simulation tables and vector PDF figures. The simulation entry points set BLAS thread counts to one before importing NumPy so that process-level parallel runs do not create nested numerical threads.
+
+## Repository layout
+
+```text
 .
-├── config.py             # Hyper-parameters + scenario grids
-├── methods.py            # KBCD, CAHB, RADISH (pure Python reference)
-├── methods_c.py          # ctypes bindings to radish_core
-├── c_src/radish_core.c   # C kernel (Stage I / II hot loops)
-├── build_c.py            # Compiler-agnostic shared-library build
-├── main.py               # Simulation runner
-├── analysis.py           # Publication figures + LaTeX tables
-├── real_data/            # Real-data application code (§4)
-│   ├── real_setup.py     #   fit working model on HORIZON / FIT
-│   ├── real_scenarios.py #   ξ × η grid definition
-│   ├── real_run.py       #   simulation sweep on real-anchored DGP
-│   └── real_figures.py   #   F1–F3 + Table 1
-├── requirements.txt
-├── LICENSE
-└── README.md
+|-- main.py                       simulation command-line entry point
+|-- config.py                     scenarios, sample sizes, and runtime settings
+|-- methods.py                    pure-Python KBCD, CAHB, and RADISH
+|-- methods_c.py                  optional C-backed implementations
+|-- historical_size_analysis.py  paired N_H sensitivity summaries and figures
+|-- analysis.py                   main tables and publication figures
+|-- build_c.py                    native-library build helper
+|-- c_src/radish_core.c           C kernels
+|-- real_data/                    restricted-data reproduction scripts
+|-- requirements.txt
+`-- LICENSE
 ```
 
-Generated artefacts (`results/`, `real_data/*.csv`, `real_data/*.pkl`,
-`real_data/figures/`, build outputs) are ignored by `.gitignore`.
+Generated outputs, compiled libraries, restricted data, manuscripts, and the local `archive/` directory are excluded by `.gitignore`.
 
----
+## Reproducibility notes
 
-## 6. Citation
+- The default seed is fixed in the command-line runners.
+- Joblib uses process-level parallelism; BLAS libraries are restricted to one thread per worker.
+- The C backend is optional. Use `RADISH_BACKEND=python` when validating the reference implementation.
+- Historical-size comparisons are paired across methods and sample sizes.
+- Full experiments can take several minutes depending on the backend and worker count.
+
+## Citation
 
 ```bibtex
 @unpublished{zhang2026radish,
@@ -167,16 +137,10 @@ Generated artefacts (`results/`, `real_data/*.csv`, `real_data/*.pkl`,
             Historical Borrowing in Clinical Trials},
   author = {Zhang, Hengtao and Qu, Yuanke and Jin, Huaqing},
   year   = {2026},
-  note   = {Manuscript under review.}
+  note   = {Manuscript under review}
 }
 ```
 
-Correspondence: Huaqing Jin (`huaqingjin@mail.tsinghua.edu.cn`).
+## License
 
----
-
-## 7. License
-
-Code is released under the [MIT License](LICENSE). The HORIZON and FIT
-datasets are governed by their respective data-use agreements and are
-not covered by this license.
+The source code is released under the [MIT License](LICENSE). HORIZON and FIT data remain governed by their original data-use agreements and are not covered by this license.

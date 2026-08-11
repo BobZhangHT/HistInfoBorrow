@@ -1,32 +1,38 @@
-# =============================================================================
-# RADISH — Git Ignore Rules
-# =============================================================================
-# Track:   source code (.py), c_src/, build_c.py, README, LICENSE, requirements
-# Ignore:  generated results, raw data, caches, editors, PDFs, build artefacts
+# Local research archive. It may contain private trial data and is never pushed.
+archive/
 
-# ── Python byte-code & caches ────────────────────────────────────────────────
+# Python caches and environments
 __pycache__/
 *.py[cod]
-*$py.class
-*.pyo
 *.pyd
-*.so
 *.nbi
 *.nbc
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+.venv/
+venv/
+env/
+.conda/
 
-# ── Build / packaging ────────────────────────────────────────────────────────
+# Native build and packaging outputs
+radish_core.dll
+radish_core.so
+radish_core.dylib
+*.o
+*.obj
+*.lib
+*.exp
+*.pdb
 build/
 dist/
 *.egg-info/
-*.egg
-.eggs/
-*.manifest
-*.spec
 
-# ── Generated outputs & caches ───────────────────────────────────────────────
+# Generated simulation outputs
 results/
 output/
-tune_results/
 cache/
 .simulation_cache/
 simulation_cache/
@@ -38,80 +44,49 @@ simulation_cache/
 *.h5
 *.hdf5
 *.mat
+
+# Restricted real-data inputs and generated outputs
+real_data/*
+!real_data/*.py
+
+# Manuscripts, reference material, and LaTeX build products
+docs/
+references/
+papers/
+*.pdf
+*.tex
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
+*.out
 *.log
+
+# Data exports and temporary files
+*.csv
+*.rdata
+*.RData
+*.rda
+*.rds
+*.rtf
 *.tmp
 *.temp
 *.bak
 *.swp
 *.swo
 
-# ── Reference material / data (DO NOT COMMIT) ────────────────────────────────
-references/
-papers/
-R Codes/
-docs/
-scripts/
-*.pdf
-*.csv
-*.tex
-*.Rdata
-*.rda
-*.rds
-*.rtf
-
-# `real_data/` holds non-redistributable HORIZON/FIT data + outputs.
-# Track only the Python reproduction scripts (data must be obtained
-# independently — see README §"Real-data application").
-real_data/*
-!real_data/*.py
-
-# ── Virtual environments ─────────────────────────────────────────────────────
-.env/
-.venv/
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-.conda/
-conda-env/
-
-# ── Editors / IDEs ───────────────────────────────────────────────────────────
+# Editors and operating-system files
 .vscode/
-*.code-workspace
 .idea/
-*.iml
-.ipynb_checkpoints/
-*.ipynb
-.spyderproject
-.spyproject
 .cursor/
 .claude/
-
-# ── OS junk ──────────────────────────────────────────────────────────────────
+*.code-workspace
+.ipynb_checkpoints/
+*.ipynb
 .DS_Store
-.AppleDouble
-.LSOverride
 Thumbs.db
-Thumbs.db:encryptable
-ehthumbs.db
-ehthumbs_vista.db
-*.stackdump
-[Dd]esktop.ini
-$RECYCLE.BIN/
+desktop.ini
 *~
-.nfs*
-
-# ── Testing ──────────────────────────────────────────────────────────────────
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.hypothesis/
-
-# ── Allowlist (top-level repo essentials) ────────────────────────────────────
-!README.md
-!LICENSE
-!requirements.txt
-!.gitignore
-!.gitattributes
