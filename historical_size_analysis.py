@@ -7,7 +7,13 @@ import numpy as np
 import pandas as pd
 
 import config
-from analysis import METHOD_COLORS, METHOD_ORDER, PUB_RC
+from analysis import (
+    METHOD_COLORS,
+    METHOD_LABELS,
+    METHOD_ORDER,
+    PUB_RC,
+    SCENARIO_DISPLAY,
+)
 
 
 plt.rcParams.update(PUB_RC)
@@ -273,9 +279,12 @@ def advantage_change(df):
 def _plot_sensitivity(comparison, out_path):
     sizes = sorted({int(comparison.N_H_Low.iloc[0]), int(comparison.N_H_High.iloc[0])})
     power = comparison[(comparison.Method == "RADISH") & (comparison.Effect == "Power")].copy()
-    power["ScenarioIndex"] = power.Scenario.str.extract(r"B(\d)").astype(int)
+    scenario_order = list(config.get_mode_scenarios("hist_size"))
+    power["ScenarioIndex"] = pd.Categorical(
+        power.Scenario, categories=scenario_order, ordered=True)
     power = power.sort_values("ScenarioIndex")
-    labels = [f"B{i}" for i in power.ScenarioIndex]
+    labels = [SCENARIO_DISPLAY.get(s, s.split("_")[0])
+              for s in power.Scenario]
     x = np.arange(len(labels))
 
     fig, axes = plt.subplots(2, 2, figsize=(6.83, 5.25), sharex=True)
@@ -286,16 +295,19 @@ def _plot_sensitivity(comparison, out_path):
         ("Mean_W", "Mean borrowing weight", "(d) Borrowing weight"),
     ]
     for ax, (prefix, ylabel, title) in zip(axes.flat, panels):
-        for n_h, color, marker in zip(sizes, ["#1f77b4", "#d62728"], ["o", "s"]):
-            ax.plot(x, power[f"{prefix}_NH{n_h}"], color=color, marker=marker,
-                    linewidth=1.8, label=fr"$N_H={n_h}$")
+        for n_h, marker, linestyle, alpha in zip(
+                sizes, ["o", "s"], ["--", "-"], [0.58, 1.0]):
+            ax.plot(x, power[f"{prefix}_NH{n_h}"],
+                    color=METHOD_COLORS["RADISH"], marker=marker,
+                    linestyle=linestyle, alpha=alpha, linewidth=1.8,
+                    label=fr"$N_H={n_h}$")
         ax.set_ylabel(ylabel)
         ax.set_title(title, loc="left")
         ax.grid(alpha=0.25)
         if prefix == "Rejection":
-            ax.set_ylim(0.80, 0.96)
+            ax.set_ylim(0.80, 1.01)
         elif prefix == "Mean_W":
-            ax.set_ylim(0, 0.22)
+            ax.set_ylim(0, 0.92)
     for ax in axes[-1, :]:
         ax.set_xticks(x, labels)
         ax.set_xlabel("Scenario")
@@ -309,12 +321,13 @@ def _plot_conflict_robustness(comparison, out_path):
     null = comparison[comparison.Effect == "Null"].copy()
     sizes = sorted({int(null.N_H_Low.iloc[0]), int(null.N_H_High.iloc[0])})
     scenarios = ["B3_mdBias_highPrec", "B4_mdBias_lowPrec"]
-    scenario_titles = ["B3: precise history", "B4: noisy history"]
+    scenario_titles = ["S5: precise history", "S6: noisy history"]
     fig, axes = plt.subplots(2, 2, figsize=(6.83, 5.25), sharex="col")
     x = np.arange(len(METHOD_ORDER))
     width = 0.34
-    colors = ["#0072B2", "#D55E00"]
+    method_colors = [METHOD_COLORS[m] for m in METHOD_ORDER]
     hatches = [None, "//"]
+    alphas = [0.62, 1.0]
 
     for col, (scenario, scenario_title) in enumerate(zip(scenarios, scenario_titles)):
         subset = null[null.Scenario == scenario].set_index("Method")
@@ -322,10 +335,11 @@ def _plot_conflict_robustness(comparison, out_path):
                 ("Rejection", "Type I error", 0.05),
                 ("Coverage", "Coverage", 0.95)]):
             ax = axes[row, col]
-            for j, (n_h, color, hatch) in enumerate(zip(sizes, colors, hatches)):
+            for j, (n_h, hatch, alpha) in enumerate(zip(sizes, hatches, alphas)):
                 values = [subset.loc[m, f"{prefix}_NH{n_h}"] for m in METHOD_ORDER]
                 bars = ax.bar(x + (j - 0.5) * width, values, width=width,
-                              color=color, edgecolor="black", linewidth=0.5,
+                              color=method_colors, alpha=alpha,
+                              edgecolor="black", linewidth=0.5,
                               hatch=hatch, label=fr"$N_H={n_h}$")
                 ax.bar_label(bars, fmt="%.3f", padding=1.5, fontsize=6.5,
                              rotation=90)

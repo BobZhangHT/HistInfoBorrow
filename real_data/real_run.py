@@ -1,32 +1,18 @@
-"""
-real_run.py — Sweep (ξ × η × method × effect × rep) cells.
+"""Run the real-data-calibrated RADISH sensitivity experiment.
 
-Configured to match CAHB §5.2.1 (Fig 2) paper text:
-  • Current trial:  Y = δZ + μ_0(X) + ε, μ_0(X) = β_0(sg) + β_1(sg)·X3
-                    + β_2(sg)·X4, with σ²_C and δ real-fitted from
-                    HORIZON; sg = (X1, X2) the binary fall/frx subgroup.
-  • Historical:     α_k(sg) = β_k(sg)·d, d ~ N(1+ξ, 0.3·I(ξ≠0))
-                    (multiplicative discrepancy, paper §5.2.1).
-  • Covariates:     2 binary (X1, X2) + 2 continuous KDE-sampled
-                    (X3 standardised menyrs, X4 standardised Y0).
-  • CAHB algorithm hyperparams (paper §4 defaults):
-                    γ = √3, λ_2 = 300·log(N), λ_1 from Algorithm 2,
-                    single Gaussian kernel with Scott ROT
-                    h_j = n^{-1/(p+4)}·σ_j across all 4 covariates
-                    (no separate fitting/allocation kernel).
-  • θ_0:            CAHB §5.2.1 idealisation — passed as the noiseless
-                    historical mean function evaluated at the sampled
-                    covariates (no ε_h additive noise).
+For each conflict level xi, historical-size level eta, method, hypothesis,
+and replication, the script generates a historical control sample and a
+sequential current trial.  The historical mean is shifted by
+b_theta = 2 * xi * sigma_C; eta maps to n_H in [30, 350].  HORIZON-calibrated
+covariate distributions, subgroup response surfaces, and sigma_C are used.
+The moderate alternative delta=0.14 avoids saturated power at N=200.  KBCD,
+CAHB, RADISH, and the conflict levels share random-number streams within each
+(eta, effect, replication) block.
 
-For every (ξ, η) cell we sample a historical control arm of size
-n_H(η), run a sequential adaptive trial of N_CURRENT current-trial
-patients, fit the chosen Stage-III estimator and record (est, lo, hi,
-sq_err, rejected, alloc, mean_W).
-
-Outputs: real_data/real_run_results.csv
+Output: real_data/real_run_results.csv
 """
 from __future__ import annotations
-import os, sys, time, pickle
+import hashlib, json, os, sys, time, pickle
 
 # Avoid nested BLAS threads inside the process-level simulation workers.
 for _thread_var in (
@@ -63,19 +49,22 @@ print(f"[real_run] backend = {_BACKEND}")
 
 PARAMS_PKL = ROOT / "real_data" / "real_params.pkl"
 OUT_CSV    = ROOT / "real_data" / "real_run_results.csv"
+MANIFEST_JSON = ROOT / "real_data" / "real_run_manifest.json"
 
-# DGP scale: σ_C = 1.0 matches B-sim noise regime so that the strict
-# B-sim hyperparam γ = 0.25 (config.PRIORS) produces the dimensionless
-# borrowing strength γ²·σ_C² = 0.0625 it has in B1-B6.  HORIZON's
-# absolute σ_C ≈ 0.33 would shrink this to 0.007 (9× weaker), capping
-# CAHB W at ~0.08 and erasing the canonical alloc/RMSE/power trends.
-# Realism is preserved through HORIZON-fitted β-shape (subgroup
-# heterogeneity), per-sg KDE on (menyrs, Y0), and HORIZON empirical
-# subgroup proportions — only the noise scale is harmonised with
-# B-sim.  δ_DGP = 0.5 is the B-sim baseline alternative effect that
-# yields nominal power ≈ 0.8 with N_C = 200.
-SIGMA_C_DGP  = 1.0
-DELTA_DGP    = 0.5
+# The outcome scale uses the HORIZON residual variance. The controlled DGP
+# combines the HORIZON response surface with FIT-calibrated historical
+# covariate distributions and subgroup proportions. Historical conflict is
+# introduced as b_theta = 2 * xi * sigma_C. The combined grid resolves the
+# useful low-conflict region and retains broad stress tests; it is not claimed
+# to duplicate the multiplicative perturbation in Jin et al. (2023).
+SIGMA_C_DGP  = float(np.sqrt(0.11))   # ≈ 0.33, from HORIZON residuals
+DELTA_DGP    = 0.140                  # moderate alternative; avoids saturated power
+
+# CAHB-specific settings from Jin et al. (2023, Section 4). RADISH and
+# KBCD ignore these entries, so the proposed method is not tuned to the
+# evaluation grid.
+REAL_PRIORS = dict(config.PRIORS)
+REAL_PRIORS.update(cahb_gamma=float(np.sqrt(3.0)), cahb_lambda=300.0)
 
 
 def _load_params():
@@ -103,65 +92,53 @@ def _gen_X_from_subgroup(rng, n, kdes, sg_dist, moments):
 
 
 def _gen_historical(params, eta, xi, rng):
-    """Real-data B-scenario-style DGP — additive bias + tunable σ_h
-    precision dial, mirroring config.SCENARIOS B1-B6 form but anchored
-    to HORIZON-fitted parameters and FIT-KDE covariate distributions.
+    """Generate n_H historical controls on the additive conflict path.
 
-        Y_h = μ_0^current(X) + b_θ + ε_h,
-              μ_0^current(X) = β_0(sg) + β_1(sg)·X3_std + β_2(sg)·X4_std
-              b_θ            = ξ · σ_C    (additive bias in σ_C units)
-              ε_h ~ N(0, σ_h²),   σ_h    = sigma_h_of_eta(η) · σ_C
-
-    Bias-axis ξ ∈ {0, 0.5, 1, 2}·σ_C aligns with B-scenario b_θ levels
-    {0, 0.5, 2} when re-scaled to the HORIZON noise regime σ_C = 0.33.
-
-    Precision-axis η ∈ [0, 1] maps σ_h/σ_C linearly from 3 (low prec, =
-    B2/B4/B6 σ_h ratio) at η=0 to 0.5 (high prec, = B1/B3/B5) at η=1.
-
-    Historical sample size N_H = 200 (matching B-scenarios).
+    The conditional mean uses the HORIZON response surface plus
+    b_theta = 2 * xi * sigma_C. Thus xi=0 is exactly compatible and xi=1
+    is a two-standard-deviation location discrepancy. Historical precision
+    is varied only through n_H(eta), with sigma_H fixed at sigma_C.
     """
-    # η now controls historical sample size n_H directly (literal
-    # interpretation of "precision of θ̂_0" — matches CAHB §5.2.3 design).
-    # σ_h is held fixed at σ_C, so the only precision lever is n_H.
-    # Var(θ̂_0) ∝ σ_h²/n_H, so n_H ∈ [30, 350] gives ~12× precision range.
     n_H = n_H_of_eta(eta)
     Xh, sg_h = _gen_X_from_subgroup(rng, n_H, params["kde_hist"],
                                     params["sg_dist_hist"], params["moments"])
-    Zh = rng.binomial(1, 0.5, size=n_H).astype(float)
+
     sigma_C = SIGMA_C_DGP
-    b_theta = xi * sigma_C
-    sigma_h = sigma_C        # fixed σ_h = σ_C; precision varies via n_H
+    sigma_h = sigma_C
+
+    # Transparent location-conflict path on the HORIZON outcome scale.
+    # xi=0 is exactly compatible; positive grid values double from 0.01
+    # through 0.64, with xi=1 retained as the severe-conflict endpoint.
     a0 = params["beta_curr"]["b0"]
     a1 = params["beta_curr"]["b_menyrs"]
     a2 = params["beta_curr"]["b_Y0"]
+    b_theta = 2.0 * float(xi) * sigma_C
     mu = (a0[sg_h]
           + a1[sg_h] * Xh[:, 2]
           + a2[sg_h] * Xh[:, 3]
           + b_theta)
     Yh = mu + rng.standard_normal(n_H) * sigma_h
-    mask = (Zh == 0)
-    return Xh[mask], Yh[mask]
+    # n_H denotes available historical controls, not a randomized cohort.
+    return Xh, Yh
 
 
 def sigma_h_of_eta(eta: float) -> float:
-    """Kept for backwards compatibility with figure code; always
-    returns 1.0 since σ_h is now fixed at σ_C and η controls n_H."""
-    return 1.0
+    """Backwards-compatible helper; eta changes n_H, not historical noise."""
+    del eta
+    return SIGMA_C_DGP
 
 
 def _run_trial(rng, params, xi, eta, method_cls, delta_true):
     Xh_ctrl, Yh_ctrl = _gen_historical(params, eta, xi, rng)
     if Xh_ctrl.shape[0] < 4:
         return None
-    # Hyperparameters: identical to the RADISH simulation B1-B6 study
-    # (config.PRIORS = {"cahb_gamma": 0.25, "cahb_lambda": 300}),
-    # so the only thing that distinguishes the real-data run from the
-    # B1-B6 run is the data-generating process (DGP), not the algorithm
-    # tuning.  Per user constraint, we do NOT touch CAHB / RADISH
-    # hyperparameters here.
+    # RADISH uses the common defaults. The CAHB comparator uses the
+    # real-data-study settings in REAL_PRIORS (gamma=sqrt(3), lambda base
+    # coefficient 300, yielding the implemented radius 300*log(N)), declared
+    # once above and reported by the generated design table.
     cov_params = {"p": 4, "disc_idx": [0, 1], "cont_idx": [2, 3]}
     method = method_cls({"X_h": Xh_ctrl[:, :4], "Y_h": Yh_ctrl},
-                        cov_params, config.PRIORS)
+                        cov_params, REAL_PRIORS)
     Xc, sg_c = _gen_X_from_subgroup(rng, N_CURRENT, params["kde_curr"],
                                     params["sg_dist_curr"], params["moments"])
     Xo, Yo, Zo, Pi = [], [], [], []
@@ -194,7 +171,7 @@ def _run_trial(rng, params, xi, eta, method_cls, delta_true):
         alloc_sg1=alloc_per_sg[0], alloc_sg2=alloc_per_sg[1],
         alloc_sg3=alloc_per_sg[2], alloc_sg4=alloc_per_sg[3],
         mean_W=diag["mean_W"], mean_Rn=diag["mean_Rn"],
-        n_H=200,
+        n_H=int(Xh_ctrl.shape[0]),
     )
 
 
@@ -215,19 +192,23 @@ def _task(xi, eta, method_cls, effect, rep, seed):
                     effect=effect, rep=rep, error=str(e))
 
 
-def main():
+def main(n_reps=None, n_jobs=None):
+    n_reps = N_REPS if n_reps is None else int(n_reps)
+    n_jobs = N_JOBS if n_jobs is None else int(n_jobs)
     t0 = time.time()
-    tasks, idx = [], 0
-    for xi in XI_GRID:
-        for eta in ETA_GRID:
-            for cls in (KBCD, CAHB, RADISH):
-                for effect in ("Null", "Power"):
-                    for r in range(N_REPS):
-                        tasks.append((xi, eta, cls, effect, r, SEED + idx))
-                        idx += 1
+    tasks = []
+    # Common random numbers pair methods and conflict levels within each
+    # (eta, effect, replication) block, isolating the xi sensitivity path.
+    for i_xi, xi in enumerate(XI_GRID):
+        for i_eta, eta in enumerate(ETA_GRID):
+            for i_eff, effect in enumerate(("Null", "Power")):
+                for r in range(n_reps):
+                    seed = SEED + r + n_reps * (i_eff + 2 * i_eta)
+                    for cls in (KBCD, CAHB, RADISH):
+                        tasks.append((xi, eta, cls, effect, r, seed))
     print(f"[real_run] {len(tasks)} tasks  "
-          f"(|ξ|={len(XI_GRID)} × |η|={len(ETA_GRID)} × 3 methods × 2 effects × {N_REPS} reps)")
-    res = Parallel(n_jobs=N_JOBS, backend="loky", verbose=5)(
+          f"(|ξ|={len(XI_GRID)} × |η|={len(ETA_GRID)} × 3 methods × 2 effects × {n_reps} reps)")
+    res = Parallel(n_jobs=n_jobs, backend="loky", verbose=5)(
         delayed(_task)(*t) for t in tasks)
     good = [r for r in res if "error" not in r]
     bad  = [r for r in res if "error" in r]
@@ -240,5 +221,75 @@ def main():
           f"in {(time.time()-t0)/60:.1f} min")
 
 
+def _sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_results(path=OUT_CSV):
+    """Validate the calibrated-study grid and write its SHA-256 manifest."""
+    path = Path(path)
+    df = pd.read_csv(path)
+    methods, effects = ("KBCD", "CAHB", "RADISH"), ("Null", "Power")
+    expected_rows = (
+        len(XI_GRID) * len(ETA_GRID) * len(methods) * len(effects) * N_REPS
+    )
+    assert len(df) == expected_rows, (len(df), expected_rows)
+    assert set(df["method"]) == set(methods)
+    assert set(df["effect"]) == set(effects)
+    assert np.allclose(sorted(df["xi"].unique()), XI_GRID)
+    assert np.allclose(sorted(df["eta"].unique()), ETA_GRID)
+    keys = ["xi", "eta", "method", "effect", "rep"]
+    assert not df.duplicated(keys).any(), "duplicate result identifiers"
+    counts = df.groupby(keys[:-1], observed=True).size()
+    assert counts.eq(N_REPS).all()
+    assert df["rep"].min() == 0 and df["rep"].max() == N_REPS - 1
+    for eta in ETA_GRID:
+        observed = df.loc[np.isclose(df["eta"], eta), "n_H"].unique()
+        assert len(observed) == 1 and int(observed[0]) == n_H_of_eta(eta)
+    null_delta = df.loc[df["effect"] == "Null", "delta_true"].unique()
+    power_delta = df.loc[df["effect"] == "Power", "delta_true"].unique()
+    assert len(null_delta) == 1 and np.isclose(null_delta[0], 0.0)
+    assert len(power_delta) == 1 and np.isclose(power_delta[0], DELTA_DGP)
+    required = [
+        "est", "lo", "hi", "sq_err", "alloc_overall", "mean_W", "mean_Rn",
+    ]
+    assert np.isfinite(df[required].to_numpy(float)).all()
+    report = {
+        "result_file": str(path.relative_to(ROOT)),
+        "sha256": _sha256(path),
+        "rows": int(len(df)),
+        "replications_per_cell": int(N_REPS),
+        "xi_grid": [float(x) for x in XI_GRID],
+        "eta_grid": [float(x) for x in ETA_GRID],
+        "historical_sizes": [int(n_H_of_eta(e)) for e in ETA_GRID],
+        "methods": list(methods),
+        "effects": list(effects),
+        "delta_null": 0.0,
+        "delta_power": float(DELTA_DGP),
+        "validation": "passed",
+    }
+    MANIFEST_JSON.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--reps", type=int, default=None,
+                    help=f"replications per cell (default {N_REPS}); "
+                         f"use a small value for a smoke test")
+    ap.add_argument("--jobs", type=int, default=None,
+                    help=f"parallel workers (default {N_JOBS})")
+    ap.add_argument(
+        "--validate-only", action="store_true",
+        help="validate the existing result file and write its manifest",
+    )
+    args = ap.parse_args()
+    if args.validate_only:
+        print(json.dumps(validate_results(), indent=2))
+    else:
+        main(args.reps, args.jobs)

@@ -395,16 +395,111 @@ EXPORT void estimate_ate_c(
  * RADISH: per-evaluation-point diagnostics & W vector
  * ================================================================= */
 
+/* ─────────────────────────────────────────────────────────────────
+ * Tunable commensurability-map parameters.
+ * Production configuration is G_MAP=MAP_EXCESS and G_USE_TAU=0; there is no
+ * separate calibration flag. Other maps and the tau_H^2 denominator are
+ * retained only for explicit audit variants.
+ *
+ * The native default uses the centered excess-surprisal rule.  Setting
+ * use_tau=1 replaces the reference-predictive denominator SE² by the
+ * Stage-I reference variance tau²_H in Pi_H, removing the structural
+ * ceiling W < 1/2.  The production MAP_EXCESS rule replaces the earlier
+ * raw surprisal -log p by (-log p - 1)_+; MAP_CHISQ is retained only as a
+ * tunable audit alternative.  The one-nat offset is the ideal
+ * standard-normal PIT reference calibration, not an assertion about the
+ * finite-sample mean of an estimated kernel statistic.
+ * ───────────────────────────────────────────────────────────────── */
+static double G_LAM_LOC = 1.0;   /* local  sharpness (MAP_CHISQ only) */
+static double G_LAM_GLB = 1.0;   /* global sharpness (MAP_CHISQ only) */
+static int    G_USE_TAU = 0;     /* production Stages II/III use predictive SE^2 */
+
+/* Commensurability map.  Only MAP_LEGACY and MAP_CHISQ carry free constants;
+ * the remaining three are constant-free.
+ *
+ *  0 MAP_LEGACY   D = -log kappa                      (earlier draft)
+ *  1 MAP_CHISQ    D = lam (Z^2 - 1)_+ / 2             (tunable, for comparison)
+ *  2 MAP_EXCESS   D = (-log kappa - 1)_+              <-- default
+ *                 1 = one-nat ideal standard-normal PIT reference offset
+ *                 constant, not a tuning parameter.  Equivalently
+ *                 M = min(1, e * kappa).
+ *  3 MAP_MEDIAN   D = (-log kappa - log 2)_+          M = min(1, 2 kappa)
+ *                 same idea centred on the null MEDIAN of the p-value.
+ *  4 MAP_EB       Pi_H = 1/(tau2_H + psi2), psi2 = moment estimate of the
+ *                 between-source variance.  Constant-free and MSE-optimal,
+ *                 reported to show why an exponential map is needed.
+ */
+#define MAP_LEGACY 0
+#define MAP_CHISQ  1
+#define MAP_EXCESS 2
+#define MAP_MEDIAN 3
+#define MAP_EB     4
+/* The repaired centered map is the native default.  MAP_LEGACY remains
+ * available through radish_set_borrow_params(..., MAP_LEGACY) for historical
+ * reproducibility. */
+static int    G_MAP     = MAP_EXCESS;
+static int    G_ADJ_GLOBAL = 0;  /* 1 = covariate-standardised trial-level check */
+static int    G_SEQ_GLOBAL = 0;  /* 1 = recompute the root-node check at each interim */
+static double G_PHI_LO  = 0.0;   /* allocation-probability guard rails */
+static double G_PHI_HI  = 1.0;
+static int    G_ALLOC_LEGACY = 0;/* 1 = opt into the earlier-draft uncentered Stage-II map */
+static int    G_ALLOC_MIN_N0 = 0;/* no borrowing at allocation until this many
+                                  *     concurrent controls have accrued         */
+
+/* Kish effective sample size for a local kernel-weighted mean.  The weighted
+ * mean/variance retain the raw kernel mass; only sampling variance and
+ * precision use n_eff=(sum w)^2/sum(w^2). */
+static double kernel_effective_n(const double *w, int n)
+{
+    double sw = 0.0, sw2 = 0.0;
+    if (!w || n <= 0) return 1e-6;
+    for (int i = 0; i < n; ++i) {
+        sw += w[i];
+        sw2 += w[i] * w[i];
+    }
+    if (!isfinite(sw) || !isfinite(sw2) || sw <= EPS || sw2 <= EPS)
+        return 1e-6;
+    double neff = (sw * sw) / sw2;
+    return (isfinite(neff) && neff > 1e-6) ? neff : 1e-6;
+}
+EXPORT void radish_set_borrow_params(double lam_loc, double lam_glb,
+                                     int use_tau, int map)
+{
+    G_LAM_LOC = lam_loc; G_LAM_GLB = lam_glb;
+    G_USE_TAU = use_tau; G_MAP     = map;
+}
+
+EXPORT void radish_set_adj_global(int on) { G_ADJ_GLOBAL = on; }
+
+EXPORT void radish_set_alloc_params(int seq_global, double phi_lo, double phi_hi,
+                                    int alloc_legacy, int alloc_min_n0)
+{
+    G_SEQ_GLOBAL = seq_global; G_PHI_LO = phi_lo; G_PHI_HI = phi_hi;
+    G_ALLOC_LEGACY = alloc_legacy; G_ALLOC_MIN_N0 = alloc_min_n0;
+}
+
+EXPORT void radish_get_borrow_params(double *lam_loc, double *lam_glb,
+                                     int *use_tau, int *map)
+{
+    if (lam_loc) *lam_loc = G_LAM_LOC;
+    if (lam_glb) *lam_glb = G_LAM_GLB;
+    if (use_tau) *use_tau = G_USE_TAU;
+    if (map)     *map     = G_MAP;
+}
+
 /* Compute (R_n, W, D_PDC, tau²_H) at a single evaluation point.
  *
  * The PDC surprisal at x is the Fisher (1925) combination of the local
  * (per-x) Marshall–Spiegelhalter (2007) leaf-node conflict and the trial-
  * level (root-node) conflict, both calibrated under H0 to standard normal:
+ * The production MAP_EXCESS rule centers every node contribution as
+ * D_node = max(-log(p_node) - 1, 0); the raw formulas below describe only
+ * the legacy map.
  *
  *   D_PDC(x) = D_local(x) + D_global,  D_local = −log p_local,  D_global = −log p_global
  *
  * The discount enters R_n multiplicatively as exp(D_PDC):
- *   R_n = 1 + (σ²_{0,c}/N_c) / (SE² · exp(D_PDC))
+ *   R_n = 1 + (σ²_{0,c}/n_eff) / (SE² · exp(D_PDC))
  *
  * Caller passes D_global; pass 0 to use the leaf-only (allocation-time)
  * surprisal, or the precomputed trial-level surprisal for Stage III.
@@ -420,7 +515,7 @@ static void radish_single_eval(
     /* Stage-I local historical prior */
     double *wH = (double *)malloc(sizeof(double) * (size_t)nh);
     kernel_gauss_vec(Xh, nh, p, x_eval, h, wH);
-    double swH = 0.0, swH2 = 0.0, sumH = 0.0;
+    double swH = 0.0, sumH = 0.0;
     for (int j = 0; j < nh; ++j) { swH += wH[j]; }
 
     double theta, tau2H;
@@ -441,9 +536,7 @@ static void radish_single_eval(
         }
         s2 /= swH;
         if (s2 < EPS) s2 = EPS;
-        for (int j = 0; j < nh; ++j) swH2 += wH[j] * wH[j];
-        double neff = (swH * swH) / (swH2 > EPS ? swH2 : EPS);
-        if (neff < 1e-6) neff = 1e-6;
+        double neff = kernel_effective_n(wH, nh);
         tau2H = s2 / neff;
         if (tau2H < EPS) tau2H = EPS;
     }
@@ -451,20 +544,21 @@ static void radish_single_eval(
 
     /* Stage-II concurrent-control summary */
     double *w0 = (double *)malloc(sizeof(double) * (size_t)(n0 > 0 ? n0 : 1));
-    double Nc = 0.0, ybar = 0.0, s2c = 1.0;
+    double Nc_raw = 0.0, Nc_eff = 1e-6, ybar = 0.0, s2c = 1.0;
     if (n0 > 0) {
         kernel_gauss_vec(X0, n0, p, x_eval, h, w0);
-        for (int i = 0; i < n0; ++i) Nc += w0[i];
-        if (Nc > EPS) {
+        for (int i = 0; i < n0; ++i) Nc_raw += w0[i];
+        Nc_eff = kernel_effective_n(w0, n0);
+        if (Nc_raw > EPS) {
             double sy = 0.0;
             for (int i = 0; i < n0; ++i) sy += w0[i] * Y0[i];
-            ybar = sy / Nc;
+            ybar = sy / Nc_raw;
             double s2 = 0.0;
             for (int i = 0; i < n0; ++i) {
                 double d = Y0[i] - ybar;
                 s2 += w0[i] * d * d;
             }
-            s2 /= Nc;
+            s2 /= Nc_raw;
             s2c = s2 > EPS ? s2 : EPS;
         } else {
             ybar = 0.0; s2c = 1.0;
@@ -475,11 +569,13 @@ static void radish_single_eval(
     /* PDC discrepancy with canonical Evans–Moshonov (2006) standardization:
      *   SE^2 = tau2H + s2c / Nc_s
      *   Z    = (ȳ_c − θ) / SE
-     * The data sampling variance s2c/Nc_s is included so that under H0
-     * (no conflict) Z ~ N(0,1) by the CLT, calibrating the surprisal to
-     * its theoretical baseline E[D_PDC] ≈ 1 under H0 rather than the
-     * inflated value (~5) that arises from omitting this term.        */
-    double Nc_s = Nc > nc_floor ? Nc : nc_floor;
+     * The data sampling variance s2c/Nc_s places Z on its ideal
+     * standard-normal reference scale under compatibility and avoids the
+     * inflated discrepancy caused by omitting this term.              */
+    /* Nc_eff, not raw kernel mass, controls local concurrent SE and
+     * precision.  The configured floor remains the sparse-neighbourhood
+     * fallback used by the allocation and final-stage paths. */
+    double Nc_s = Nc_eff > nc_floor ? Nc_eff : nc_floor;
     double se2 = tau2H + s2c / Nc_s;
     if (se2 < EPS) se2 = EPS;
     double tau = sqrt(se2);
@@ -488,9 +584,30 @@ static void radish_single_eval(
     if (Z < -1e10) Z = -1e10;
     double pu = phi_cdf(Z);
     double pmin = pu < (1.0 - pu) ? pu : (1.0 - pu);
-    double pn = 2.0 * pmin;
-    if (pn < EPS) pn = EPS;
-    double Dn = -log(pn);
+    double kap = 2.0 * pmin;
+    if (kap < EPS) kap = EPS;
+
+    double Dn = 0.0, psi2_loc = 0.0;
+    switch (G_MAP) {
+    case MAP_CHISQ: {
+        double ex = Z * Z - 1.0;
+        Dn = ex > 0.0 ? 0.5 * G_LAM_LOC * ex : 0.0;
+        break; }
+    case MAP_EXCESS: {                       /* one-nat reference calibration */
+        double ex = -log(kap) - 1.0;         /* ideal standard-normal PIT scale */
+        Dn = ex > 0.0 ? ex : 0.0;
+        break; }
+    case MAP_MEDIAN: {
+        double ex = -log(kap) - M_LN2;       /* log 2 = median of -log kappa     */
+        Dn = ex > 0.0 ? ex : 0.0;
+        break; }
+    case MAP_EB: {                           /* moment estimate of psi^2         */
+        double d2 = (ybar - theta) * (ybar - theta);
+        psi2_loc = d2 > se2 ? d2 - se2 : 0.0;
+        break; }
+    default:
+        Dn = -log(kap);
+    }
 
     /* Hierarchical PDC: combine leaf-node (local) and root-node (trial-level)
      * surprisal via Fisher (1925) addition on the −log p scale.  Marshall &
@@ -501,8 +618,17 @@ static void radish_single_eval(
 
     /* Coherent R_n with combined SE² as prior-precision denominator
      * (Bayesian-coherent: posterior precision of μ_0 given (θ, ȳ_c)). */
-    double gD = exp(Dpdc);
-    double PiH = 1.0 / dmax(se2 * gD, EPS);
+    double den = G_USE_TAU ? tau2H : se2;
+    double PiH;
+    if (G_MAP == MAP_EB) {
+        /* Variance-additive form: the caller supplies the trial-level excess
+         * variance in Dg, which adds to the local excess on the variance
+         * scale rather than multiplying on the surprisal scale.            */
+        PiH = 1.0 / dmax(den + psi2_loc + Dg, EPS);
+        Dpdc = psi2_loc + Dg;
+    } else {
+        PiH = 1.0 / dmax(den * exp(Dpdc), EPS);
+    }
     double PiC = dmax(Nc_s / s2c, EPS);
     double Rn = 1.0 + PiH / PiC;
     if (Rn < 1.0) Rn = 1.0;
@@ -543,9 +669,138 @@ static double global_pdc_surprisal(
     if (Zg < -1e10) Zg = -1e10;
     double pu = phi_cdf(Zg);
     double pmin = pu < (1.0 - pu) ? pu : (1.0 - pu);
-    double pg = 2.0 * pmin;
-    if (pg < EPS) pg = EPS;
-    return -log(pg);
+    double kg = 2.0 * pmin;
+    if (kg < EPS) kg = EPS;
+
+    switch (G_MAP) {
+    case MAP_CHISQ: {
+        double ex = Zg * Zg - 1.0;
+        return ex > 0.0 ? 0.5 * G_LAM_GLB * ex : 0.0; }
+    case MAP_EXCESS: {
+        double ex = -log(kg) - 1.0;
+        return ex > 0.0 ? ex : 0.0; }
+    case MAP_MEDIAN: {
+        double ex = -log(kg) - M_LN2;
+        return ex > 0.0 ? ex : 0.0; }
+    case MAP_EB: {
+        /* trial-level excess variance: (Ybar_H - Ybar_C)^2 - SE_g^2 */
+        double d2 = (mH - m0) * (mH - m0), s2 = se * se;
+        return d2 > s2 ? d2 - s2 : 0.0; }
+    default:
+        return -log(kg);
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * Covariate-adjusted trial-level conflict check.
+ *
+ * The published Z_g compares the RAW means Ybar^C and Ybar^H, standardised by
+ * the MARGINAL sample variances.  Each marginal variance carries
+ * Var{mu_0(X)} on top of the residual noise.  That covariate variation is
+ * common to both cohorts and carries no information about conflict, so it
+ * inflates the standard error and strictly reduces the power of the check --
+ * in this design Var{mu_0(X)} is about half of s^2_C.
+ *
+ * The covariate-standardised discrepancy is the same g-formula contrast used
+ * for Delta_N, evaluated on the control side only:
+ *
+ *   delta_hat = (1/N) sum_i { mu0C_hat(X_i) - theta(X_i) } = a0'Y0 - aH'YH,
+ *   var_hat   = sigma0^2 ||a0||^2 + sigmaH^2 ||aH||^2,
+ *
+ * with a0, aH the averaged normalised kernel rows and sigma^2 the kernel
+ * residual variances already used by Stage III.  No new constants.
+ * ───────────────────────────────────────────────────────────────── */
+static double resid_var_kernel(const double *Xa, const double *Ya, int na,
+                               int p, const double *h)
+{
+    if (na < 3) {
+        if (na < 2) return EPS;
+        double m = 0.0; for (int i = 0; i < na; ++i) m += Ya[i]; m /= na;
+        double s = 0.0; for (int i = 0; i < na; ++i) { double d = Ya[i]-m; s += d*d; }
+        s /= (double)(na - 1);
+        return s > EPS ? s : EPS;
+    }
+    double *row = (double *)malloc(sizeof(double) * (size_t)na);
+    double rss = 0.0, trS = 0.0, trStS = 0.0;
+    for (int i = 0; i < na; ++i) {
+        kernel_gauss_vec(Xa, na, p, Xa + (size_t)i * p, h, row);
+        double sw = 0.0;
+        for (int j = 0; j < na; ++j) sw += row[j];
+        if (sw < EPS) sw = EPS;
+        double fit = 0.0;
+        for (int j = 0; j < na; ++j) {
+            row[j] /= sw;
+            fit += row[j] * Ya[j];
+            trStS += row[j] * row[j];
+        }
+        trS += row[i];
+        double r = Ya[i] - fit;
+        rss += r * r;
+    }
+    free(row);
+    double dof = (double)na - 2.0 * trS + trStS;
+    if (dof < 1.0) dof = 1.0;
+    double v = rss / dof;
+    return v > EPS ? v : EPS;
+}
+
+static double global_conflict_adjusted(
+    const double *X, int n,
+    const double *X0, const double *Y0, int n0,
+    const double *Xh, const double *Yh, int nh,
+    int p, const double *h)
+{
+    if (n0 < 2 || nh < 2) return 0.0;
+    double *a0 = (double *)calloc((size_t)n0, sizeof(double));
+    double *aH = (double *)calloc((size_t)nh, sizeof(double));
+    double *r0 = (double *)malloc(sizeof(double) * (size_t)n0);
+    double *rH = (double *)malloc(sizeof(double) * (size_t)nh);
+    for (int i = 0; i < n; ++i) {
+        const double *xi = X + (size_t)i * p;
+        kernel_gauss_vec(X0, n0, p, xi, h, r0);
+        kernel_gauss_vec(Xh, nh, p, xi, h, rH);
+        double s0 = 0.0, sH = 0.0;
+        for (int j = 0; j < n0; ++j) s0 += r0[j];
+        for (int j = 0; j < nh; ++j) sH += rH[j];
+        if (s0 < EPS) s0 = EPS;
+        if (sH < EPS) sH = EPS;
+        for (int j = 0; j < n0; ++j) a0[j] += r0[j] / s0;
+        for (int j = 0; j < nh; ++j) aH[j] += rH[j] / sH;
+    }
+    free(r0); free(rH);
+    double delta = 0.0, q0 = 0.0, qH = 0.0;
+    for (int j = 0; j < n0; ++j) { a0[j] /= n; delta += a0[j]*Y0[j]; q0 += a0[j]*a0[j]; }
+    for (int j = 0; j < nh; ++j) { aH[j] /= n; delta -= aH[j]*Yh[j]; qH += aH[j]*aH[j]; }
+    free(a0); free(aH);
+
+    double v0 = resid_var_kernel(X0, Y0, n0, p, h);
+    double vH = resid_var_kernel(Xh, Yh, nh, p, h);
+    double var = v0 * q0 + vH * qH;
+    if (var < EPS) return 0.0;
+    double Zg = -delta / sqrt(var);       /* sign convention: theta - mu0C */
+    if (Zg >  1e10) Zg =  1e10;
+    if (Zg < -1e10) Zg = -1e10;
+    double pu = phi_cdf(Zg);
+    double pmin = pu < (1.0 - pu) ? pu : (1.0 - pu);
+    double kg = 2.0 * pmin;
+    if (kg < EPS) kg = EPS;
+
+    switch (G_MAP) {
+    case MAP_CHISQ: {
+        double ex = Zg*Zg - 1.0;
+        return ex > 0.0 ? 0.5 * G_LAM_GLB * ex : 0.0; }
+    case MAP_EXCESS: {
+        double ex = -log(kg) - 1.0;
+        return ex > 0.0 ? ex : 0.0; }
+    case MAP_MEDIAN: {
+        double ex = -log(kg) - M_LN2;
+        return ex > 0.0 ? ex : 0.0; }
+    case MAP_EB: {
+        double d2 = delta*delta;
+        return d2 > var ? d2 - var : 0.0; }
+    default:
+        return -log(kg);
+    }
 }
 
 /* Batch version: produces R_n[i], W[i], D_pdc[i], tau²_H[i] for each X[i],
@@ -560,7 +815,9 @@ EXPORT void radish_diagnostics_batch(
     double *out_Rn, double *out_W,
     double *out_Dpdc, double *out_tau2H)
 {
-    double Dg = global_pdc_surprisal(Y0, n0, Yh, nh);
+    double Dg = G_ADJ_GLOBAL
+        ? global_conflict_adjusted(X, n, X0, Y0, n0, Xh, Yh, nh, p, h)
+        : global_pdc_surprisal(Y0, n0, Yh, nh);
     for (int i = 0; i < n; ++i) {
         double Rn, W, D, t2;
         radish_single_eval(X0, Y0, n0, Xh, Yh, nh, p, h,
@@ -600,12 +857,32 @@ EXPORT double radish_allocation_prob(
         }
     }
 
-    /* Allocation-time: use leaf-only surprisal (Dg=0).  The trial-level
-     * conflict signal needs accumulated trial data and only enters at
-     * Stage III via radish_diagnostics_batch.                           */
+    /* Allocation-time trial-level surprisal.  The default is the centered
+     * leaf-only map, D_n^A = (-log(kappa_n)-1)_+.  In legacy mode the old raw
+     * surprisal is used for reproducibility.  With G_SEQ_GLOBAL the root-node
+     * check is recomputed from controls accrued so far using only interim
+     * information, and the same commensurability map is applied.             */
     double Rn, W, D, t2;
-    radish_single_eval(X0, Y0, n0, Xh, Yh, nh, p, h_fit, x_new,
-                       nc_floor, 0.0, &Rn, &W, &D, &t2);
+    /* Stage II retains the predictive SE^2 precision denominator. The
+     * discrepancy-map choice is independent: centered by default, with the
+     * uncentered legacy map available only for explicit reproduction. */
+    double sv_ll = G_LAM_LOC, sv_lg = G_LAM_GLB;
+    int    sv_ut = G_USE_TAU, sv_mp = G_MAP;
+    G_USE_TAU = 0;
+    if (G_ALLOC_LEGACY) { G_LAM_LOC = 1.0; G_LAM_GLB = 1.0; G_MAP = MAP_LEGACY; }
+
+    double Dg_now = 0.0;
+    if (G_SEQ_GLOBAL && !G_ALLOC_LEGACY && n0 >= 2)
+        Dg_now = global_pdc_surprisal(Y0, n0, Yh, nh);
+
+    if (n0 < G_ALLOC_MIN_N0) {
+        Rn = 1.0;                       /* not enough concurrent controls yet */
+    } else {
+        radish_single_eval(X0, Y0, n0, Xh, Yh, nh, p, h_fit, x_new,
+                           nc_floor, Dg_now, &Rn, &W, &D, &t2);
+    }
+
+    G_LAM_LOC = sv_ll; G_LAM_GLB = sv_lg; G_USE_TAU = sv_ut; G_MAP = sv_mp;
     free(X0); free(Y0);
 
     /* Allocation: Gaussian-weighted local arm sizes (single kernel; the
@@ -625,6 +902,8 @@ EXPORT double radish_allocation_prob(
     double pi = (n0e * n0e) / (n0e * n0e + N1 * N1);
     if (pi < 0.0) pi = 0.0;
     if (pi > 1.0) pi = 1.0;
+    if (pi < G_PHI_LO) pi = G_PHI_LO;
+    if (pi > G_PHI_HI) pi = G_PHI_HI;
     return pi;
 }
 

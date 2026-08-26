@@ -2,15 +2,15 @@
 
 Reference implementation for **Robust Adaptive Discrepancy-Informed Shrinkage for Historical Borrowing in Clinical Trials** by Hengtao Zhang, Yuanke Qu, and Huaqing Jin.
 
-RADISH is a covariate-adaptive randomized design that borrows information from external controls only where historical and concurrent controls are locally compatible. A single Gaussian product kernel is used throughout planning, sequential allocation, and final estimation. Historical borrowing is discounted by a local historical-concurrent conflict diagnostic and falls back toward the concurrent-only KBCD design when the sources disagree.
+RADISH is a covariate-adaptive randomized design that borrows information from external controls only where historical and concurrent controls are locally compatible. A single Gaussian product kernel is used throughout planning, sequential allocation, and final estimation. Both sequential allocation and final analysis use the centered excess-surprisal conflict score $D=(-\log\kappa-1)_+$ and the reference-predictive variance scale; incompatible historical information is discounted and the design moves toward the concurrent-only KBCD baseline as conflict increases.
 
 ## Installation
 
 Python 3.9 or newer is recommended.
 
 ```bash
-git clone https://github.com/BobZhangHT/CAHB-PP.git
-cd CAHB-PP
+git clone https://github.com/BobZhangHT/HistInfoBorrow.git
+cd HistInfoBorrow
 python -m pip install -r requirements.txt
 ```
 
@@ -20,77 +20,66 @@ The pure-Python implementation works without compilation. An optional C backend 
 python build_c.py
 ```
 
-On Windows with MinGW, use:
-
-```bash
-python build_c.py --mingw
-```
-
-The build creates `radish_core.dll` or `radish_core.so` beside `methods_c.py`. `main.py` detects the library automatically and otherwise uses `methods.py`. Set `RADISH_BACKEND=python` to force the reference implementation or `RADISH_BACKEND=c` to require the compiled backend.
+On Windows with MinGW, use `python build_c.py --mingw`. Add `--self-test` to run the centered Stage-II and Stage-III Python/C parity checks immediately after compilation. The build creates `radish_core.dll`, `radish_core.so`, or `radish_core.dylib` beside `methods_c.py`. `main.py` detects the library automatically and otherwise uses `methods.py`. Set `RADISH_BACKEND=python` to force the reference implementation or `RADISH_BACKEND=c` to require the compiled backend.
 
 ## Synthetic simulation study
 
-The primary experiment is a three-by-two bias and precision design. The historical mean shift is `b_H ∈ {0, 0.5, 2.0}`, and the historical outcome standard deviation is `σ_H ∈ {0.5, 3.0}`. The concurrent and default historical sample sizes are both 200.
+The primary experiment is a four-by-two conflict-and-precision design. Historical mean shift is `b_H in {0, 0.1, 0.5, 2.0}`, representing compatible, low-, moderate-, and severe-conflict regimes. Historical outcome standard deviation is `sigma_H in {0.5, 3.0}`. Concurrent and default historical sample sizes are both 200.
 
 | Scenario | Historical bias | Historical SD | Interpretation |
 |:--|--:|--:|:--|
-| B1 | 0.0 | 0.5 | Compatible and precise |
-| B2 | 0.0 | 3.0 | Compatible but noisy |
-| B3 | 0.5 | 0.5 | Moderate conflict, precise history |
-| B4 | 0.5 | 3.0 | Moderate conflict, noisy history |
-| B5 | 2.0 | 0.5 | Severe conflict, precise history |
-| B6 | 2.0 | 3.0 | Severe conflict, noisy history |
+| S1 | 0.0 | 0.5 | Compatible and precise |
+| S2 | 0.0 | 3.0 | Compatible but noisy |
+| S3 | 0.1 | 0.5 | Low conflict, precise history |
+| S4 | 0.1 | 3.0 | Low conflict, noisy history |
+| S5 | 0.5 | 0.5 | Moderate conflict, precise history |
+| S6 | 0.5 | 3.0 | Moderate conflict, noisy history |
+| S7 | 2.0 | 0.5 | Severe conflict, precise history |
+| S8 | 2.0 | 3.0 | Severe conflict, noisy history |
 
 Run from the repository root:
 
 ```bash
-# Ten-replication smoke test
+# Ten replications per cell: smoke test of the complete four-regime grid
 python main.py --mode demo --jobs 4
 
-# Main paper experiment, 1000 replications per cell
+# Main paper experiment: 1000 replications per cell, 48000 fits total
 python main.py --mode full --jobs 8
 
-# Supplementary precision-gradient experiment
+# Validate the formal result contract and recomputed summaries
+python main.py --mode full --validate-only
+
+# Supplementary sensitivity experiments
 python main.py --mode precision --jobs 8
-
-# Supplementary bias-gradient experiment
 python main.py --mode bias --jobs 8
-
-# Paired historical-size sensitivity, N_H = 200 versus 400
+python main.py --mode bias --validate-only
 python main.py --mode hist_size --jobs 8
+python main.py --mode hist_size --validate-only
 ```
 
-All modes use seed 2026 by default. Set `--seed` to change it. `--reps` is available for short `hist_size` checks, for example:
+The `bias` mode is a focused low-conflict experiment on
+`xi in {0, .01, .02, .04, .08, .16}`, with
+`b_theta = 2 * xi * sigma_C`. Its operating-characteristic figure uses a
+zero-aware base-2 logarithmic axis. The primary `full` mode still contains
+the moderate and severe stress tests, so the focused plot does not replace
+robustness evidence outside the favorable borrowing region.
 
-```bash
-python main.py --mode hist_size --reps 2 --jobs 2
-```
+All modes use seed 2026 by default. `--seed` changes it except for the optimized formal `hist_size` workflow described below. `--reps` is available for short `hist_size` checks. Outputs are written under `results/<mode>/` as `raw_results.csv`, `metrics.csv`, `plots/`, and `tables/`. Generated results are intentionally excluded from Git.
 
-Results are written to `results/<mode>/`:
-
-```text
-results/<mode>/
-|-- raw_results.csv
-|-- metrics.csv
-|-- plots/
-`-- tables/
-```
-
-The historical-size mode uses nested historical cohorts and common random-number streams within each paired comparison. Its dedicated summaries and figures are generated by `historical_size_analysis.py` and include the RADISH sensitivity plot and the B3/B4 robustness plot.
+The formal historical-size workflow requires a validated `results/full/raw_results.csv` generated with the default seed. It reuses all 48,000 primary `N_H=200` rows and computes only the 48,000 new `N_H=400` rows, halving the two-size fitting workload. Each larger cohort preserves the first 200 historical observations and the concurrent covariate/outcome-innovation stream, then appends 200 observations from a cloned post-prefix RNG state. Adaptive assignments can differ because the historical reference and planning bandwidth change. The resulting `N_H=400` cohort is a deterministic counterfactual extension, not an independent historical draw. The pairing contract is recorded in `results/hist_size/hist_size_pairing_manifest.json`, and dedicated summaries and figures are generated by `historical_size_analysis.py`. A custom `--seed` is rejected because the stored primary result currently has no seed metadata.
 
 ## Real-data-calibrated study
 
-The application uses HORIZON and FIT participant-level data. These data are restricted and are not distributed in this repository. After obtaining access under the applicable data-use agreements, place the merged file at `real_data/dat_merge.csv`. The required schema is documented in `real_data/real_setup.py`.
-
-Run the pipeline in order:
+The application uses restricted HORIZON and FIT participant-level data, which are not distributed in this repository. After obtaining access under the applicable data-use agreements, place the merged file at `real_data/dat_merge.csv`; the required schema is documented in `real_data/real_setup.py`. The formal grid contains `N=200`, a 20-participant burn-in, historical sizes `{30,110,190,270,350}`, conflict levels `{0,.01,.02,.04,.08,.16,.32,.64,1}`, three methods, two effect settings, and 1000 replications per cell.
 
 ```bash
 python real_data/real_setup.py
-python real_data/real_run.py
+python real_data/real_run.py --reps 1000 --jobs 6
+python real_data/real_run.py --validate-only
 python real_data/real_figures.py
 ```
 
-The first command estimates the working-model parameters, the second runs the calibrated simulation, and the third creates the figures and scenario table.
+The experiment contains 270,000 fits. The integrated validator checks the grid, replication counts, identifiers, finite outputs, and writes a SHA-256 manifest before figures are generated.
 
 ## Methods and implementation
 
@@ -100,34 +89,41 @@ The first command estimates the working-model parameters, the second runs the ca
 | CAHB | `methods.py::CAHB` | Variance-ratio borrowing |
 | KBCD | `methods.py::KBCD` | Concurrent-only baseline |
 
-`methods.py` is the reference implementation. `methods_c.py` exposes matching C-backed classes through `ctypes`, and `c_src/radish_core.c` contains the native kernels. `analysis.py` generates the main simulation tables and vector PDF figures. The simulation entry points set BLAS thread counts to one before importing NumPy so that process-level parallel runs do not create nested numerical threads.
+`methods.py` is the reference implementation. `methods_c.py` exposes matching C-backed classes through `ctypes`, and `c_src/radish_core.c` contains the native kernels. The production Python and C paths both use centered Stage-II allocation by default; the legacy uncentered map remains available only for explicit historical-reproducibility checks. `analysis.py` and `real_data/real_figures.py` generate the publication figures.
 
 ## Repository layout
 
 ```text
 .
-|-- main.py                       simulation command-line entry point
-|-- config.py                     scenarios, sample sizes, and runtime settings
-|-- methods.py                    pure-Python KBCD, CAHB, and RADISH
-|-- methods_c.py                  optional C-backed implementations
-|-- historical_size_analysis.py  paired N_H sensitivity summaries and figures
-|-- analysis.py                   main tables and publication figures
-|-- build_c.py                    native-library build helper
-|-- c_src/radish_core.c           C kernels
-|-- real_data/                    restricted-data reproduction scripts
+|-- main.py                         synthetic simulation entry point
+|-- config.py                       scenarios and runtime settings
+|-- methods.py                      pure-Python implementations
+|-- methods_c.py                    optional C-backed implementations
+|-- analysis.py                     synthetic tables and figures
+|-- historical_size_analysis.py    historical-size sensitivity analysis
+|-- build_c.py                      native-library build helper
+|-- c_src/radish_core.c             C kernels
+|-- real_data/                      restricted-data reproduction scripts
 |-- requirements.txt
 `-- LICENSE
 ```
 
-Generated outputs, compiled libraries, restricted data, manuscripts, and the local `archive/` directory are excluded by `.gitignore`.
+Generated outputs, native binaries, restricted data, manuscripts, and the local `archive/` directory are excluded by `.gitignore`.
 
-## Reproducibility notes
+## Reproducibility checks
 
-- The default seed is fixed in the command-line runners.
-- Joblib uses process-level parallelism; BLAS libraries are restricted to one thread per worker.
-- The C backend is optional. Use `RADISH_BACKEND=python` when validating the reference implementation.
-- Historical-size comparisons are paired across methods and sample sizes.
-- Full experiments can take several minutes depending on the backend and worker count.
+```bash
+python -B -c "import config, methods, analysis, historical_size_analysis; import real_data.real_scenarios, real_data.real_run, real_data.real_figures"
+python build_c.py --self-test
+python main.py --mode demo --jobs 4
+python main.py --mode demo --validate-only
+python real_data/real_run.py --validate-only
+```
+
+- Command-line runners fix the default seed.
+- Joblib uses process-level parallelism and each worker restricts BLAS libraries to one thread.
+- The C backend is optional; use `RADISH_BACKEND=python` to validate the reference implementation.
+- The manuscript's formal numerical claims are based only on result files that pass the corresponding validator.
 
 ## Citation
 

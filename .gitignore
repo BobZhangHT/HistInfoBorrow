@@ -8,6 +8,8 @@ __pycache__/
 *.nbi
 *.nbc
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 .tox/
@@ -48,12 +50,14 @@ simulation_cache/
 # Restricted real-data inputs and generated outputs
 real_data/*
 !real_data/*.py
+!real_data/README.md
 
 # Manuscripts, reference material, and LaTeX build products
 docs/
 references/
 papers/
 *.pdf
+*.png
 *.tex
 *.aux
 *.bbl
@@ -90,3 +94,7 @@ papers/
 Thumbs.db
 desktop.ini
 *~
+tmp/
+reports/
+# Internal revision notes are not part of the public package
+REVISION_PLAN.md

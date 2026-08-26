@@ -1,9 +1,10 @@
 """
-config.py — Simulation configuration (3×2 factorial design).
+config.py — Simulation configuration for the primary 4×2 design.
 
-Clean 3×2 factorial grid:
+Primary 4×2 conflict-by-precision grid:
                     High precision (σ_H=0.5)        Low precision (σ_H=3.0)
   No bias (b=0)     B1: ideal borrowing              B2: noisy but unbiased
+  Low bias (b=0.1)  L1: useful borrowing remains     L2: noisy low conflict
   Mod bias (b=0.5)  B3: precise bias → CAHB traps    B4: hidden bias in noise
   Large bias (b=2)  B5: all methods detect            B6: all methods detect
 
@@ -32,7 +33,7 @@ SIGMA_1 = 1.2    # treatment arm noise SD (heteroscedastic)
 
 EFFECT_SIZES = {"Null": 0.0, "Power": 0.5}
 
-# ── Simulation Scenarios (3×2 factorial) ──────────────────────────
+# ── Original six-scenario subset (stable B1--B6 identifiers) ───────
 # Y^H = μ₀^C(X) + b_θ + ε_H,   ε_H ~ N(0, σ_H²)
 #
 # Bias levels:   b = 0.0 (none), 0.5 (moderate), 2.0 (large)
@@ -53,11 +54,29 @@ SCENARIOS = {
         "description": "Large bias, noisy — all methods detect conflict"},
 }
 
+# ── Primary four-regime grid used by demo and full modes ────────────────
+# L1/L2 add the low-conflict transition while preserving B1--B6 meanings.
+PRIMARY_SCENARIOS = {
+    "B1_noBias_highPrec":  SCENARIOS["B1_noBias_highPrec"],
+    "B2_noBias_lowPrec":   SCENARIOS["B2_noBias_lowPrec"],
+    "L1_lowBias_highPrec": {"b_theta": 0.1, "sigma_h": 0.5,
+        "description": "Low conflict and precise — useful borrowing should remain"},
+    "L2_lowBias_lowPrec":  {"b_theta": 0.1, "sigma_h": 3.0,
+        "description": "Low conflict but noisy — limited information gain"},
+    "B3_mdBias_highPrec":  SCENARIOS["B3_mdBias_highPrec"],
+    "B4_mdBias_lowPrec":   SCENARIOS["B4_mdBias_lowPrec"],
+    "B5_lgBias_highPrec":  SCENARIOS["B5_lgBias_highPrec"],
+    "B6_lgBias_lowPrec":   SCENARIOS["B6_lgBias_lowPrec"],
+}
+
 # ── Kernel ───────────────────────────────────────────────────────
 # A single Gaussian product kernel is used for every stage (Stage I/II/III
 # and the allocation rule).  Its per-dimension bandwidth is set by Scott's
 # rule of thumb h_j = n^{-1/(p+4)} * sigma_j (see methods.kernel_bandwidths);
 # there is no separate fitting/allocation kernel and no hand-tuned bandwidth.
+
+# Backwards-compatible name used by older downstream scripts.
+DEMO_SCENARIOS = PRIMARY_SCENARIOS
 
 # ── Method hyperparameters ───────────────────────────────────────
 PRIORS = {
@@ -94,16 +113,25 @@ PRECISION_SCENARIOS = _build_precision_scenarios()
 # fine grid at fixed σ_H = 0.5 to verify the quadratic-in-b growth
 # of D_PDC and the exponential collapse of W in the unsaturated
 # regime (i.e. before D_PDC hits the −log(ε_p) ≈ 27.6 cap).
-BIAS_GRID = [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50]
+# Focused low-conflict grid.  We use the same dimensionless parameter as the
+# real-data-calibrated study: b_theta = 2 * xi * sigma_C.  Here
+# sigma_C=SIGMA_0=1, so the requested doubling grid maps to
+# b_theta={0,.02,.04,.08,.16,.32}.  Moderate and severe conflict remain in
+# the primary 4x2 experiment at b_theta=.5 and 2.
+BIAS_XI_GRID = [0.0, 0.01, 0.02, 0.04, 0.08, 0.16]
+BIAS_GRID = [2.0 * xi * SIGMA_0 for xi in BIAS_XI_GRID]
 BIAS_GRID_SIGMA_H = 0.5
 
 def _build_bias_scenarios():
     out = {}
-    for b in BIAS_GRID:
-        key = f"G_b{b:g}".replace(".", "p")
+    for xi, b in zip(BIAS_XI_GRID, BIAS_GRID):
+        key = f"G_xi{xi:g}".replace(".", "p")
         out[key] = {"b_theta": float(b), "sigma_h": float(BIAS_GRID_SIGMA_H),
-                    "description": f"Bias gradient b={b}, σ_H={BIAS_GRID_SIGMA_H}",
-                    "_grid_bias_value": float(b)}
+                    "xi": float(xi),
+                    "description": (f"Low-conflict gradient xi={xi}, "
+                                    f"b_theta={b}, sigma_H={BIAS_GRID_SIGMA_H}"),
+                    "_grid_bias_value": float(b),
+                    "_grid_xi_value": float(xi)}
     return out
 
 BIAS_SCENARIOS = _build_bias_scenarios()
@@ -112,7 +140,7 @@ BIAS_SCENARIOS = _build_bias_scenarios()
 N_REPS_DEMO       = 10
 N_REPS_FULL       = 1000
 N_REPS_PRECISION  = 500   # 12 cells × 500 reps = 6000 trials/method
-N_REPS_BIAS       = 500   # 10 cells × 500 reps
+N_REPS_BIAS       = 500   # 6 xi cells x 2 effects x 3 methods x 500 reps
 N_REPS_HIST_SIZE  = 1000
 
 # Historical-sample-size sensitivity analysis. The larger case doubles the
@@ -128,6 +156,8 @@ def get_mode_replications(mode):
 
 def get_mode_scenarios(mode):
     """Return the scenario dict for a given mode."""
+    if mode in {"demo", "full", "hist_size"}:
+        return PRIMARY_SCENARIOS
     if mode == "precision":
         return PRECISION_SCENARIOS
     if mode == "bias":
@@ -137,7 +167,7 @@ def get_mode_scenarios(mode):
 # ── Output & Runtime ─────────────────────────────────────────────
 RESULTS_ROOT   = "results"
 N_JOBS         = 4
-SCENARIO_ORDER = list(SCENARIOS.keys())
+SCENARIO_ORDER = list(PRIMARY_SCENARIOS.keys())
 METHOD_ORDER   = ["KBCD", "CAHB", "RADISH"]
 EFFECT_ORDER   = ["Null", "Power"]
 

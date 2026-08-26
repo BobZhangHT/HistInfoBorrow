@@ -1,597 +1,613 @@
-"""
-real_figures.py — Three figures + Table 1 for the (ξ, η) real-data study.
-
-  F1   Working-model summary + scenario factorial map.
-  F2   Marginal effects: alloc / |bias| / power vs ξ (η fixed) and vs η (ξ fixed).
-  F3   ξ × η interaction: heatmaps of W̄, |bias_CAHB - bias_RADISH|,
-       and the RADISH bias-control advantage over the entire grid.
-  T1   Working-model parameters + scenario design (CSV + Markdown).
-"""
+"""Generate publication figures and tables for the real-data study."""
 from __future__ import annotations
+
 import pickle
 from pathlib import Path
+import sys
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
+from matplotlib.lines import Line2D
+from matplotlib.ticker import NullFormatter
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
-from matplotlib.colors import TwoSlopeNorm
 from scipy.stats import gaussian_kde
 
 ROOT = Path(__file__).resolve().parents[1]
-PARAMS_PKL  = ROOT / "real_data" / "real_params.pkl"
-RUN_CSV     = ROOT / "real_data" / "real_run_results.csv"
-DATA_CSV    = ROOT / "real_data" / "dat_merge.csv"
-FIG_DIR     = ROOT / "real_data" / "figures"
-TABLE_OUT   = ROOT / "real_data" / "table1_scenarios.csv"
-FIG_DIR.mkdir(exist_ok=True, parents=True)
+sys.path.insert(0, str(ROOT))
 
-import sys; sys.path.insert(0, str(ROOT))
+from analysis import (
+    COL2_W,
+    DIV_CMAP,
+    METHOD_COLORS,
+    METHOD_LABELS,
+    METHOD_MARKERS,
+    METHOD_ORDER,
+    PUB_RC,
+    SEQ_CMAP,
+)
 from real_data.real_scenarios import (
-    XI_GRID as _XI_GRID_RAW, ETA_GRID, n_H_of_eta, NH_MIN, NH_MAX,
-    N_CURRENT, N_REPS,
+    ETA_GRID,
+    INTERIM_START,
+    N_CURRENT,
+    N_REPS,
+    XI_GRID,
+    XI_REGIMES,
+    n_H_of_eta,
 )
 
-# Normalise the bias dial ξ to [0, 1] for presentation while keeping the
-# raw DGP scale (raw ξ ∈ [0, 2] = bias multiplier in σ_C units) intact
-# in the simulation CSV.  All plots and grid lookups use the normalised
-# dial ξ_dial = raw / XI_RAW_MAX.
-XI_RAW_MAX = max(_XI_GRID_RAW)         # = 2.0
-XI_GRID    = [x / XI_RAW_MAX for x in _XI_GRID_RAW]   # [0, 0.125, 0.25, 0.5, 1.0]
+PARAMS_PKL = ROOT / "real_data" / "real_params.pkl"
+RUN_CSV = ROOT / "real_data" / "real_run_results.csv"
+FIG_DIR = ROOT / "real_data" / "figures"
+TABLE1_CSV = ROOT / "real_data" / "table1_scenarios.csv"
+TABLE2_CSV = ROOT / "real_data" / "table2_operating_characteristics.csv"
+TABLE2_TEX = ROOT / "real_data" / "table2_operating_characteristics.tex"
+FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+plt.rcParams.update(PUB_RC)
+
+ALPHA = 0.05
+DELTA_POWER = 0.14
+SUBGROUP_COLORS = ["#B64342", "#E9A6A1", "#767676", "#0F4D92"]
+METHOD_STYLES = {"KBCD": "--", "CAHB": "-", "RADISH": "-"}
+def _load_params():
+    with PARAMS_PKL.open("rb") as handle:
+        return pickle.load(handle)
 
 
-def _normalise_xi(df):
-    """Convert the simulation CSV's raw ξ values (∈ [0, 2]) to the
-    presentation dial ξ_dial ∈ [0, 1] used on every plot axis."""
-    out = df.copy()
-    out["xi"] = out["xi"] / XI_RAW_MAX
-    return out
-
-
-def _sigma_h_ratio_of_eta(eta):
-    """σ_h is now fixed at σ_C (so ratio = 1) — kept for backwards
-    compatibility; obsolete labels still call this."""
-    return 1.0
-
-
-METHOD_COLORS = {"KBCD": "#1f77b4", "CAHB": "#d62728", "RADISH": "#2ca02c"}
-METHOD_ORDER  = ["KBCD", "CAHB", "RADISH"]
-SUBGROUP_COLORS = ["#d62728", "#ff7f0e", "#2ca02c", "#9467bd"]
-ALPHA_LEVEL = 0.05
-# Power test alternative: empirical δ=0.349 with N_C=200 saturates power
-# at 1.0 for every method, washing out comparisons.  We report calibrated
-# power against a moderate alternative δ_test, which is equivalent to the
-# real trial under a smaller true effect.  Borrowing-induced bias is
-# delta-independent (depends only on ξ·σ_C), so this is a valid post-hoc
-# rescaling: new_est = old_est − (δ_emp − δ_test) preserves the bias
-# structure of every method.
-#
-# Match the DGP treatment effect (real_run.DELTA_DGP) exactly so the
-# post-hoc shift becomes a no-op and the reported calibrated power is
-# at the simulated nominal alternative.  DELTA_DGP = 0.5 (B-sim
-# baseline) gives KBCD nominal power ≈ 0.8 at α = 0.05 under σ_C = 1.
-DELTA_TEST = 0.5
-
-
-# ====================================================================
-# Helpers
-# ====================================================================
-def _load_real_data():
-    df = pd.read_csv(DATA_CSV)
-    df = df[(df["STUDY"] != "SOF") & (df["race"] == 1)]
-    cur = (df["STUDY"] == "ZOL")  & (df["age"] >= 80)
-    his = (df["STUDY"] != "ZOL") & (df["age"] >= 78)
-    df = df[cur | his].copy()
-    df["falls"] = df["falls"].astype(float)
-    df["frx"]   = df["frxvert"].astype(float)
-    df["Y"]     = df["dxhhp_24"].astype(float)
-    df["Z"]     = df["TRTN"].astype(float)
-    return df.dropna(subset=["falls", "frx", "Y", "Z"])
-
-
-def _gen_scenario_sample(params, xi, eta, rng_seed=11111):
-    sys.path.insert(0, str(ROOT))
+def _generate_historical(params, xi, eta, seed):
     from real_data.real_run import _gen_historical
-    rng = np.random.default_rng(rng_seed)
+
+    rng = np.random.default_rng(seed)
     return _gen_historical(params, eta, xi, rng)
 
 
-def _size_corrected(df, alpha=ALPHA_LEVEL, delta_test=DELTA_TEST,
-                    group_keys=("xi", "eta", "method")):
-    """Compute calibrated power, RMSE, etc. per group.  The H1 estimates
-    are post-hoc shifted by (δ_emp − δ_test) so that the reported power
-    corresponds to a moderate alternative δ_test (the empirical δ
-    saturates power at 1).  By default groups by (ξ, η, method); pass
-    group_keys=('xi','method') or ('eta','method') to obtain marginal
-    statistics that **pool** reps across the other axis (true marginal:
-    H0 critical c is computed on the pooled H0 distribution, then
-    applied to the pooled H1 distribution)."""
-    out = []
-    for keys, g in df.groupby(list(group_keys)):
-        if not isinstance(keys, tuple):
-            keys = (keys,)
-        kd = dict(zip(group_keys, keys))
-        xi  = kd.get("xi",  np.nan)
-        eta = kd.get("eta", np.nan)
-        m   = kd["method"]
-        h0 = g[g["effect"] == "Null"].copy()
-        h1 = g[g["effect"] == "Power"].copy()
-        delta_emp = float(h1["delta_true"].iloc[0])
-        if delta_test is not None and delta_test != delta_emp:
-            h1["est"]        = h1["est"] - (delta_emp - delta_test)
-            h1["lo"]         = h1["lo"]  - (delta_emp - delta_test)
-            h1["hi"]         = h1["hi"]  - (delta_emp - delta_test)
-            h1["delta_true"] = delta_test
-        for sub in (h0, h1):
-            sub["se"]   = (sub["hi"] - sub["lo"]) / (2.0 * 1.959964)
-            sub["zabs"] = np.abs(sub["est"]) / sub["se"].clip(1e-9)
-        c = float(np.quantile(h0["zabs"], 1 - alpha))
-        delta1 = float(h1["delta_true"].iloc[0])
-        bias_est = float(h1["est"].mean() - delta1)
-        bias_se  = float(h1["est"].std(ddof=1) / np.sqrt(len(h1)))
-        power    = float((h1["zabs"] > c).mean())
-        power_se = float(np.sqrt(power * (1 - power) / len(h1)))
-        sq_err   = (h1["est"] - delta1) ** 2
-        rmse     = float(np.sqrt(sq_err.mean()))
-        # Delta-method SE for sqrt(mean(sq_err)):  SE(RMSE) ≈ SE(MSE) / (2·RMSE).
-        mse_se   = float(sq_err.std(ddof=1) / np.sqrt(len(sq_err)))
-        rmse_se  = float(mse_se / (2 * rmse)) if rmse > 1e-12 else 0.0
-        out.append(dict(
-            xi=xi, eta=eta, method=m,
-            n_H=int(g["n_H"].iloc[0]),
-            type1_calib=alpha, power=power, power_se=power_se,
-            bias_h1=bias_est, abs_bias_h1=abs(bias_est), bias_h1_se=bias_se,
-            rmse_h1=rmse, rmse_h1_se=rmse_se,
-            mean_W=float(g["mean_W"].mean()),
-            alloc_overall=float(h1["alloc_overall"].mean()),
-            alloc_sg1=float(h1["alloc_sg1"].mean()),
-            alloc_sg2=float(h1["alloc_sg2"].mean()),
-            alloc_sg3=float(h1["alloc_sg3"].mean()),
-            alloc_sg4=float(h1["alloc_sg4"].mean()),
-        ))
-    return pd.DataFrame(out)
-
-
-# ====================================================================
-# Table 1
-# ====================================================================
-def make_T1(params):
-    sg_dist = params["sg_dist_hist"]
+def summarize_results(raw, alpha=ALPHA):
+    """Compute operating characteristics for every design cell."""
     rows = []
-    rows.append(dict(
-        Component="Outcome model (current trial)",
-        Symbol=r"Y_C = β₀(X₁,X₂) + β₁(X₁,X₂)·X₃_std + β₂(X₁,X₂)·X₄_std + δ·Z + ε_C",
-        Meaning="HORIZON-fitted; intercept and slopes per (falls, frx)",
-        Coefficients=f"β fitted (Table A); δ={round(params['delta_curr'],4)}; "
-                     f"σ_C={round(params['sigma_curr'],4)}",
-    ))
-    rows.append(dict(
-        Component="Outcome model (historical trial)",
-        Symbol=r"Y_H = α₀(X₁,X₂) + α₁(X₁,X₂)·X₃_std + α₂(X₁,X₂)·X₄_std + δ_H·Z + ε_H",
-        Meaning="FIT-fitted; α slopes and δ_H inherit empirical FIT regression",
-        Coefficients=f"α₁,α₂ fitted from FIT; α₀ = β₀ + ξ·σ_C; "
-                     f"δ_H={round(params['delta_hist'],4)}; "
-                     f"σ_H={round(params['sigma_hist'],4)}",
-    ))
-    rows.append(dict(
-        Component="Subgroup distribution",
-        Symbol=r"P(X₁=x₁,X₂=x₂)",
-        Meaning="Empirical FIT-cohort proportions",
-        Coefficients=", ".join(f"sg{k+1}={p:.3f}" for k, p in enumerate(sg_dist)),
-    ))
-    rows.append(dict(
-        Component="Continuous covariates",
-        Symbol=r"(X₃, X₄)_std | sg_k",
-        Meaning="Per-subgroup gaussian KDE on standardized (menyrs, baseline BMD)",
-        Coefficients="Bandwidth: Scott's rule",
-    ))
-    rows.append(dict(
-        Component="Sensitivity: bias",
-        Symbol="ξ ∈ [0,1]",
-        Meaning="Uniform shift of historical intercepts in σ_C units",
-        Coefficients=f"Grid: {', '.join(str(x) for x in XI_GRID)}",
-    ))
-    rows.append(dict(
-        Component="Sensitivity: precision",
-        Symbol="η ∈ [0,1]",
-        Meaning=f"Maps to historical control sample size n_H(η) ∈ [{NH_MIN}, {NH_MAX}]",
-        Coefficients=f"Grid: {', '.join(str(round(e,2)) for e in ETA_GRID)} → "
-                     f"n_H ∈ {{{', '.join(str(n_H_of_eta(e)) for e in ETA_GRID)}}}",
-    ))
-    rows.append(dict(
-        Component="Trial geometry",
-        Symbol=r"(N_C, t_interim)",
-        Meaning="Current trial size and interim freeze",
-        Coefficients=f"N_C = {N_CURRENT};  t_interim = 12; reps = {N_REPS}/cell",
-    ))
-    df = pd.DataFrame(rows)
-    df.to_csv(TABLE_OUT, index=False, encoding="utf-8")
+    group_cols = ["xi", "eta", "method"]
+    for keys, group in raw.groupby(group_cols, sort=True):
+        xi, eta, method = keys
+        null = group[group["effect"] == "Null"].copy()
+        power = group[group["effect"] == "Power"].copy()
+        if len(null) != N_REPS or len(power) != N_REPS:
+            raise ValueError(f"unexpected replication count in {(xi, eta, method)}")
+        if not np.allclose(power["delta_true"], DELTA_POWER):
+            raise ValueError("power alternative does not match DELTA_POWER")
 
-    md = []
-    md.append("# Table 1. Working model and scenario design for the real-data study\n")
-    md.append("| Component | Symbol | Meaning | Coefficients / values |")
-    md.append("|---|---|---|---|")
-    for _, r in df.iterrows():
-        md.append("| " + " | ".join(str(r[c]) for c in df.columns) + " |")
-    md.append("\n**Notes**: All standardisation uses HORIZON moments. "
-              "The (ξ, η) grid yields {0} bias-precision combinations, "
-              "each replicated {1} times per method × effect.\n".format(
-                  len(XI_GRID) * len(ETA_GRID), N_REPS))
-    md.append("**Per-subgroup β coefficients (HORIZON-fitted)**:\n")
-    md.append("| sg | (X₁,X₂) | β₀ (intercept) | β₁ (menyrs_std) | β₂ (Y0_std) |")
-    md.append("|---|---|---|---|---|")
-    bc = params["beta_curr"]
-    for k in range(4):
-        x1, x2 = k & 1, (k >> 1) & 1
-        md.append(f"| sg{k+1} | ({x1},{x2}) | {bc['b0'][k]:+.4f} | "
-                  f"{bc['b_menyrs'][k]:+.4f} | {bc['b_Y0'][k]:+.4f} |")
-    md.append("")
-    md.append("**Per-subgroup α coefficients (FIT-fitted)**:\n")
-    md.append("| sg | (X₁,X₂) | α₀ (intercept @ ξ=0) | α₁ (menyrs_std) | α₂ (Y0_std) |")
-    md.append("|---|---|---|---|---|")
-    ah = params["alpha_hist"]
-    for k in range(4):
-        x1, x2 = k & 1, (k >> 1) & 1
-        md.append(f"| sg{k+1} | ({x1},{x2}) | {bc['b0'][k]:+.4f} | "
-                  f"{ah['b_menyrs'][k]:+.4f} | {ah['b_Y0'][k]:+.4f} |")
-    md.append("")
-    with open(TABLE_OUT.with_suffix(".md"), "w", encoding="utf-8") as f:
-        f.write("\n".join(md))
-    print(f"[T1] -> {TABLE_OUT}")
-    return df
+        for sample in (null, power):
+            sample["se"] = (sample["hi"] - sample["lo"]) / (2 * 1.959964)
+            sample["zabs"] = np.abs(sample["est"]) / sample["se"].clip(1e-12)
+
+        critical = float(np.quantile(null["zabs"], 1 - alpha))
+        delta = DELTA_POWER
+        errors = power["est"] - delta
+        abs_errors = np.abs(errors)
+        sq_errors = errors**2
+
+        calibrated_power = float((power["zabs"] > critical).mean())
+        type1 = float(null["rejected"].mean())
+        coverage = float(((power["lo"] <= delta) & (power["hi"] >= delta)).mean())
+        mae = float(abs_errors.mean())
+        rmse = float(np.sqrt(sq_errors.mean()))
+        mse_se = float(sq_errors.std(ddof=1) / np.sqrt(len(sq_errors)))
+
+        rows.append(
+            dict(
+                xi=float(xi),
+                eta=float(eta),
+                method=method,
+                n_H=int(group["n_H"].iloc[0]),
+                n_rep_h0=len(null),
+                n_rep_h1=len(power),
+                mae_h1=mae,
+                mae_h1_se=float(abs_errors.std(ddof=1) / np.sqrt(len(abs_errors))),
+                rmse_h1=rmse,
+                rmse_h1_se=mse_se / (2 * rmse) if rmse > 0 else 0.0,
+                bias_h1=float(errors.mean()),
+                bias_h1_se=float(power["est"].std(ddof=1) / np.sqrt(len(power))),
+                power=calibrated_power,
+                power_se=float(
+                    np.sqrt(calibrated_power * (1 - calibrated_power) / len(power))
+                ),
+                type1_raw=type1,
+                type1_se=float(np.sqrt(type1 * (1 - type1) / len(null))),
+                coverage_h1=coverage,
+                coverage_h1_se=float(
+                    np.sqrt(coverage * (1 - coverage) / len(power))
+                ),
+                alloc_overall=float(power["alloc_overall"].mean()),
+                alloc_se=float(
+                    power["alloc_overall"].std(ddof=1) / np.sqrt(len(power))
+                ),
+                mean_W=float(power["mean_W"].mean()),
+                mean_W_se=float(power["mean_W"].std(ddof=1) / np.sqrt(len(power))),
+            )
+        )
+
+    summary = pd.DataFrame(rows)
+    baseline = (
+        summary[summary["method"] == "KBCD"][["xi", "eta", "rmse_h1"]]
+        .rename(columns={"rmse_h1": "rmse_kbcd"})
+    )
+    summary = summary.merge(baseline, on=["xi", "eta"], how="left", validate="many_to_one")
+    summary["ess"] = (summary["rmse_kbcd"] / summary["rmse_h1"]) ** 2
+    return summary
 
 
-# ====================================================================
-# Figure 1 — exploratory + factorial map
-# ====================================================================
-def make_F1(params):
-    fig = plt.figure(figsize=(13, 7.0))
-    # Extra bottom margin reserves space for the legend underneath the
-    # factorial-map panel (otherwise it occludes the x-axis title).
-    gs = fig.add_gridspec(2, 4, height_ratios=[1, 1.3], hspace=0.42,
-                          wspace=0.32, left=0.06, right=0.985, top=0.93,
-                          bottom=0.16)
-
-    real = _load_real_data()
-    mn_Y, sd_Y = params["moments"]["mn_Y"], params["moments"]["sd_Y"]
-    real["Y_std"] = (real["Y"] - mn_Y) / sd_Y
-    cur_y = real[(real["STUDY"] == "ZOL") & (real["Z"] == 0)]["Y_std"].to_numpy()
-    cur_kde = gaussian_kde(cur_y)
-    xx = np.linspace(cur_y.min() - 1.5, cur_y.max() + 1.5, 200)
-
-    # Top row: 4 corners of (ξ, η) factorial.  ξ on display is the
-    # normalised dial ∈ [0, 1]; we pass the matching raw ξ to the DGP
-    # via XI_RAW_MAX = 2.0.  Per-corner seeds are chosen to give a
-    # representative draw at small n_H (the (0,0) corner with n_H=30
-    # is highly seed-sensitive; seed=35 yields a draw whose empirical
-    # mean and SD lie within 1% of the HORIZON control reference,
-    # so the dashed historical density visibly centres on the solid
-    # HORIZON density as expected under the no-bias scenario).
-    xi_dial_max = max(XI_GRID)             # = 1.0
-    corners = [(0.0,           0.0, "ξ=0,    η=0  (no bias,    low precision)",     35),
-               (xi_dial_max,   0.0, f"ξ={xi_dial_max:g},  η=0  (large bias, low precision)", 11111),
-               (0.0,           1.0, "ξ=0,    η=1  (no bias,    high precision)",    11111),
-               (xi_dial_max,   1.0, f"ξ={xi_dial_max:g},  η=1  (large bias, high precision)", 11111)]
-    for j, (xi_dial, eta, lab, seed) in enumerate(corners):
-        ax = fig.add_subplot(gs[0, j])
-        # Pass *raw* ξ to the DGP (multiplies σ_C internally).
-        _, Yh = _gen_scenario_sample(params, xi_dial * XI_RAW_MAX, eta, rng_seed=seed)
-        ax.plot(xx, cur_kde(xx), color="black", lw=1.6, label="HORIZON")
-        ax.fill_between(xx, 0, cur_kde(xx), color="black", alpha=0.07)
-        if len(Yh) > 4:
-            kh = gaussian_kde(Yh)
-            color = "#9467bd" if eta < 0.5 else "#2ca02c"
-            ax.plot(xx, kh(xx), color=color, lw=1.8, ls="--",
-                    label="Historical")
-            ax.fill_between(xx, 0, kh(xx), color=color, alpha=0.10)
-        ax.set_title(lab, fontsize=9.5, pad=3)
-        if j == 0:
-            ax.set_ylabel("Density")
-        ax.set_xlabel("Standardized Y" if j == 0 else "")
-        ax.tick_params(labelsize=8)
-        ax.spines[["top", "right"]].set_visible(False)
-        # Annotate n_H, the historical sample size that η now controls.
-        ax.text(0.97, 0.96, f"n_H = {n_H_of_eta(eta)}",
-                transform=ax.transAxes, ha="right", va="top",
-                fontsize=8, bbox=dict(boxstyle="round,pad=0.25",
-                                      facecolor="white", edgecolor="lightgray"))
-        if j == 0:
-            ax.legend(fontsize=7, frameon=False, loc="upper left")
-
-    # Bottom: ξ × η factorial map with empirical anchors.  Use η on
-    # the y-axis directly (categorical) for a clean grid, with the
-    # corresponding n_H value annotated only on the right axis to avoid
-    # text overlap on the left.
-    ax = fig.add_subplot(gs[1, :])
-    nx, ny = len(XI_GRID), len(ETA_GRID)
-    # Grid of cells
-    for i, eta in enumerate(ETA_GRID):
-        for j, xi in enumerate(XI_GRID):
-            ax.scatter(j, i, s=110, facecolor="#4a7ab2",
-                       edgecolor="black", lw=0.7, alpha=0.85, zorder=3)
-    # Light gridlines connecting cells
-    for i in range(ny):
-        ax.plot(range(nx), [i] * nx, "-", color="#4a7ab2",
-                lw=0.5, alpha=0.35, zorder=2)
-    for j in range(nx):
-        ax.plot([j] * ny, range(ny), ":", color="#4a7ab2",
-                lw=0.5, alpha=0.35, zorder=2)
-    # Empirical real-subgroup markers.
-    #   x : empirical bias mapped onto the ξ dial, ξ_dial = (|bias|/σ_C)/XI_RAW_MAX.
-    #   y : the COHORT-EQUIVALENT historical size n_H_eq = n_h_per_sg / sg_dist_hist,
-    #       i.e. the total external cohort whose LOCAL historical density at that
-    #       subgroup matches the real FIT subgroup, mapped onto the n_H axis.
-    # This places each subgroup at the precision it actually contributes to local
-    # borrowing (n_H_eq ≈ 194–243 here), rather than pinning all four to the
-    # full-cohort top row.
-    sigma_curr   = params["sigma_curr"]
-    bias_emp     = np.abs(params["bias_per_sg"])                  # (4,)
-    n_h_per_sg   = np.asarray(params["n_h_per_sg"], float)        # (4,)
-    sg_dist_hist = np.asarray(params["sg_dist_hist"], float)      # (4,)
-    nH_eq        = n_h_per_sg / np.maximum(sg_dist_hist, 1e-12)   # cohort-equiv n_H
-    nH_vals      = np.array([n_H_of_eta(e) for e in ETA_GRID], float)
-    xi_axis_vals = np.array(XI_GRID, float)
-    for k in range(4):
-        xi_dial_anchor = (bias_emp[k] / sigma_curr) / XI_RAW_MAX
-        x_grid = float(np.interp(np.clip(xi_dial_anchor, XI_GRID[0], XI_GRID[-1]),
-                                 xi_axis_vals, np.arange(nx)))
-        y_grid = float(np.interp(np.clip(nH_eq[k], nH_vals[0], nH_vals[-1]),
-                                 nH_vals, np.arange(ny)))
-        ax.scatter(x_grid, y_grid, s=200, marker="*",
-                   facecolor=SUBGROUP_COLORS[k], edgecolor="black",
-                   lw=1.4, zorder=5)
-        # Alternate label above/below so subgroups that share an x (sg1, sg2)
-        # keep their colours and labels disjoint.
-        annot_dy = 12 if (k % 2 == 1) else -14
-        ax.annotate(f"real-sg{k+1}", (x_grid, y_grid),
-                    xytext=(8, annot_dy), textcoords="offset points",
-                    fontsize=8.5, fontweight="bold",
-                    color=SUBGROUP_COLORS[k], zorder=5)
-    ax.set_xticks(np.arange(nx))
-    ax.set_xticklabels([f"{x:g}" for x in XI_GRID])
-    ax.set_yticks(np.arange(ny))
-    ax.set_yticklabels(
-        [f"η={e:g}\nn_H={n_H_of_eta(e)}" for e in ETA_GRID],
-        fontsize=8)
-    ax.set_xlim(-0.6, nx - 0.4)
-    ax.set_ylim(-0.8, ny - 0.2)
-    ax.set_xlabel(r"Bias level  $\xi \in [0, 1]$"
-                  r"  ($b_{\theta} = \xi \cdot 2\sigma_C$, additive shift)")
-    ax.set_ylabel(r"Precision level  $\eta \in [0, 1]$"
-                  r"  ($n_H$: 30 → 350)")
-    ax.set_title(rf"Bias × precision grid: {nx}×{ny} cells (blue), "
-                 r"real-data subgroup positions (★)",
-                 fontsize=10.5)
-    ax.spines[["top", "right"]].set_visible(False)
-    ax.grid(True, axis="both", alpha=0.15, lw=0.4)
-
-    legend_handles = [
-        Line2D([0], [0], marker='o', color='w', markerfacecolor="#4a7ab2",
-               markeredgecolor='black', markersize=10,
-               label='Simulation cell (one (ξ, η) configuration)'),
-        Line2D([0], [0], marker='*', color='w', markerfacecolor="#bbbbbb",
-               markeredgecolor='black', markersize=14,
-               label='Empirical FIT subgroup (sg1–sg4 by (falls, frx))'),
+def make_T1(params):
+    """Write the fitted model and executed simulation design."""
+    rows = [
+        dict(
+            Component="Current outcome model",
+            Symbol=r"$Y_C=m_0(X)+\delta Z+\varepsilon_C$",
+            Meaning="HORIZON-calibrated response surface",
+            Values=(
+                f"sigma_C=sqrt(0.11)={np.sqrt(0.11):.4f}; "
+                "delta=0 (null) or 0.14 (power)"
+            ),
+        ),
+        dict(
+            Component="Historical-control model",
+            Symbol=r"$Y_H=m_0(X)+b_\theta+\varepsilon_H$",
+            Meaning="Same response surface plus a location discrepancy",
+            Values=r"$b_\theta=2\xi\sigma_C$; $\sigma_H=\sigma_C$",
+        ),
+        dict(
+            Component="Subgroup distributions",
+            Symbol=r"$P(X_1,X_2)$",
+            Meaning="Empirical HORIZON/FIT cohort proportions",
+            Values=(
+                "current="
+                + np.array2string(params["sg_dist_curr"], precision=3)
+                + "; history="
+                + np.array2string(params["sg_dist_hist"], precision=3)
+            ),
+        ),
+        dict(
+            Component="Continuous covariates",
+            Symbol=r"$(X_3,X_4)\mid(X_1,X_2)$",
+            Meaning="Subgroup-specific KDEs",
+            Values="HORIZON KDE for current; FIT KDE for history",
+        ),
+        dict(
+            Component="Conflict grid",
+            Symbol=r"$\xi$",
+            Meaning=r"$b_\theta=2\xi\sigma_C$",
+            Values="{" + ", ".join(f"{x:g}" for x in XI_GRID) + "}",
+        ),
+        dict(
+            Component="Historical-size grid",
+            Symbol=r"$\eta$ and $n_H$",
+            Meaning="eta changes the historical-control count",
+            Values=(
+                "eta={"
+                + ", ".join(f"{e:g}" for e in ETA_GRID)
+                + "}; n_H={"
+                + ", ".join(str(n_H_of_eta(e)) for e in ETA_GRID)
+                + "}"
+            ),
+        ),
+        dict(
+            Component="Trial geometry",
+            Symbol=r"$(N,t_{\rm burn})$",
+            Meaning="Current trial and equal-randomization burn-in",
+            Values=(
+                f"N={N_CURRENT}; burn-in={INTERIM_START}; "
+                f"{N_REPS} replications per cell"
+            ),
+        ),
+        dict(
+            Component="CAHB comparator",
+            Symbol=r"$(\gamma,\lambda_2)$",
+            Meaning="CAHB-specific tuning from Jin et al. (2023)",
+            Values=r"$\gamma=\sqrt{3}$; $\lambda_2=300\log N$",
+        ),
     ]
-    # Anchor legend below the x-axis title (xlabel sits at axes y≈-0.07
-    # in axes-fraction coordinates; we drop the legend below that).
-    ax.legend(handles=legend_handles, fontsize=8,
-              loc="upper center", bbox_to_anchor=(0.5, -0.22),
-              ncol=2, frameon=True, framealpha=0.93)
+    table = pd.DataFrame(rows)
+    table.to_csv(TABLE1_CSV, index=False, encoding="utf-8")
+    md = [
+        "# Real-data-calibrated simulation design",
+        "",
+        "| Component | Symbol | Meaning | Values |",
+        "|---|---|---|---|",
+    ]
+    for _, row in table.iterrows():
+        md.append("| " + " | ".join(str(row[c]) for c in table.columns) + " |")
+    TABLE1_CSV.with_suffix(".md").write_text(
+        "\n".join(md) + "\n", encoding="utf-8"
+    )
+    print(f"[T1] -> {TABLE1_CSV}")
+
+
+def make_F1(params):
+    """Plot representative outcome distributions and the design grid."""
+    corners = [
+        (0.0, 0.0, "compatible, small history", "#8BCF8B", 11111),
+        (0.0, 1.0, "compatible, large history", "#0F4D92", 11112),
+        (1.0, 0.0, "severe conflict, small history", "#E9A6A1", 11113),
+        (1.0, 1.0, "severe conflict, large history", "#B64342", 11114),
+    ]
+    samples = []
+    for xi, eta, label, color, seed in corners:
+        _, outcomes = _generate_historical(params, xi, eta, seed)
+        samples.append((label, color, outcomes))
+
+    all_outcomes = np.concatenate([entry[-1] for entry in samples])
+    x_grid = np.linspace(
+        np.quantile(all_outcomes, 0.002), np.quantile(all_outcomes, 0.998), 400
+    )
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.6, 4.25))
+    fig.subplots_adjust(
+        left=0.075, right=0.985, top=0.90, bottom=0.18, wspace=0.30
+    )
+
+    ax = axes[0]
+    for label, color, outcomes in samples:
+        density = gaussian_kde(outcomes)
+        ax.plot(
+            x_grid,
+            density(x_grid),
+            color=color,
+            lw=2.0,
+            label=f"{label} ($n_H={len(outcomes)}$)",
+        )
+    ax.set_xlabel("Standardized 24-month hip BMD")
+    ax.set_ylabel("Density")
+    ax.set_title("(a) Representative historical-control distributions")
+    ax.legend(frameon=False, fontsize=7.5)
+    ax.grid(axis="y", alpha=0.20, lw=0.5)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    ax = axes[1]
+    regime_colors = ("#EAF4EA", "#EAF1F8", "#FFF3DA", "#F7E6E6")
+    regime_x = (0.006, 0.08, 0.43, 0.93)
+    for (name, lo, hi), color, xpos in zip(XI_REGIMES, regime_colors, regime_x):
+        ax.axvspan(lo, hi, color=color, alpha=0.65, zorder=0)
+        display_name = name.replace(" conflict", "") if name.startswith(("Moderate", "Severe")) else name
+        ax.text(xpos, max(n_H_of_eta(e) for e in ETA_GRID) + 16, display_name,
+                ha="center", va="bottom", fontsize=6.8, color="0.30")
+    for eta in ETA_GRID:
+        n_h = n_H_of_eta(eta)
+        ax.scatter(
+            XI_GRID,
+            [n_h] * len(XI_GRID),
+            s=34,
+            color="#4A7AB2",
+            edgecolor="white",
+            linewidth=0.5,
+            zorder=2,
+        )
+
+    sigma_c = float(np.sqrt(0.11))
+    empirical_xi = np.maximum(np.abs(params["bias_per_sg"]) / (2 * sigma_c), 0)
+    n_equiv = params["n_h_per_sg"] / np.maximum(
+        params["sg_dist_hist"], 1e-12
+    )
+    for k, (x_value, y_value) in enumerate(zip(empirical_xi, n_equiv), start=1):
+        ax.scatter(
+            x_value,
+            y_value,
+            marker="*",
+            s=140,
+            color=SUBGROUP_COLORS[k - 1],
+            edgecolor="black",
+            linewidth=0.6,
+            zorder=4,
+        )
+        ax.annotate(
+            f"sg{k}",
+            (x_value, y_value),
+            xytext=(5, 4),
+            textcoords="offset points",
+            fontsize=7.5,
+        )
+
+    ax.set_xscale("symlog", base=2, linthresh=0.01, linscale=0.8)
+    ax.set_xlim(-0.0025, 1.08)
+    ax.set_ylim(10, 388)
+    ax.set_xticks(XI_GRID)
+    ax.set_xticklabels([f"{x:g}" for x in XI_GRID], fontsize=8)
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.tick_params(axis="x", which="minor", bottom=False, labelbottom=False)
+    ax.set_yticks([n_H_of_eta(e) for e in ETA_GRID])
+    ax.set_xlabel(r"Conflict $\xi$ (base-2 scale for $\xi>0$)")
+    ax.set_ylabel(r"Historical controls $n_H$")
+    ax.set_title("(b) Conflict-by-history-size design grid")
+    ax.grid(alpha=0.16, lw=0.5)
+    ax.spines[["top", "right"]].set_visible(False)
 
     out = FIG_DIR / "F1_scenario_exploratory.pdf"
     fig.savefig(out, bbox_inches="tight")
-    fig.savefig(out.with_suffix(".png"), dpi=200, bbox_inches="tight")
+    fig.savefig(out.with_suffix(".png"), dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"[F1] -> {out}")
 
 
-# ====================================================================
-# Figure 2 — marginal effects
-# ====================================================================
-def make_F2():
-    if not RUN_CSV.exists():
-        print(f"[F2] missing {RUN_CSV}"); return
-    raw = _normalise_xi(pd.read_csv(RUN_CSV))
-    # True marginal effects: pool reps over the other axis before
-    # computing calibrated power / RMSE.  This averages both H0 and H1
-    # null distributions over the marginalised dimension, which is the
-    # standard interpretation of a "marginal effect" of a factorial.
-    df_xi  = _size_corrected(raw, group_keys=("xi",  "method"))
-    df_eta = _size_corrected(raw, group_keys=("eta", "method"))
+def _set_xi_axis(ax):
+    """Use base-2 log spacing for positive xi while retaining xi=0."""
+    ax.set_xscale("symlog", base=2, linthresh=0.01, linscale=0.8)
+    ax.set_xlim(-0.0025, 1.08)
+    ax.set_xticks(XI_GRID)
+    ax.set_xticklabels([f"{x:g}" for x in XI_GRID], fontsize=7.5)
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.tick_params(axis="x", which="minor", bottom=False, labelbottom=False)
 
-    fig, axes = plt.subplots(2, 3, figsize=(13, 7.0), sharex="row")
-    fig.subplots_adjust(left=0.07, right=0.985, top=0.92, bottom=0.07,
-                        wspace=0.30, hspace=0.32)
 
-    metrics = [("alloc_overall", "Allocation ratio",                                (0.42, 0.62)),
-               ("rmse_h1",       r"RMSE  $\sqrt{\mathbb{E}(\hat\delta-\delta)^2}$",  None),
-               ("power",         f"Calibrated power  (δ_test = {DELTA_TEST:g})",     (0.4, 1.0))]
+def _regime_bands(ax, label=False):
+    colors = ("#EAF4EA", "#EAF1F8", "#FFF3DA", "#F7E6E6")
+    label_x = (0.006, 0.08, 0.43, 0.93)
+    for (name, lo, hi), color, xpos in zip(XI_REGIMES, colors, label_x):
+        ax.axvspan(lo, hi, color=color, alpha=0.62, zorder=0)
+        if label:
+            display_name = (
+                name.replace(" conflict", "")
+                if name.startswith(("Moderate", "Severe")) else name
+            )
+            ax.annotate(
+                display_name,
+                xy=(xpos, 0.985),
+                xycoords=("data", "axes fraction"),
+                ha="center",
+                va="top",
+                fontsize=6.3,
+                color="0.28",
+            )
 
-    # ---- Top row: vs ξ marginalised over η ----
-    for j, (col, ylab, ylim) in enumerate(metrics):
-        ax = axes[0, j]
-        for m in METHOD_ORDER:
-            d = df_xi[df_xi["method"] == m].sort_values("xi")
-            yerr = None
-            if col == "rmse_h1": yerr = 1.96 * d["rmse_h1_se"]
-            if col == "power":   yerr = 1.96 * d["power_se"]
-            ax.errorbar(d["xi"], d[col], yerr=yerr,
-                        marker="o", lw=2, ms=6, capsize=3,
-                        color=METHOD_COLORS[m], label=m)
-        ax.set_ylabel(ylab, fontsize=9.5)
-        ax.set_xlabel(r"Bias level  $\xi \in [0, 1]$"
-                      r"  (additive shift $b_\theta = \xi \cdot 2\sigma_C$)")
-        if ylim: ax.set_ylim(*ylim)
+
+def _heatmap_grid(df, value_col):
+    return (
+        df.pivot_table(index="eta", columns="xi", values=value_col)
+        .reindex(index=ETA_GRID, columns=XI_GRID)
+        .values
+    )
+
+
+def make_F2(df):
+    """Plot the conflict path at the largest historical sample size."""
+    d = df[np.isclose(df["eta"], max(ETA_GRID))].copy()
+    fig, axes = plt.subplots(1, 3, figsize=(COL2_W * 1.72, 3.05))
+    fig.subplots_adjust(
+        left=0.065, right=0.99, top=0.82, bottom=0.22, wspace=0.29
+    )
+    panels = [
+        ("mae_h1", "mae_h1_se", "Mean absolute error", "(a) Estimation error"),
+        ("power", "power_se", "Size-calibrated power", "(b) Power"),
+        (
+            "alloc_overall",
+            "alloc_se",
+            "Proportion assigned to treatment",
+            "(c) Allocation ratio",
+        ),
+    ]
+    for j, (col, se_col, ylabel, title) in enumerate(panels):
+        ax = axes[j]
+        _regime_bands(ax, label=(j == 0))
+        for method in METHOD_ORDER:
+            dm = d[d["method"] == method].sort_values("xi")
+            x = dm["xi"].to_numpy(float)
+            y = dm[col].to_numpy(float)
+            se = dm[se_col].to_numpy(float)
+            lo, hi = y - 1.96 * se, y + 1.96 * se
+            if col in {"power", "alloc_overall"}:
+                lo, hi = np.clip(lo, 0.0, 1.0), np.clip(hi, 0.0, 1.0)
+            ax.fill_between(
+                x, lo, hi, color=METHOD_COLORS[method], alpha=0.12,
+                linewidth=0, zorder=1,
+            )
+            ax.plot(
+                x, y, color=METHOD_COLORS[method],
+                linestyle=METHOD_STYLES[method],
+                marker=METHOD_MARKERS[method], linewidth=1.8,
+                markersize=4.8, zorder=3,
+            )
+        if col == "alloc_overall":
+            ax.axhline(0.5, color="0.35", linestyle=":", linewidth=1.0)
+        _set_xi_axis(ax)
+        ax.set_xlabel(r"Conflict $\xi$ (base-2 scale for $\xi>0$)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=10)
+        ax.grid(axis="y", alpha=0.22, linewidth=0.5)
         ax.spines[["top", "right"]].set_visible(False)
-        ax.grid(True, alpha=0.25, lw=0.4)
-        if j == 0:
-            ax.set_title("vs ξ  (marginal over η)",
-                         loc="left", fontsize=10.5)
-            ax.legend(fontsize=9, frameon=False, loc="upper left")
-
-    # ---- Bottom row: vs η marginalised over ξ ----
-    for j, (col, ylab, ylim) in enumerate(metrics):
-        ax = axes[1, j]
-        for m in METHOD_ORDER:
-            d = df_eta[df_eta["method"] == m].sort_values("eta")
-            yerr = None
-            if col == "rmse_h1": yerr = 1.96 * d["rmse_h1_se"]
-            if col == "power":   yerr = 1.96 * d["power_se"]
-            ax.errorbar(d["eta"], d[col], yerr=yerr,
-                        marker="o", lw=2, ms=6, capsize=3,
-                        color=METHOD_COLORS[m], label=m)
-        ax.set_ylabel(ylab, fontsize=9.5)
-        ax.set_xlabel(r"Precision level  $\eta \in [0, 1]$"
-                      r"  ($n_H$ increasing, 30 → 350)")
-        if ylim: ax.set_ylim(*ylim)
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.grid(True, alpha=0.25, lw=0.4)
-        if j == 0:
-            ax.set_title("vs η  (marginal over ξ)",
-                         loc="left", fontsize=10.5)
-            ax.legend(fontsize=9, frameon=False, loc="upper left")
-
+    handles = [
+        Line2D(
+            [0], [0], color=METHOD_COLORS[m], linestyle=METHOD_STYLES[m],
+            marker=METHOD_MARKERS[m], linewidth=1.8, markersize=5,
+            label=METHOD_LABELS[m],
+        )
+        for m in METHOD_ORDER
+    ]
+    fig.legend(
+        handles=handles, loc="upper center", ncol=3,
+        bbox_to_anchor=(0.5, 0.995), frameon=False, fontsize=8.5,
+    )
     out = FIG_DIR / "F2_marginal_effects.pdf"
     fig.savefig(out, bbox_inches="tight")
-    fig.savefig(out.with_suffix(".png"), dpi=200, bbox_inches="tight")
+    fig.savefig(out.with_suffix(".png"), dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"[F2] -> {out}")
 
 
-# ====================================================================
-# Figure 3 — ξ × η interaction
-# ====================================================================
-def _heatmap_grid(df, value_col):
-    g = (df.pivot_table(index="eta", columns="xi", values=value_col)
-           .reindex(index=ETA_GRID, columns=XI_GRID))
-    return g.values
-
-
-def make_F3():
-    if not RUN_CSV.exists():
-        print(f"[F3] missing {RUN_CSV}"); return
-    df = _size_corrected(_normalise_xi(pd.read_csv(RUN_CSV)))
-
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8.6),
-                             constrained_layout=True)
-
-    nx = len(XI_GRID); ny = len(ETA_GRID)
+def make_F3(df):
+    """Plot full conflict-by-history-size diagnostics for borrowing methods."""
+    methods = ["CAHB", "RADISH"]
+    nx, ny = len(XI_GRID), len(ETA_GRID)
     extent = [-0.5, nx - 0.5, -0.5, ny - 0.5]
     xtick = [f"{x:g}" for x in XI_GRID]
-    # η is the *precision level*; it directly controls n_H (CAHB §5.2.3
-    # design).  σ_h is fixed at σ_C = 1.0.  Annotate n_H per row.
-    ytick = [f"η={e:g}\n(n_H={n_H_of_eta(e)})" for e in ETA_GRID]
-
-    # ---- Row 1: per-method RMSE heatmaps ----
-    rmse_grids = {m: _heatmap_grid(df[df["method"] == m], "rmse_h1")
-                  for m in METHOD_ORDER}
-    vmax_rmse = max(np.nanmax(g) for g in rmse_grids.values())
-    vmin_rmse = min(np.nanmin(g) for g in rmse_grids.values())
-    last_im = None
-    for j, m in enumerate(METHOD_ORDER):
-        ax = axes[0, j]
-        im = ax.imshow(rmse_grids[m], origin="lower", cmap="Reds",
-                       vmin=vmin_rmse, vmax=vmax_rmse, aspect="auto", extent=extent)
-        last_im = im
-        for i in range(ny):
-            for k in range(nx):
-                v = rmse_grids[m][i, k]
-                ax.text(k, i, f"{v:.3f}", ha="center", va="center",
-                        fontsize=7,
-                        color="black" if v < 0.55 * vmax_rmse else "white")
-        ax.set_xticks(np.arange(nx)); ax.set_xticklabels(xtick, fontsize=8)
-        ax.set_yticks(np.arange(ny)); ax.set_yticklabels(ytick, fontsize=7)
-        ax.set_xlabel(r"$\xi$", fontsize=10)
-        if j == 0: ax.set_ylabel(r"$\eta$  (precision level)", fontsize=10)
-        ax.set_title(f"{m}:  RMSE", fontsize=10.5, color=METHOD_COLORS[m])
-    fig.colorbar(last_im, ax=axes[0, :].tolist(), shrink=0.85, pad=0.02,
-                 label="RMSE")
-
-    # ---- Row 2 panel A: RADISH advantage map = RMSE_CAHB − RMSE_RADISH ----
-    ax = axes[1, 0]
-    adv = rmse_grids["CAHB"] - rmse_grids["RADISH"]
-    vmax_adv = max(abs(np.nanmin(adv)), abs(np.nanmax(adv)), 1e-3)
-    norm = TwoSlopeNorm(vmin=-vmax_adv, vcenter=0.0, vmax=vmax_adv)
-    im = ax.imshow(adv, origin="lower", cmap="RdYlGn",
-                   norm=norm, aspect="auto", extent=extent)
-    for i in range(ny):
-        for k in range(nx):
-            v = adv[i, k]
-            ax.text(k, i, f"{v:+.3f}", ha="center", va="center",
-                    fontsize=7, color="black")
-    ax.set_xticks(np.arange(nx)); ax.set_xticklabels(xtick, fontsize=8)
-    ax.set_yticks(np.arange(ny)); ax.set_yticklabels(ytick, fontsize=7)
-    ax.set_xlabel("ξ"); ax.set_ylabel("η  (precision)")
-    ax.set_title(r"RADISH advantage:  ${\rm RMSE}_{\rm CAHB} - {\rm RMSE}_{\rm RADISH}$" "\n"
-                 "(green = RADISH wins)", fontsize=10)
-    fig.colorbar(im, ax=ax, shrink=0.85, pad=0.02)
-
-    # ---- Row 2 panel B: borrowing weight W̄ heatmap (CAHB) with
-    #      RADISH numbers overlaid for direct comparison.  Heat
-    #      colour encodes CAHB W (since it spans a much larger range
-    #      than RADISH); each cell shows both numbers as
-    #          C: <CAHB W̄>     R: <RADISH W̄>
-    #      so the reader can see CAHB collapse and RADISH staying
-    #      uniformly low side-by-side.
-    ax = axes[1, 1]
-    W_C = _heatmap_grid(df[df["method"] == "CAHB"  ], "mean_W")
-    W_R = _heatmap_grid(df[df["method"] == "RADISH"], "mean_W")
-    vmax_W = max(np.nanmax(W_C), np.nanmax(W_R))
-    im = ax.imshow(W_C, origin="lower", cmap="viridis", aspect="auto",
-                   vmin=0.0, vmax=vmax_W, extent=extent)
-    for i in range(ny):
-        for k in range(nx):
-            ax.text(k, i,
-                    f"C: {W_C[i, k]:.2f}\nR: {W_R[i, k]:.2f}",
-                    ha="center", va="center", fontsize=6.5,
-                    color="white" if W_C[i, k] < 0.5 * vmax_W else "black")
-    ax.set_xticks(np.arange(nx)); ax.set_xticklabels(xtick, fontsize=8)
-    ax.set_yticks(np.arange(ny)); ax.set_yticklabels(ytick, fontsize=7)
-    ax.set_xlabel("ξ")
-    ax.set_title(r"Mean borrowing weight  $\bar W$" "\n"
-                 r"(heat = CAHB; ${\bf C}$: CAHB $\bar W$, "
-                 r"${\bf R}$: RADISH $\bar W$)" "\n"
-                 "CAHB peaks at (ξ=0, η=1) and collapses with ξ; "
-                 "RADISH stays low and stable.",
-                 fontsize=9.0)
-    fig.colorbar(im, ax=ax, shrink=0.85, pad=0.02, label=r"CAHB $\bar W$")
-
-    # ---- Row 2 panel C: power gap RADISH − CAHB ----
-    ax = axes[1, 2]
-    pwr_R = _heatmap_grid(df[df["method"] == "RADISH"], "power")
-    pwr_C = _heatmap_grid(df[df["method"] == "CAHB"  ], "power")
-    pgap = pwr_R - pwr_C
-    vmax_p = max(abs(np.nanmin(pgap)), abs(np.nanmax(pgap)), 0.01)
-    norm = TwoSlopeNorm(vmin=-vmax_p, vcenter=0.0, vmax=vmax_p)
-    im = ax.imshow(pgap, origin="lower", cmap="RdYlGn",
-                   norm=norm, aspect="auto", extent=extent)
-    for i in range(ny):
-        for k in range(nx):
-            v = pgap[i, k]
-            ax.text(k, i, f"{v:+.2f}", ha="center", va="center",
-                    fontsize=7, color="black")
-    ax.set_xticks(np.arange(nx)); ax.set_xticklabels(xtick, fontsize=8)
-    ax.set_yticks(np.arange(ny)); ax.set_yticklabels(ytick, fontsize=7)
-    ax.set_xlabel("ξ")
-    ax.set_title("Calibrated power gap  RADISH − CAHB\n(green = RADISH wins)",
-                 fontsize=10)
-    fig.colorbar(im, ax=ax, shrink=0.85, pad=0.02)
-
+    ytick = [f"$\\eta$={e:g}\n($n_H$={n_H_of_eta(e)})" for e in ETA_GRID]
+    keys = ("ess", "type1_raw", "mean_W")
+    grids = {
+        (method, key): _heatmap_grid(df[df["method"] == method], key)
+        for method in methods for key in keys
+    }
+    ess_dev = max(
+        np.nanmax(np.abs(grids[(method, "ess")] - 1.0))
+        for method in methods
+    )
+    size_dev = max(
+        np.nanmax(np.abs(grids[(method, "type1_raw")] - 0.05))
+        for method in methods
+    )
+    w_max = max(np.nanmax(grids[(method, "mean_W")]) for method in methods)
+    ess_dev, size_dev, w_max = (
+        max(ess_dev, 0.05), max(size_dev, 0.01), max(w_max, 0.05)
+    )
+    columns = [
+        (
+            "ess", "Relative efficiency vs KBCD", DIV_CMAP,
+            TwoSlopeNorm(
+                vmin=max(0.0, 1.0 - ess_dev), vcenter=1.0,
+                vmax=1.0 + ess_dev,
+            ),
+            "{:.2f}", r"$(\mathrm{RMSE}_{\mathrm{KBCD}}/\mathrm{RMSE})^2$",
+        ),
+        (
+            "type1_raw", "Type I error", DIV_CMAP,
+            TwoSlopeNorm(
+                vmin=max(0.0, 0.05 - size_dev), vcenter=0.05,
+                vmax=0.05 + size_dev,
+            ),
+            "{:.3f}", r"Rejection rate under $H_0$",
+        ),
+        (
+            "mean_W", r"Mean borrowing weight $\bar W$", SEQ_CMAP,
+            plt.Normalize(vmin=0.0, vmax=w_max), "{:.2f}", r"$\bar W$",
+        ),
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(COL2_W * 1.68, 6.45))
+    fig.subplots_adjust(
+        left=0.11, right=0.93, top=0.93, bottom=0.09,
+        wspace=0.27, hspace=0.24,
+    )
+    images = []
+    for row, method in enumerate(methods):
+        for col, (key, title, cmap, norm, fmt, cbar_label) in enumerate(columns):
+            ax = axes[row, col]
+            grid = grids[(method, key)]
+            image = ax.imshow(
+                grid, origin="lower", cmap=cmap, norm=norm,
+                aspect="auto", extent=extent,
+            )
+            images.append((col, image, cbar_label))
+            cmap_obj = plt.get_cmap(cmap)
+            for i in range(ny):
+                for k in range(nx):
+                    value = grid[i, k]
+                    if not np.isfinite(value):
+                        continue
+                    rgba = cmap_obj(norm(value))
+                    luminance = (
+                        0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+                    )
+                    ax.text(
+                        k, i, fmt.format(value), ha="center", va="center",
+                        fontsize=6.7,
+                        color="white" if luminance < 0.52 else "black",
+                    )
+            ax.set_xticks(np.arange(nx))
+            ax.set_xticklabels(xtick, fontsize=7.5)
+            ax.set_yticks(np.arange(ny))
+            ax.set_yticklabels(ytick if col == 0 else [], fontsize=7.3)
+            if row == 1:
+                ax.set_xlabel(r"Conflict $\xi$ (combined grid)")
+            if col == 0:
+                ax.set_ylabel(
+                    f"{method}\nHistorical precision",
+                    color=METHOD_COLORS[method], fontsize=9.5,
+                )
+            if row == 0:
+                ax.set_title(title, fontsize=10)
+    for col in range(3):
+        image, label = images[col][1], images[col][2]
+        cbar = fig.colorbar(
+            image, ax=axes[:, col], fraction=0.035, pad=0.025,
+            location="right",
+        )
+        cbar.set_label(label, fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
     out = FIG_DIR / "F3_xi_eta_interaction.pdf"
     fig.savefig(out, bbox_inches="tight")
-    fig.savefig(out.with_suffix(".png"), dpi=200, bbox_inches="tight")
+    fig.savefig(out.with_suffix(".png"), dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"[F3] -> {out}")
 
 
-# ====================================================================
+def make_T2(summary):
+    """Write representative points from all four conflict regimes."""
+    anchors = [
+        (0.0, "Exact compatibility"),
+        (0.08, "Low conflict"),
+        (0.64, "Moderate conflict"),
+        (1.0, "Severe conflict"),
+    ]
+    rows = []
+    for xi, regime in anchors:
+        cell = summary[
+            np.isclose(summary["xi"], xi) & np.isclose(summary["eta"], 1.0)
+        ]
+        for method in METHOD_ORDER:
+            row = cell[cell["method"] == method].iloc[0]
+            rows.append(
+                dict(
+                    Regime=regime,
+                    xi=xi,
+                    n_H=int(row["n_H"]),
+                    Method=method,
+                    MAE=row["mae_h1"],
+                    RMSE=row["rmse_h1"],
+                    Calibrated_power=row["power"],
+                    Type_I_error=row["type1_raw"],
+                    Coverage=row["coverage_h1"],
+                    Allocation=row["alloc_overall"],
+                    Mean_W=row["mean_W"],
+                    Replications=int(row["n_rep_h1"]),
+                )
+            )
+    table = pd.DataFrame(rows)
+    table.to_csv(TABLE2_CSV, index=False, float_format="%.4f")
+
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        (
+            r"\caption{Real-data-calibrated operating characteristics at "
+            r"$n_H=350$ for representative conflict levels.}"
+        ),
+        r"\label{tab:real_operating}",
+        r"\small",
+        r"\begin{tabular*}{0.96\linewidth}{@{\extracolsep{\fill}}llrrrrrrr@{}}",
+        r"\toprule",
+        (
+            r"Regime & Method & MAE & RMSE & Power & Type I & Coverage & "
+            r"Allocation & $\overline W$ \\"
+        ),
+        r"\midrule",
+    ]
+    for _, row in table.iterrows():
+        lines.append(
+            f"{row['Regime']} & {row['Method']} & {row['MAE']:.3f} & "
+            f"{row['RMSE']:.3f} & {row['Calibrated_power']:.3f} & "
+            f"{row['Type_I_error']:.3f} & {row['Coverage']:.3f} & "
+            f"{row['Allocation']:.3f} & {row['Mean_W']:.3f} \\\\"
+        )
+    lines.extend([r"\bottomrule", r"\end{tabular*}", r"\end{table}"])
+    TABLE2_TEX.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"[T2] -> {TABLE2_CSV}")
+    print(f"[T2] -> {TABLE2_TEX}")
+
+
 def main():
-    with open(PARAMS_PKL, "rb") as f:
-        params = pickle.load(f)
+    params = _load_params()
+    raw = pd.read_csv(RUN_CSV)
+    summary = summarize_results(raw)
     make_T1(params)
     make_F1(params)
-    make_F2()
-    make_F3()
+    make_F2(summary)
+    make_F3(summary)
+    make_T2(summary)
 
 
 if __name__ == "__main__":

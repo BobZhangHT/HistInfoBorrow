@@ -21,6 +21,20 @@ from pathlib import Path
 import ctypes as ct
 import numpy as np
 
+def _kernel_effective_n(weights, floor=1e-6):
+    """Reference for the C RADISH kernel's Kish effective sample size.
+
+    The native code computes this internally for each local concurrent
+    neighbourhood. Keeping the scalar reference here makes the Python/C
+    numerical contract explicit for parity checks.
+    """
+    w = np.asarray(weights, dtype=float).ravel()
+    sw = float(np.sum(w))
+    sw2 = float(np.dot(w, w))
+    if (not np.isfinite(sw)) or (not np.isfinite(sw2)) or sw <= 1e-12 or sw2 <= 1e-12:
+        return float(floor)
+    return float(max((sw * sw) / sw2, floor))
+
 # ── Locate and load the shared library ───────────────────────────
 _HERE = Path(__file__).resolve().parent
 _LIB_NAME = "radish_core.dll" if os.name == "nt" else "radish_core.so"
@@ -64,6 +78,76 @@ _lib.estimate_ate_c.argtypes      = [
     _PD, _PD, _PD, _PD, _PD,   # outputs
 ]
 _lib.estimate_ate_c.restype       = None
+
+_lib.radish_set_borrow_params.argtypes = [_DBL, _DBL, _INT, _INT]
+_lib.radish_set_borrow_params.restype  = None
+
+_lib.radish_get_borrow_params.argtypes = [ct.POINTER(_DBL), ct.POINTER(_DBL),
+                                           ct.POINTER(_INT), ct.POINTER(_INT)]
+_lib.radish_get_borrow_params.restype = None
+
+_lib.radish_set_adj_global.argtypes    = [_INT]
+_lib.radish_set_adj_global.restype     = None
+
+
+def set_adj_global(on=False):
+    """Use the covariate-standardised trial-level conflict check instead of the
+    raw Welch comparison of marginal means.  The raw statistic standardises by
+    marginal variances, which carry Var{mu_0(X)}; that term is common to both
+    cohorts, carries no conflict information, and costs power.  Constant-free.
+    Process-global: set it inside each worker."""
+    _lib.radish_set_adj_global(int(bool(on)))
+
+
+_lib.radish_set_alloc_params.argtypes  = [_INT, _DBL, _DBL, _INT, _INT]
+_lib.radish_set_alloc_params.restype   = None
+
+
+def set_alloc_params(seq_global=False, phi_lo=0.0, phi_hi=1.0,
+                     alloc_legacy=False, alloc_min_n0=0):
+    """Stage-II options.  ``seq_global`` recomputes the trial-level conflict
+    check from the controls accrued so far at every interim (published rule:
+    off, leaf-only); ``phi_lo``/``phi_hi`` clip the randomization probability;
+    ``alloc_legacy`` is an explicit opt-in that keeps Stage II on the published
+    map even when Stage III uses the repaired one; ``alloc_min_n0`` suppresses borrowing at allocation
+    until that many concurrent controls have accrued.
+    Process-global: set it inside each worker."""
+    _lib.radish_set_alloc_params(int(bool(seq_global)),
+                                 float(phi_lo), float(phi_hi),
+                                 int(bool(alloc_legacy)), int(alloc_min_n0))
+
+
+MAPS = {"legacy": 0, "chisq": 1, "excess": 2, "median": 3, "eb": 4}
+
+
+def set_borrow_params(lam_loc=1.0, lam_glb=1.0, use_tau=False, map="excess"):
+    """Configure the commensurability map in the C kernel.
+
+    Defaults use the centered excess-surprisal rule and retain the
+    reference-predictive SE^2 precision scale. ``map`` selects how the conflict p-value
+    kappa becomes the discount M:
+
+      "legacy"  M = kappa                         (earlier-draft uncentered rule)
+      "excess"  M = min(1, e * kappa)             centered one-nat calibration
+      "median"  M = min(1, 2 * kappa)             constant-free
+      "chisq"   M = exp{-lam (Z^2-1)_+/2}         needs lam_loc / lam_glb
+      "eb"      variance-additive moment estimator, constant-free
+
+    Only "chisq" reads lam_loc / lam_glb.  Process-global: set inside each
+    worker.
+    """
+    m = MAPS[map] if isinstance(map, str) else int(map)
+    _lib.radish_set_borrow_params(float(lam_loc), float(lam_glb),
+                                  int(bool(use_tau)), m)
+
+
+def get_borrow_params():
+    """Return the process-local C borrowing configuration for parity tests."""
+    lam_loc, lam_glb, use_tau, map_code = _DBL(), _DBL(), _INT(), _INT()
+    _lib.radish_get_borrow_params(ct.byref(lam_loc), ct.byref(lam_glb),
+                                  ct.byref(use_tau), ct.byref(map_code))
+    return lam_loc.value, lam_glb.value, bool(use_tau.value), map_code.value
+
 
 _lib.radish_diagnostics_batch.argtypes = [
     _PD, _INT,
@@ -299,10 +383,35 @@ class CAHB:
 # ═══════════════════════════════════════════════════════════════════
 
 class RADISH:
-    """Robust Adaptive Discrepancy-Informed Shrinkage (proposed). C-backed."""
+    """Robust Adaptive Discrepancy-Informed Shrinkage (proposed). C-backed.
+
+    The minimal finite-sample calibration that distinguishes RADISH from the
+    earlier draft is applied here by construction:
+
+      * the excess-surprisal commensurability map D = (-log kappa - 1)_+
+        (``map="excess"``), whose one-nat offset is motivated by the ideal
+        standard-normal probability-integral-transform calibration and is not
+        asserted to equal the finite-sample mean of the kernel statistic.
+
+    This introduces no tuning constant. Stage II uses the centered leaf-only
+    allocation-time check and both stages retain the predictive-variance
+    denominator. ``alloc_legacy=1``
+    remains an explicit opt-in for reproducing the earlier uncentered rule.
+
+    These are process-global C statics, so they are set in __init__: each
+    joblib worker constructs its own RADISH and thereby configures its own
+    process.  KBCD and CAHB read none of these globals, so a mixed run is
+    unaffected.  To reproduce the earlier draft's rule for comparison, call
+    ``set_borrow_params(1., 1., 0, "legacy")`` and ``set_adj_global(0)``
+    after construction.
+    """
     name = "RADISH"
 
     def __init__(self, historical_data, scenario_params, priors):
+        set_borrow_params(1.0, 1.0, use_tau=False, map="excess")
+        set_alloc_params(seq_global=False, phi_lo=0.0, phi_hi=1.0,
+                         alloc_legacy=False, alloc_min_n0=0)
+        set_adj_global(False)
         self.X_h = _arr(_as_2d(historical_data["X_h"]))
         self.Y_h = _arr(historical_data["Y_h"])
         self.h = _arr(kernel_bandwidths(self.X_h))
