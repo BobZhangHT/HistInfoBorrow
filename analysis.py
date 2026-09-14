@@ -1,23 +1,9 @@
-"""
-analysis.py — Publication-quality figures and tables.
+"""Publication-quality figures and tables for all simulation modes.
 
-Two output modes
-----------------
-mode="full"       4×2 conflict-by-precision scenarios:
-    Fig 1  Allocation Ratio   (Null | Power)
-    Fig 2  Bias + RMSE        (2×2 metric × effect)
-    Fig 3  CI Width + Coverage (2×2 metric × effect)
-    Fig 4  Type-I + Power
-    Fig 5  Borrowing Diagnostics: mean W, mean R_n         ← NEW
-    Fig 6  Precision-Awareness Map: W vs (b_θ, σ_H) heat   ← NEW
-
-mode="precision"  σ_H sensitivity sweep at fixed b_θ:
-    Fig P1  Borrowing weight W vs σ_H        (showcase)   ← NEW
-    Fig P2  Information ratio R_n vs σ_H                  ← NEW
-    Fig P3  RMSE & Coverage vs σ_H                        ← NEW
-    Fig P4  Type-I error / Power vs σ_H                   ← NEW
-
-All figures saved as vector PDF at publication quality.
+Factorial modes produce allocation, interval, calibrated-power, borrowing, and
+precision diagnostics. Dedicated paths handle the local-conflict,
+global-by-local, precision, bias, and historical-size studies. Figures are
+written as publication-quality vector PDFs.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -107,12 +93,12 @@ EFFECT_DISPLAY = {"Null": r"$\Delta = 0$ (Null)", "Power": r"$\Delta = 0.5$ (Pow
 SCENARIO_DISPLAY = {
     "B1_noBias_highPrec": "S1",
     "B2_noBias_lowPrec": "S2",
-    "L1_lowBias_highPrec": "S3",
-    "L2_lowBias_lowPrec": "S4",
-    "B3_mdBias_highPrec": "S5",
-    "B4_mdBias_lowPrec": "S6",
-    "B5_lgBias_highPrec": "S7",
-    "B6_lgBias_lowPrec": "S8",
+    "B3_mdBias_highPrec": "S3",
+    "B4_mdBias_lowPrec": "S4",
+    "B5_lgBias_highPrec": "S5",
+    "B6_lgBias_lowPrec": "S6",
+    "L1_lowBias_highPrec": "L1",
+    "L2_lowBias_lowPrec": "L2",
 }
 
 
@@ -122,7 +108,29 @@ def _save(fig, path):
     plt.close(fig)
 
 
+def _fmt_shift(v):
+    """Compact %g-style label for a single historical shift."""
+    return f"{float(v):g}"
+
+
+def _b_local_label(meta):
+    """Return "(b0,b1)" for a scenario dict that defines local shifts."""
+    bl = meta.get("b_local") if isinstance(meta, dict) else None
+    try:
+        return f"({_fmt_shift(bl[0])},{_fmt_shift(bl[1])})"
+    except (TypeError, IndexError, KeyError, ValueError):
+        return None
+
+
 def _scen_short_factorial(s):
+    """Three-line scenario label: index, historical shift(s), noise SD.
+
+    The middle line reports the LOCAL stratum-wise shifts whenever the
+    scenario defines them, because the primary grid keeps the X1 = 0 stratum
+    exactly compatible; the marginal shift b_theta would average that
+    structure away.  Scenarios without b_local (the precision and bias grids)
+    keep the legacy marginal-shift rendering.
+    """
     if s in SCENARIO_DISPLAY:
         return SCENARIO_DISPLAY[s]
     if config:
@@ -132,8 +140,18 @@ def _scen_short_factorial(s):
             if s in pool:
                 sc = pool[s]
                 idx = s.split("_")[0]
+                loc = _b_local_label(sc)
+                if loc is not None:
+                    return f"{idx}\n$b={loc}$\n$\\sigma_H={sc['sigma_h']}$"
                 return f"{idx}\n$b={sc['b_theta']}$\n$\\sigma_H={sc['sigma_h']}$"
     return s
+
+
+def _diag_se(frame, name):
+    """Standard error of a per-replication diagnostic column (skipna)."""
+    v = frame.get(name, pd.Series(dtype=float))
+    return v.std(ddof=1, skipna=True) / np.sqrt(max(len(v.dropna()), 1))
+
 
 def _aggregate(df, scenarios):
     df = df.copy()
@@ -141,6 +159,31 @@ def _aggregate(df, scenarios):
     df["coverage"] = ((df.ci_low <= td) & (td <= df.ci_high)).astype(int)
     df["width"] = df.ci_high - df.ci_low
     df["sq_err"] = (df.estimated_delta - td) ** 2
+    se = df["width"] / (2 * 1.959964)
+    valid_se = np.isfinite(se) & (se != 0)
+    df["z_abs"] = np.nan
+    df.loc[valid_se, "z_abs"] = (
+        np.abs(df.loc[valid_se, "estimated_delta"]) / se.loc[valid_se]
+    )
+
+    alpha = config.ALPHA if config is not None else 0.05
+    calibrated = {}
+    for sc in scenarios:
+        for mt in METHOD_ORDER:
+            cell = df[(df.scenario == sc) & (df.method == mt)]
+            null_z = cell.loc[cell.effect_type == "Null", "z_abs"]
+            power_z = cell.loc[cell.effect_type == "Power", "z_abs"]
+            null_z = null_z[np.isfinite(null_z)]
+            power_z = power_z[np.isfinite(power_z)]
+            if null_z.empty or power_z.empty:
+                calibrated[(sc, mt)] = (np.nan, np.nan)
+                continue
+            critical = np.nanquantile(null_z, 1 - alpha)
+            rejection = float((power_z > critical).mean())
+            rejection_se = float(np.sqrt(
+                rejection * (1 - rejection) / len(power_z)
+            ))
+            calibrated[(sc, mt)] = (rejection, rejection_se)
 
     rows = []
     for sc in scenarios:
@@ -148,6 +191,9 @@ def _aggregate(df, scenarios):
             for mt in METHOD_ORDER:
                 s = df[(df.scenario == sc) & (df.effect_type == ef) & (df.method == mt)]
                 if s.empty: continue
+                rejection_calibrated, rejection_calibrated_se = (
+                    calibrated[(sc, mt)] if ef == "Power" else (np.nan, np.nan)
+                )
                 rows.append(dict(
                     Scenario=sc, Effect=ef, Method=mt, n=len(s),
                     Bias=s.estimation_bias.mean(),
@@ -156,12 +202,20 @@ def _aggregate(df, scenarios):
                     Rejection=s.rejected.mean(),
                     Rejection_se=np.sqrt(s.rejected.mean()*(1-s.rejected.mean())/len(s)),
                     Rejection_ci95=1.96*np.sqrt(s.rejected.mean()*(1-s.rejected.mean())/len(s)),
+                    Rejection_calibrated=rejection_calibrated,
+                    Rejection_calibrated_se=rejection_calibrated_se,
+                    Rejection_calibrated_ci95=1.96*rejection_calibrated_se,
                     Coverage=s.coverage.mean(),
                     Width=s.width.mean(),
                     Width_se=s.width.std(ddof=1)/np.sqrt(len(s)),
                     Alloc=s.allocation_ratio.mean(),
                     Mean_W=s.get("mean_W", pd.Series(dtype=float)).mean(skipna=True),
-                    Mean_W_se=s.get("mean_W", pd.Series(dtype=float)).std(ddof=1, skipna=True)/np.sqrt(max(len(s.get("mean_W", pd.Series(dtype=float)).dropna()),1)),
+                    Mean_W_se=_diag_se(s, "mean_W"),
+                    # Stratum-wise Stage-III weights (covariate-local borrowing)
+                    Mean_W_x1_0=s.get("mean_W_x1_0", pd.Series(dtype=float)).mean(skipna=True),
+                    Mean_W_x1_0_se=_diag_se(s, "mean_W_x1_0"),
+                    Mean_W_x1_1=s.get("mean_W_x1_1", pd.Series(dtype=float)).mean(skipna=True),
+                    Mean_W_x1_1_se=_diag_se(s, "mean_W_x1_1"),
                     Mean_Rn=s.get("mean_Rn", pd.Series(dtype=float)).mean(skipna=True),
                     Mean_Dpdc=s.get("mean_Dpdc", pd.Series(dtype=float)).mean(skipna=True),
                 ))
@@ -192,12 +246,19 @@ _REGIME_LAYOUTS = {
 }
 
 
-def _regime_bands(ax, scenarios, label=True):
-    """Shade conflict regimes for either the six- or eight-cell grid."""
+def _regime_bands(ax, scenarios, label=True, names=None):
+    """Shade conflict regimes for either the six- or eight-cell grid.
+
+    names optionally overrides the regime captions, which the three-column
+    borrowing figure needs because the full captions would run together on a
+    panel that is about a third of a page wide.
+    """
     regimes = _REGIME_LAYOUTS.get(len(scenarios))
     if regimes is None:
         return
     for k, (name, lo, hi) in enumerate(regimes):
+        if names:
+            name = names.get(name, name)
         if k % 2 == 1:
             ax.axvspan(lo - 0.5, hi - 0.5, color="0.5", alpha=0.07, zorder=0)
         if lo > 0:
@@ -328,40 +389,6 @@ def plot_figure1_allocation(df, scen_order, out_dir):
     print("  [ok] Figure 1: allocation ratio")
 
 
-def plot_figure2_bias_rmse(df, scen_order, out_dir):
-    agg = _aggregate(df, scen_order)
-    if agg.empty: return
-    fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.6))
-    for col, eff in enumerate(["Null", "Power"]):
-        sub = agg[agg.Effect == eff]
-        scen = [s for s in scen_order if s in sub.Scenario.values]
-
-        # Row 1 -- estimation bias.  This is the robustness axis: borrowing a
-        # biased reference transfers that bias straight into the estimator.
-        ax = axes[0, col]
-        _regime_bands(ax, scen)
-        _grouped_bar(ax, sub, scen, "Bias", "Estimation bias",
-                     ref_line=0, ref_label="zero bias",
-                     err_metric="Bias_se")
-        ax.set_title(f"Bias: {EFFECT_DISPLAY[eff]}", pad=14)
-
-        # Row 2 -- relative efficiency against KBCD, on the equivalent-trial-
-        # size scale.  Above the line the design is more accurate than the
-        # concurrent-only baseline, below it borrowing has cost accuracy.
-        ax = axes[1, col]
-        _regime_bands(ax, scen, label=False)
-        emax = float(np.nanmax(sub["ESS"].values)) if len(sub) else 1.5
-        _grouped_bar(ax, sub, scen, "ESS",
-                     "Efficiency vs KBCD\n" r"$(\mathrm{RMSE}_{\mathrm{KBCD}}/\mathrm{RMSE})^2$",
-                     ref_line=1.0, ref_label="KBCD baseline",
-                     ylim=(0, max(1.6, emax * 1.22)))
-        ax.set_title(f"Relative efficiency: {EFFECT_DISPLAY[eff]}")
-    _shared_method_legend(fig, loc="lower center", ncol=3, y=-0.08)
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
-    _save(fig, out_dir / "plots" / "fig2_bias_rmse.pdf")
-    print("  [ok] Figure 2: bias / relative efficiency")
-
-
 def plot_figure3_ci(df, scen_order, out_dir):
     agg = _aggregate(df, scen_order)
     if agg.empty: return
@@ -396,7 +423,7 @@ def plot_figure4_testing(df, scen_order, out_dir):
     fig, axes = plt.subplots(1, 2, figsize=(COL2_W, 3.1))
     for ax, eff, ttl in zip(axes, ["Null", "Power"],
                             ["Type I Error  ($\\Delta=0$)",
-                             "Statistical Power  ($\\Delta=0.5$)"]):
+                             "Calibrated Power  ($\\Delta=0.5$)"]):
         sub = agg[agg.Effect == eff]
         scen = [s for s in scen_order if s in sub.Scenario.values]
         _regime_bands(ax, scen)
@@ -413,9 +440,9 @@ def plot_figure4_testing(df, scen_order, out_dir):
         else:
             # Zoom to the occupied range: on a 0-1 axis the B1 borrowing gain
             # is compressed into a few pixels and reads as "no difference".
-            lo = float(np.nanmin(sub.Rejection.values))
-            _grouped_bar(ax, sub, scen, "Rejection", "Power",
-                         err_metric="Rejection_ci95",
+            lo = float(np.nanmin(sub.Rejection_calibrated.values))
+            _grouped_bar(ax, sub, scen, "Rejection_calibrated", "Power",
+                         err_metric="Rejection_calibrated_ci95",
                          ylim=(max(0.0, lo - 0.10), 1.02))
         ax.set_title(ttl, pad=14)
     _shared_method_legend(fig, y=1.07)
@@ -424,13 +451,61 @@ def plot_figure4_testing(df, scen_order, out_dir):
     print("  [ok] Figure 4: type I / power")
 
 
-def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
-    """Borrowing mechanism: information ratio and conflict index by scenario.
+# (method, column, fill alpha, hatch) drawn left to right inside each scenario
+# group: solid = X1 = 0 stratum, hatched = X1 = 1 stratum.  KBCD is omitted
+# because its Stage-III weight is 0/1 by construction.
+_LOCAL_WEIGHT_SERIES = [
+    ("RADISH", "Mean_W_x1_0", 0.85, None),
+    ("RADISH", "Mean_W_x1_1", 0.55, "///"),
+    ("CAHB",   "Mean_W_x1_0", 0.85, None),
+    ("CAHB",   "Mean_W_x1_1", 0.55, "///"),
+]
 
-    The mean borrowing weight is reported in the operating-characteristics
-    tables instead of here, since W = (R_n - 1)/R_n is a deterministic
-    transform of the information ratio and plotting both would show the same
-    quantity twice.
+# Compact regime captions for the three-column borrowing figure.
+_REGIME_SHORT = {"Compatible": "Comp.", "Low conflict": "Low",
+                 "Moderate conflict": "Mod.", "Severe conflict": "Severe"}
+
+
+def _local_weight_bars(ax, agg, scenarios, width=0.19):
+    """Grouped bars of the mean Stage-III weight within each covariate stratum."""
+    x = np.arange(len(scenarios))
+    n = len(_LOCAL_WEIGHT_SERIES)
+    offs = (np.arange(n) - (n - 1) / 2.0) * (width + 0.02)
+    for off, (mt, col, alpha, hatch) in zip(offs, _LOCAL_WEIGHT_SERIES):
+        vals = []
+        for sc in scenarios:
+            row = agg[(agg.Method == mt) & (agg.Scenario == sc)]
+            vals.append(float(row[col].values[0])
+                        if (len(row) and col in agg.columns) else np.nan)
+        ax.bar(x + off, vals, width, color=METHOD_COLORS[mt], alpha=alpha,
+               hatch=hatch,
+               edgecolor="0.25" if hatch else "white",
+               linewidth=0.5 if hatch else 0.7)
+    # Headroom above the unit interval so the stratum key never covers a bar.
+    ax.set_ylim(0, 1.24)
+    ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
+    # Colour already encodes the method, so the in-panel legend only names the
+    # two strata through their fill style.
+    strata = [
+        mpatches.Patch(facecolor="0.4", alpha=0.85, edgecolor="white",
+                       linewidth=0.7, label=r"$X_1=0$"),
+        mpatches.Patch(facecolor="0.4", alpha=0.55, edgecolor="0.25",
+                       linewidth=0.5, hatch="///", label=r"$X_1=1$"),
+    ]
+    ax.legend(handles=strata, loc="upper center", ncol=2, fontsize=6.0,
+              handlelength=1.0, handletextpad=0.3, borderpad=0.25,
+              columnspacing=0.8, bbox_to_anchor=(0.5, 1.0))
+
+
+def _plot_figure5_mechanism_legacy(df, scen_order, out_dir):
+    """Legacy borrowing-mechanism panel retained for reproducibility.
+
+    Panel (a) is the effective information gain, panel (b) the covariate-local
+    borrowing profile -- the mean Stage-III weight inside each stratum, which
+    is where the conflict actually lives -- and panel (c) the conflict index
+    that drives the local decline.  The single mean weight is reported in the
+    operating-characteristics table, where it can be read against the
+    stratum-wise values plotted here.
     """
     agg = _aggregate(df, scen_order)
     if agg.empty: return
@@ -438,18 +513,34 @@ def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
     sub = agg[agg.Effect == "Power"]
     scen = [s for s in scen_order if s in sub.Scenario.values]
 
-    fig, axes = plt.subplots(1, 2, figsize=(COL2_W, 3.0))
+    fig, axes = plt.subplots(1, 3, figsize=(COL2_W, 2.9))
+
+    # (a) Effective information gain.
     ax = axes[0]
-    _regime_bands(ax, scen)
-    _grouped_bar(ax, sub, scen, "Mean_Rn", r"Mean information ratio $\overline{R_n(x)}$",
+    _regime_bands(ax, scen, names=_REGIME_SHORT)
+    _grouped_bar(ax, sub, scen, "Mean_Rn",
+                 r"Mean information ratio $\overline{R_n(x)}$",
                  ref_line=1.0, ref_label=r"$R_n=1$ (no borrowing)",
                  ylim=(0.95, max(1.6, sub.Mean_Rn.max()*1.10)))
-    ax.set_title(r"Effective information gain", pad=14)
+    ax.set_ylabel(r"Mean information ratio $\overline{R_n(x)}$", fontsize=7.6)
+    ax.set_title(r"Effective information gain", pad=12, fontsize=8)
+    ax.tick_params(axis="both", labelsize=6.8)
 
-    # Conflict index is defined for RADISH only (CAHB has no HCC statistic
-    # and KBCD never borrows), so this panel carries a single series.
+    # (b) Covariate-local borrowing profile.
     ax = axes[1]
-    _regime_bands(ax, scen)
+    _regime_bands(ax, scen, names=_REGIME_SHORT)
+    _local_weight_bars(ax, sub, scen)
+    ax.set_xticks(np.arange(len(scen)))
+    ax.set_xticklabels([_scen_short_factorial(s) for s in scen], fontsize=6.8)
+    ax.set_ylabel(r"Mean borrowing weight $\overline{W}$", fontsize=7.6)
+    ax.set_title("Local borrowing profile", pad=12, fontsize=8)
+    ax.tick_params(axis="y", labelsize=6.8)
+    ax.margins(x=0.02)
+
+    # (c) Conflict index.  Defined for RADISH only (CAHB has no HCC statistic
+    # and KBCD never borrows), so this panel carries a single series.
+    ax = axes[2]
+    _regime_bands(ax, scen, label=False)
     r = sub[sub.Method == "RADISH"]
     vals = [float(r[r.Scenario == s]["Mean_Dpdc"].values[0]) if len(r[r.Scenario == s])
             else np.nan for s in scen]
@@ -457,13 +548,17 @@ def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
            alpha=0.88, edgecolor="white", linewidth=0.7)
     for i, v in enumerate(vals):
         if np.isfinite(v):
-            ax.text(i, v * 1.12, f"{v:.1f}", ha="center", va="bottom", fontsize=6.8)
+            ax.text(i, v * 1.12, f"{v:.1f}", ha="center", va="bottom", fontsize=6.0)
     ax.set_yscale("log")
-    ax.set_ylim(top=float(np.nanmax(vals)) * 2.6)
+    vmax = float(np.nanmax(vals)) if np.isfinite(vals).any() else np.nan
+    if np.isfinite(vmax) and vmax > 0:
+        ax.set_ylim(top=vmax * 2.6)
     ax.set_xticks(np.arange(len(scen)))
-    ax.set_xticklabels([_scen_short_factorial(s) for s in scen], fontsize=7.3)
-    ax.set_ylabel(r"Mean conflict index $\overline{D_{\mathrm{HCC}}(x)}$")
-    ax.set_title(r"Conflict detection (RADISH)", pad=14)
+    ax.set_xticklabels([_scen_short_factorial(s) for s in scen], fontsize=6.8)
+    ax.set_ylabel(r"Mean conflict index $\overline{D_{\mathrm{HCC}}(x)}$",
+                  fontsize=7.6)
+    ax.set_title(r"Conflict detection (RADISH)", pad=12, fontsize=8)
+    ax.tick_params(axis="y", labelsize=6.8)
     ax.margins(x=0.02)
 
     _shared_method_legend(fig, y=1.06)
@@ -472,36 +567,208 @@ def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
     print("  [ok] Figure 5: borrowing diagnostics")
 
 
+def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
+    """CAHB-style operating-characteristic display for local borrowing.
+
+    The precise-history path isolates increasing covariate-dependent conflict.
+    Outcome panels show the consequence; stratum panels show where borrowing
+    and allocation change.
+    """
+    scenario_meta = {}
+    if config:
+        candidates = (
+            config.SCENARIOS,
+            getattr(config, "LOCAL_PATH_SCENARIOS", {}),
+            config.get_mode_scenarios("full"),
+        )
+        scenario_meta = next(
+            (pool for pool in candidates if all(sc in pool for sc in scen_order)),
+            {},
+        )
+    precise = []
+    for sc in scen_order:
+        meta = scenario_meta.get(sc, {})
+        if meta.get("sigma_h") == 0.5:
+            precise.append(sc)
+    if not precise:
+        return
+    agg = _aggregate(df, precise)
+    power = agg[agg.Effect == "Power"]
+    x = np.array([scenario_meta[s]["b_local"][1] for s in precise])
+
+    fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.15), sharex=True)
+
+    ax = axes[0, 0]
+    for mt in METHOD_ORDER:
+        vals, errs = [], []
+        for sc in precise:
+            s = df[(df.scenario == sc) & (df.effect_type == "Power") &
+                   (df.method == mt)]
+            ae = np.abs(s.estimated_delta - s.true_delta)
+            vals.append(ae.mean())
+            errs.append(1.96 * ae.std(ddof=1) / np.sqrt(max(len(ae), 1)))
+        ax.errorbar(x, vals, yerr=errs, color=METHOD_COLORS[mt],
+                    marker=METHOD_MARKERS[mt], linestyle="-", capsize=2,
+                    label=METHOD_LABELS[mt])
+    ax.set_ylabel(r"Mean absolute error $|\widehat\Delta-\Delta|$")
+
+    ax = axes[0, 1]
+    for mt in METHOD_ORDER:
+        r = power[power.Method == mt].set_index("Scenario")
+        vals = np.array([r.loc[s, "Rejection_calibrated"] for s in precise])
+        errs = 1.96 * np.array([r.loc[s, "Rejection_calibrated_se"] for s in precise])
+        ax.errorbar(x, vals, yerr=errs, color=METHOD_COLORS[mt],
+                    marker=METHOD_MARKERS[mt], linestyle="-", capsize=2)
+    ax.set_ylabel("Calibrated power")
+    ax.set_ylim(0.0, 1.01)
+
+    ax = axes[1, 0]
+    for mt in ("CAHB", "RADISH"):
+        r = power[power.Method == mt].set_index("Scenario")
+        for k, ls in ((0, "-"), (1, "--")):
+            vals = np.array([r.loc[s, f"Mean_W_x1_{k}"] for s in precise])
+            errs = 1.96 * np.array([r.loc[s, f"Mean_W_x1_{k}_se"] for s in precise])
+            ax.errorbar(x, vals, yerr=errs, color=METHOD_COLORS[mt],
+                        marker=METHOD_MARKERS[mt], linestyle=ls, capsize=2)
+    ax.axhline(0, color="0.45", linewidth=0.8, linestyle=":")
+    ax.set_ylabel(r"Mean final borrowing weight $\overline{W}_N^F$")
+    ax.set_ylim(-0.02, 0.58)
+
+    ax = axes[1, 1]
+    for mt in ("CAHB", "RADISH"):
+        for k, ls in ((0, "-"), (1, "--")):
+            vals, errs = [], []
+            for sc in precise:
+                s = df[(df.scenario == sc) & (df.effect_type == "Power") &
+                       (df.method == mt)][f"alloc_x1_{k}"].dropna()
+                vals.append(s.mean())
+                errs.append(1.96 * s.std(ddof=1) / np.sqrt(max(len(s), 1)))
+            ax.errorbar(x, vals, yerr=errs, color=METHOD_COLORS[mt],
+                        marker=METHOD_MARKERS[mt], linestyle=ls, capsize=2)
+    ax.axhline(0.5, color=METHOD_COLORS["KBCD"], linewidth=1.0,
+               linestyle=":")
+    ax.set_ylabel("Proportion assigned to treatment")
+    ax.set_ylim(0.47, 0.62)
+
+    for label, ax in zip("abcd", axes.ravel()):
+        ax.set_title(f"({label})", loc="left", pad=5, fontweight="bold")
+        ax.set_xticks(x)
+        span = max(float(np.ptp(x)), 1.0)
+        ax.set_xlim(float(np.min(x)) - 0.04 * span,
+                    float(np.max(x)) + 0.04 * span)
+    for ax in axes[1, :]:
+        ax.set_xlabel(r"Local conflict in $X_1=1$ stratum, $b_1$")
+
+    method_handles = [plt.Line2D([], [], color=METHOD_COLORS[m],
+                      marker=METHOD_MARKERS[m], label=METHOD_LABELS[m])
+                      for m in METHOD_ORDER]
+    stratum_handles = [
+        plt.Line2D([], [], color="0.25", linestyle="-", label=r"$X_1=0$ lower conflict"),
+        plt.Line2D([], [], color="0.25", linestyle="--", label=r"$X_1=1$ higher conflict"),
+    ]
+    fig.legend(handles=method_handles + stratum_handles, loc="upper center",
+               bbox_to_anchor=(0.5, 1.01), ncol=5, frameon=False, fontsize=7.2)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    _save(fig, out_dir / "plots" / "fig5_borrowing_diagnostics.pdf")
+    print("  [ok] Figure 5: local borrowing operating characteristics")
+
+
+def plot_global_local_quadrants(df, scen_order, out_dir):
+    """Compact diagnostic for the orthogonal global-by-local experiment."""
+    labels = [r"$G^-L^-$", r"$G^+L^-$", r"$G^-L^+$", r"$G^+L^+$"]
+    x = np.arange(len(scen_order))
+    fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.0), sharex=True)
+
+    ax = axes[0, 0]
+    for method in ("CAHB", "RADISH"):
+        rows = df[(df.effect_type == "Power") & (df.method == method)]
+        for k, ls in ((0, "-"), (1, "--")):
+            vals = [rows[rows.scenario == sc][f"mean_W_x1_{k}"].mean()
+                    for sc in scen_order]
+            ax.plot(x, vals, color=METHOD_COLORS[method], marker=METHOD_MARKERS[method],
+                    linestyle=ls)
+    ax.set_ylabel(r"Mean final borrowing weight")
+
+    ax = axes[0, 1]
+    for method in ("CAHB", "RADISH"):
+        rows = df[(df.effect_type == "Power") & (df.method == method)]
+        for k, ls in ((0, "-"), (1, "--")):
+            vals = [rows[rows.scenario == sc][f"alloc_x1_{k}"].mean()
+                    for sc in scen_order]
+            ax.plot(x, vals, color=METHOD_COLORS[method], marker=METHOD_MARKERS[method],
+                    linestyle=ls)
+    ax.axhline(0.5, color="0.45", linewidth=0.8, linestyle=":")
+    ax.set_ylabel("Proportion assigned to treatment")
+
+    agg = _aggregate(df, scen_order)
+    power = agg[agg.Effect == "Power"]
+    ax = axes[1, 0]
+    for method in METHOD_ORDER:
+        r = power[power.Method == method].set_index("Scenario")
+        ax.plot(x, [r.loc[sc, "RMSE"] for sc in scen_order],
+                color=METHOD_COLORS[method], marker=METHOD_MARKERS[method])
+    ax.set_ylabel("RMSE")
+
+    ax = axes[1, 1]
+    for method in METHOD_ORDER:
+        r = power[power.Method == method].set_index("Scenario")
+        ax.plot(x, [r.loc[sc, "Rejection_calibrated"] for sc in scen_order],
+                color=METHOD_COLORS[method], marker=METHOD_MARKERS[method])
+    ax.set_ylabel("Calibrated power")
+
+    for label, ax in zip("abcd", axes.ravel()):
+        ax.set_title(f"({label})", loc="left", pad=5, fontweight="bold")
+        ax.set_xticks(x, labels)
+        ax.grid(axis="y", alpha=0.22, linewidth=0.5)
+    method_handles = [plt.Line2D([], [], color=METHOD_COLORS[m],
+                      marker=METHOD_MARKERS[m], label=METHOD_LABELS[m])
+                      for m in METHOD_ORDER]
+    stratum_handles = [
+        plt.Line2D([], [], color="0.25", linestyle="-", label=r"$X_1=0$"),
+        plt.Line2D([], [], color="0.25", linestyle="--", label=r"$X_1=1$"),
+    ]
+    fig.legend(handles=method_handles + stratum_handles, loc="upper center",
+               bbox_to_anchor=(0.5, 1.01), ncol=5, frameon=False, fontsize=7.2)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    _save(fig, out_dir / "plots" / "fig_global_local_quadrants.pdf")
+    print("  [ok] Global-by-local four-quadrant diagnostic")
+
+
 def plot_figure6_precision_map(df, scen_order, out_dir):
-    """NEW: 2-D precision-bias map of borrowing weight."""
+    """2-D map of borrowing weight over local conflict and historical noise."""
     if config is None: return
     rows = []
     for sc in scen_order:
         primary = getattr(config, "PRIMARY_SCENARIOS", getattr(config, "DEMO_SCENARIOS", {}))
         meta = primary.get(sc, config.SCENARIOS.get(sc, {}))
-        b = meta.get("b_theta"); sh = meta.get("sigma_h")
+        # The x coordinate is the LOCAL conflict b1 whenever the grid defines
+        # it: the marginal shift would plot a cell whose X1 = 0 stratum is
+        # exactly compatible at the same coordinate as a uniformly shifted one.
+        bl = meta.get("b_local") if isinstance(meta, dict) else None
+        b = float(bl[1]) if bl is not None else meta.get("b_theta")
+        sh = meta.get("sigma_h")
         for mt in ["CAHB", "RADISH"]:
             s = df[(df.scenario==sc)&(df.effect_type=="Power")&(df.method==mt)]
             if s.empty or "mean_W" not in s: continue
-            rows.append(dict(b_theta=b, sigma_h=sh, method=mt,
+            rows.append(dict(b_loc=b, sigma_h=sh, method=mt,
                              W=s.mean_W.mean(skipna=True)))
     pdat = pd.DataFrame(rows).dropna()
     if pdat.empty: return
 
     fig, axes = plt.subplots(1, 2, figsize=(COL2_W, 3.0), sharey=True)
     # Build coordinate axes
-    bvals = sorted(pdat.b_theta.unique())
+    bvals = sorted(pdat.b_loc.unique())
     svals = sorted(pdat.sigma_h.unique())
     for ax, mt in zip(axes, ["CAHB", "RADISH"]):
         Z = np.full((len(svals), len(bvals)), np.nan)
         for _, r in pdat[pdat.method == mt].iterrows():
-            i = svals.index(r.sigma_h); j = bvals.index(r.b_theta)
+            i = svals.index(r.sigma_h); j = bvals.index(r.b_loc)
             Z[i, j] = r.W
         im = ax.imshow(Z, aspect="auto", origin="lower", cmap=SEQ_CMAP,
                        vmin=0, vmax=max(0.4, np.nanmax(Z)*1.05))
         ax.set_xticks(range(len(bvals))); ax.set_xticklabels([f"{b:g}" for b in bvals])
         ax.set_yticks(range(len(svals))); ax.set_yticklabels([f"{s:g}" for s in svals])
-        ax.set_xlabel(r"Historical bias  $b_\theta$")
+        ax.set_xlabel(r"Local conflict  $b_1$")
         if mt == "CAHB": ax.set_ylabel(r"Historical noise SD  $\sigma_H$")
         ax.set_title(f"{mt}: mean $W(x)$")
         for i in range(Z.shape[0]):
@@ -680,18 +947,26 @@ def write_factorial_table(df, scen_order, out_dir):
     """Diagnostics-augmented summary table (LaTeX + CSV)."""
     agg = _aggregate(df, scen_order)
     cols = ["Scenario", "Effect", "Method", "n",
-            "Bias", "RMSE", "Rejection", "Coverage", "Width",
-            "Mean_W", "Mean_Rn", "Mean_Dpdc", "Alloc"]
+            "Bias", "RMSE", "ESS",
+            "Rejection", "Rejection_calibrated", "Coverage", "Width",
+            "Mean_W", "Mean_W_x1_0", "Mean_W_x1_1",
+            "Mean_Rn", "Mean_Dpdc", "Alloc"]
     out = agg[cols].copy()
     out.to_csv(out_dir / "tables" / "metrics_full.csv", index=False)
-    fmt = {"Bias":"{:.4f}","RMSE":"{:.4f}","Rejection":"{:.3f}",
+    fmt = {"Bias":"{:.4f}","RMSE":"{:.4f}","ESS":"{:.3f}",
+           "Rejection":"{:.3f}",
+           "Rejection_calibrated":"{:.3f}",
            "Coverage":"{:.3f}","Width":"{:.3f}",
-           "Mean_W":"{:.3f}","Mean_Rn":"{:.3f}","Mean_Dpdc":"{:.3f}",
+           "Mean_W":"{:.3f}","Mean_W_x1_0":"{:.3f}","Mean_W_x1_1":"{:.3f}",
+           "Mean_Rn":"{:.3f}","Mean_Dpdc":"{:.3f}",
            "Alloc":"{:.3f}"}
     for c, f in fmt.items():
         out[c] = out[c].apply(lambda v: f.format(v) if pd.notna(v) and v != "" else "—")
     out_tex = out.rename(columns={
+        "Rejection_calibrated": "Power (calibrated)",
         "Mean_W":  r"$\overline{W}$",
+        "Mean_W_x1_0": r"$\overline{W}_{X_1=0}$",
+        "Mean_W_x1_1": r"$\overline{W}_{X_1=1}$",
         "Mean_Rn": r"$\overline{R_n}$",
         "Mean_Dpdc": r"$\overline{D_{\mathrm{PDC}}}$",
         "Scenario": "Scenario", "Alloc": "Alloc.\\,Ratio",
@@ -702,9 +977,12 @@ def write_factorial_table(df, scen_order, out_dir):
         tex = (
             "\\begin{table}[!ht]\n\\centering\n"
             "\\caption{Operating characteristics across the conflict-by-precision "
-            "design, including borrowing diagnostics "
-            "($\\overline{W}$, $\\overline{R_n}$, "
-            "$\\overline{D_{\\mathrm{PDC}}}$). "
+            "design, including the relative efficiency "
+            "$\\mathrm{ESS} = (\\mathrm{RMSE}_{\\mathrm{KBCD}}/\\mathrm{RMSE})^2$ "
+            "and the borrowing diagnostics $\\overline{R_n}$, "
+            "$\\overline{W}$, the stratum-wise weights "
+            "$\\overline{W}_{X_1=0}$ and $\\overline{W}_{X_1=1}$, and the "
+            "conflict index $\\overline{D_{\\mathrm{PDC}}}$. "
             "Each cell is averaged over Monte~Carlo replications.}\n"
             "\\label{tab:metrics_full}\n"
             f"{body}\n\\end{{table}}\n"
@@ -1051,11 +1329,16 @@ def run_analysis(df, out_dir, mode="full"):
         print("Bias sensitivity theory-verification analysis complete.")
         return
 
+    if mode == "global_local":
+        scenarios = config.get_mode_scenarios(mode)
+        plot_global_local_quadrants(df, list(scenarios), out_dir)
+        print("Global-by-local diagnostic analysis complete.")
+        return
+
     # Factorial figures for the mode-specific six- or eight-cell grid.
     scen_order = list(config.get_mode_scenarios(mode).keys()) if config else \
                  sorted(df.scenario.unique())
     plot_figure1_allocation(df, scen_order, out_dir)
-    plot_figure2_bias_rmse(df, scen_order, out_dir)
     plot_figure3_ci(df, scen_order, out_dir)
     plot_figure4_testing(df, scen_order, out_dir)
     plot_figure5_borrowing_diagnostics(df, scen_order, out_dir)

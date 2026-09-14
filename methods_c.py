@@ -291,6 +291,8 @@ class KBCD:
 
     def compute_diagnostics(self, X, Y, Z):
         return {"mean_W": 0.0, "mean_Rn": 1.0,
+                "mean_W_x1_0": 0.0, "mean_W_x1_1": 0.0,
+                "mean_Rn_x1_0": 1.0, "mean_Rn_x1_1": 1.0,
                 "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
 
 
@@ -365,16 +367,26 @@ class CAHB:
         Xc = _arr(_as_2d(X)); Y = _arr(Y); Z = np.asarray(Z, int)
         if (Z == 0).sum() < 2 or (Z == 1).sum() < 2:
             return {"mean_W": np.nan, "mean_Rn": np.nan,
+                    "mean_W_x1_0": np.nan, "mean_W_x1_1": np.nan,
+                    "mean_Rn_x1_0": np.nan, "mean_Rn_x1_1": np.nan,
                     "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
         m = self._fit_arrays(Xc, Y, Z)
         if m is None:
             return {"mean_W": np.nan, "mean_Rn": np.nan,
+                    "mean_W_x1_0": np.nan, "mean_W_x1_1": np.nan,
+                    "mean_Rn_x1_0": np.nan, "mean_Rn_x1_1": np.nan,
                     "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
         Rn = np.zeros(m["n"])
         _lib.cahb_Rn_batch(Xc, m["n"], Xc, m["Z"], m["n"], m["p"],
                            m["tau"], m["phi"], self.h, Rn)
         W = (Rn - 1.0) / np.maximum(Rn, 1e-12)
+        x1_0 = Xc[:, 0] == 0
+        x1_1 = Xc[:, 0] == 1
         return {"mean_W": float(W.mean()), "mean_Rn": float(Rn.mean()),
+                "mean_W_x1_0": float(W[x1_0].mean()) if np.any(x1_0) else np.nan,
+                "mean_W_x1_1": float(W[x1_1].mean()) if np.any(x1_1) else np.nan,
+                "mean_Rn_x1_0": float(Rn[x1_0].mean()) if np.any(x1_0) else np.nan,
+                "mean_Rn_x1_1": float(Rn[x1_1].mean()) if np.any(x1_1) else np.nan,
                 "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
 
 
@@ -459,6 +471,8 @@ class RADISH:
         i0 = np.where(Z == 0)[0]
         if len(i0) < 2:
             return {"mean_W": np.nan, "mean_Rn": np.nan,
+                    "mean_W_x1_0": np.nan, "mean_W_x1_1": np.nan,
+                    "mean_Rn_x1_0": np.nan, "mean_Rn_x1_1": np.nan,
                     "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
         n = Xc.shape[0]
         Rn = np.zeros(n); W = np.zeros(n); D = np.zeros(n); T2 = np.zeros(n)
@@ -469,7 +483,13 @@ class RADISH:
             Xc.shape[1], self.h, self.n0_fin,
             Rn, W, D, T2,
         )
+        x1_0 = Xc[:, 0] == 0
+        x1_1 = Xc[:, 0] == 1
         return {"mean_W": float(W.mean()), "mean_Rn": float(Rn.mean()),
+                "mean_W_x1_0": float(W[x1_0].mean()) if np.any(x1_0) else np.nan,
+                "mean_W_x1_1": float(W[x1_1].mean()) if np.any(x1_1) else np.nan,
+                "mean_Rn_x1_0": float(Rn[x1_0].mean()) if np.any(x1_0) else np.nan,
+                "mean_Rn_x1_1": float(Rn[x1_1].mean()) if np.any(x1_1) else np.nan,
                 "mean_Dpdc": float(D.mean()), "mean_tau2_H": float(T2.mean())}
 
 

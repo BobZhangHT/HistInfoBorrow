@@ -28,6 +28,19 @@ def _prepare(df):
         & (out["true_delta"] <= out["ci_high"])
     ).astype(float)
     out["width"] = out["ci_high"] - out["ci_low"]
+    se = out["width"] / (2.0 * 1.959964)
+    out["z_abs"] = np.abs(out["estimated_delta"]) / se
+    out["reported_rejection"] = out["rejected"].astype(float)
+    for (n_h, scenario, method), cell in out.groupby(
+            ["n_historical", "scenario", "method"]):
+        null_z = cell.loc[cell.effect_type == "Null", "z_abs"].dropna()
+        if null_z.empty:
+            continue
+        critical = np.quantile(null_z, 1.0 - config.ALPHA)
+        mask = ((out.n_historical == n_h) & (out.scenario == scenario) &
+                (out.method == method) & (out.effect_type == "Power"))
+        out.loc[mask, "reported_rejection"] = (
+            out.loc[mask, "z_abs"] > critical).astype(float)
     return out
 
 
@@ -75,7 +88,7 @@ def paired_history_size_comparison(df):
     rows = []
     mean_metrics = {
         "Bias": "error",
-        "Rejection": "rejected",
+        "Rejection": "reported_rejection",
         "Coverage": "coverage",
         "Width": "width",
         "Allocation": "allocation_ratio",
@@ -148,8 +161,8 @@ def method_contrasts(df):
             else:
                 rmse_gain_se = np.nan
             rejection_gain, rejection_se, rejection_l, rejection_u, _ = _paired_mean(
-                group["rejected_other"].to_numpy(dtype=float),
-                group["rejected_radish"].to_numpy(dtype=float))
+                group["reported_rejection_other"].to_numpy(dtype=float),
+                group["reported_rejection_radish"].to_numpy(dtype=float))
             width_reduction, width_se, width_l, width_u, _ = _paired_mean(
                 group["width_radish"].to_numpy(dtype=float),
                 group["width_other"].to_numpy(dtype=float))
@@ -232,8 +245,10 @@ def advantage_change(df):
             )
             se_rmse = float(np.std(influence, ddof=1) / np.sqrt(len(influence)))
 
-            rejection_did = ((r_high.rejected.to_numpy() - c_high.rejected.to_numpy())
-                             - (r_low.rejected.to_numpy() - c_low.rejected.to_numpy()))
+            rejection_did = ((r_high.reported_rejection.to_numpy() -
+                              c_high.reported_rejection.to_numpy())
+                             - (r_low.reported_rejection.to_numpy() -
+                                c_low.reported_rejection.to_numpy()))
             width_did = ((c_high.width.to_numpy() - r_high.width.to_numpy())
                          - (c_low.width.to_numpy() - r_low.width.to_numpy()))
             coverage_did = ((r_high.coverage.to_numpy() - c_high.coverage.to_numpy())
@@ -290,7 +305,7 @@ def _plot_sensitivity(comparison, out_path):
     fig, axes = plt.subplots(2, 2, figsize=(6.83, 5.25), sharex=True)
     panels = [
         ("RMSE", "RMSE", "(a) RMSE"),
-        ("Rejection", "Power", "(b) Power"),
+        ("Rejection", "Calibrated power", "(b) Calibrated power"),
         ("Width", "CI width", "(c) Confidence-interval width"),
         ("Mean_W", "Mean borrowing weight", "(d) Borrowing weight"),
     ]
@@ -350,9 +365,9 @@ def _plot_conflict_robustness(comparison, out_path):
             ax.yaxis.grid(True, alpha=0.3)
             ax.xaxis.grid(False)
             if row == 0:
-                ax.set_ylim(0, 0.38)
+                ax.set_ylim(0, 0.62)
             else:
-                ax.set_ylim(0.60, 1.01)
+                ax.set_ylim(0.40, 1.01)
             ax.set_xticks(x, METHOD_ORDER)
     axes[0, 0].legend(frameon=False, loc="upper left")
     fig.tight_layout()

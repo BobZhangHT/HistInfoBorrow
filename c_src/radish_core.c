@@ -182,6 +182,55 @@ EXPORT void kernel_gauss_vec(
     }
 }
 
+/* Row-normalized Gaussian weights with log-weight stabilization.  All
+ * downstream local summaries depend on relative weights, so subtracting the
+ * largest log weight and normalizing is algebraically equivalent to using
+ * the original Gaussian values while preventing an all-zero row when the
+ * unscaled values underflow. */
+static void kernel_gauss_vec_stable(
+    const double *Xref, int n_ref, int p,
+    const double *x_star, const double *h,
+    double *w)
+{
+    if (n_ref <= 0) return;
+
+    double max_log = -HUGE_VAL;
+    int max_idx = 0;
+    int have_finite = 0;
+    for (int j = 0; j < n_ref; ++j) {
+        double s = squared_scaled_dist(x_star, Xref + (size_t)j*p, h, p);
+        double logw = -0.5 * s;
+        w[j] = logw;
+        if (isfinite(logw) && (!have_finite || logw > max_log)) {
+            max_log = logw;
+            max_idx = j;
+            have_finite = 1;
+        }
+    }
+
+    if (!have_finite) {
+        for (int j = 0; j < n_ref; ++j) w[j] = 0.0;
+        w[0] = 1.0;
+        return;
+    }
+
+    double total = 0.0;
+    for (int j = 0; j < n_ref; ++j) {
+        if (isfinite(w[j])) {
+            w[j] = exp(w[j] - max_log);
+            total += w[j];
+        } else {
+            w[j] = 0.0;
+        }
+    }
+    if (!isfinite(total) || total <= 0.0) {
+        for (int j = 0; j < n_ref; ++j) w[j] = 0.0;
+        w[max_idx] = 1.0;
+        return;
+    }
+    for (int j = 0; j < n_ref; ++j) w[j] /= total;
+}
+
 /* Product Epanechnikov kernel weight VECTOR.
  *   k(u) = max(0, 1 - u^2) * 0.75, product over dimensions.          */
 EXPORT void kernel_epan_vec(
@@ -227,8 +276,11 @@ static void build_normalized_S(
     int p, const double *h,
     double *S)   /* (n_eval, n_ref) */
 {
-    kernel_gauss_matrix(Xref, n_ref, Xeval, n_eval, p, h, S);
-    normalize_rows(S, n_eval, n_ref);
+    for (int i = 0; i < n_eval; ++i) {
+        kernel_gauss_vec_stable(Xref, n_ref, p,
+                                Xeval + (size_t)i * p, h,
+                                S + (size_t)i * n_ref);
+    }
 }
 
 /* Residual variance for one arm with second-order degrees-of-freedom
@@ -514,55 +566,42 @@ static void radish_single_eval(
 {
     /* Stage-I local historical prior */
     double *wH = (double *)malloc(sizeof(double) * (size_t)nh);
-    kernel_gauss_vec(Xh, nh, p, x_eval, h, wH);
+    kernel_gauss_vec_stable(Xh, nh, p, x_eval, h, wH);
     double swH = 0.0, sumH = 0.0;
     for (int j = 0; j < nh; ++j) { swH += wH[j]; }
 
     double theta, tau2H;
-    if (swH <= EPS) {
-        /* fallback: global mean / large variance */
-        double m = 0.0;
-        for (int j = 0; j < nh; ++j) m += Yh[j];
-        m /= nh;
-        theta = m;
-        tau2H = 1e6;
-    } else {
-        for (int j = 0; j < nh; ++j) sumH += wH[j] * Yh[j];
-        theta = sumH / swH;
-        double s2 = 0.0;
-        for (int j = 0; j < nh; ++j) {
-            double d = Yh[j] - theta;
-            s2 += wH[j] * d * d;
-        }
-        s2 /= swH;
-        if (s2 < EPS) s2 = EPS;
-        double neff = kernel_effective_n(wH, nh);
-        tau2H = s2 / neff;
-        if (tau2H < EPS) tau2H = EPS;
+    for (int j = 0; j < nh; ++j) sumH += wH[j] * Yh[j];
+    theta = sumH / swH;
+    double s2 = 0.0;
+    for (int j = 0; j < nh; ++j) {
+        double d = Yh[j] - theta;
+        s2 += wH[j] * d * d;
     }
+    s2 /= swH;
+    if (s2 < EPS) s2 = EPS;
+    double neff = kernel_effective_n(wH, nh);
+    tau2H = s2 / neff;
+    if (tau2H < EPS) tau2H = EPS;
     free(wH);
 
     /* Stage-II concurrent-control summary */
     double *w0 = (double *)malloc(sizeof(double) * (size_t)(n0 > 0 ? n0 : 1));
     double Nc_raw = 0.0, Nc_eff = 1e-6, ybar = 0.0, s2c = 1.0;
     if (n0 > 0) {
-        kernel_gauss_vec(X0, n0, p, x_eval, h, w0);
+        kernel_gauss_vec_stable(X0, n0, p, x_eval, h, w0);
         for (int i = 0; i < n0; ++i) Nc_raw += w0[i];
         Nc_eff = kernel_effective_n(w0, n0);
-        if (Nc_raw > EPS) {
-            double sy = 0.0;
-            for (int i = 0; i < n0; ++i) sy += w0[i] * Y0[i];
-            ybar = sy / Nc_raw;
-            double s2 = 0.0;
-            for (int i = 0; i < n0; ++i) {
-                double d = Y0[i] - ybar;
-                s2 += w0[i] * d * d;
-            }
-            s2 /= Nc_raw;
-            s2c = s2 > EPS ? s2 : EPS;
-        } else {
-            ybar = 0.0; s2c = 1.0;
+        double sy = 0.0;
+        for (int i = 0; i < n0; ++i) sy += w0[i] * Y0[i];
+        ybar = sy / Nc_raw;
+        double s2 = 0.0;
+        for (int i = 0; i < n0; ++i) {
+            double d = Y0[i] - ybar;
+            s2 += w0[i] * d * d;
         }
+        s2 /= Nc_raw;
+        s2c = s2 > EPS ? s2 : EPS;
     }
     free(w0);
 
@@ -573,8 +612,7 @@ static void radish_single_eval(
      * standard-normal reference scale under compatibility and avoids the
      * inflated discrepancy caused by omitting this term.              */
     /* Nc_eff, not raw kernel mass, controls local concurrent SE and
-     * precision.  The configured floor remains the sparse-neighbourhood
-     * fallback used by the allocation and final-stage paths. */
+     * precision.  The configured floor stabilizes sparse neighbourhoods. */
     double Nc_s = Nc_eff > nc_floor ? Nc_eff : nc_floor;
     double se2 = tau2H + s2c / Nc_s;
     if (se2 < EPS) se2 = EPS;
@@ -614,7 +652,11 @@ static void radish_single_eval(
      * Spiegelhalter (2007) show each node-level conflict p-value is calibrated
      * Uniform under H0; Presanis et al. (2013) combine them additively in
      * surprisal form to obtain a single coherent conflict statistic.        */
-    double Dpdc = Dn + Dg;
+    /* Gate the marginal safeguard by local evidence. This retains global
+       protection while preventing conflict in one region from automatically
+       suppressing borrowing in a separate locally compatible region. */
+    double Dg_local = (1.0 - exp(-Dn)) * Dg;
+    double Dpdc = Dn + Dg_local;
 
     /* Coherent R_n with combined SE² as prior-precision denominator
      * (Bayesian-coherent: posterior precision of μ_0 given (θ, ȳ_c)). */
@@ -723,7 +765,7 @@ static double resid_var_kernel(const double *Xa, const double *Ya, int na,
     double *row = (double *)malloc(sizeof(double) * (size_t)na);
     double rss = 0.0, trS = 0.0, trStS = 0.0;
     for (int i = 0; i < na; ++i) {
-        kernel_gauss_vec(Xa, na, p, Xa + (size_t)i * p, h, row);
+        kernel_gauss_vec_stable(Xa, na, p, Xa + (size_t)i * p, h, row);
         double sw = 0.0;
         for (int j = 0; j < na; ++j) sw += row[j];
         if (sw < EPS) sw = EPS;
@@ -757,8 +799,8 @@ static double global_conflict_adjusted(
     double *rH = (double *)malloc(sizeof(double) * (size_t)nh);
     for (int i = 0; i < n; ++i) {
         const double *xi = X + (size_t)i * p;
-        kernel_gauss_vec(X0, n0, p, xi, h, r0);
-        kernel_gauss_vec(Xh, nh, p, xi, h, rH);
+        kernel_gauss_vec_stable(X0, n0, p, xi, h, r0);
+        kernel_gauss_vec_stable(Xh, nh, p, xi, h, rH);
         double s0 = 0.0, sH = 0.0;
         for (int j = 0; j < n0; ++j) s0 += r0[j];
         for (int j = 0; j < nh; ++j) sH += rH[j];
@@ -888,7 +930,7 @@ EXPORT double radish_allocation_prob(
     /* Allocation: Gaussian-weighted local arm sizes (single kernel; the
      * bandwidth h_alloc passed in equals the shared Scott-ROT bandwidth). */
     double *wa = (double *)malloc(sizeof(double)*(size_t)n_curr);
-    kernel_gauss_vec(X_curr, n_curr, p, x_new, h_alloc, wa);
+    kernel_gauss_vec_stable(X_curr, n_curr, p, x_new, h_alloc, wa);
     double N0 = 0.0, N1 = 0.0;
     for (int i = 0; i < n_curr; ++i) {
         if (Z_curr[i] == 0) N0 += wa[i];
@@ -918,7 +960,7 @@ EXPORT double kbcd_allocation_prob(
 {
     if (n_curr < 2) return 0.5;
     double *wa = (double *)malloc(sizeof(double)*(size_t)n_curr);
-    kernel_gauss_vec(X_curr, n_curr, p, x_new, h_alloc, wa);
+    kernel_gauss_vec_stable(X_curr, n_curr, p, x_new, h_alloc, wa);
     double N0 = 0.0, N1 = 0.0;
     for (int i = 0; i < n_curr; ++i) {
         if (Z_curr[i] == 0) N0 += wa[i];
@@ -945,7 +987,7 @@ static void cahb_hist_mean(
 {
     double *w = (double *)malloc(sizeof(double)*(size_t)nh);
     for (int i = 0; i < ne; ++i) {
-        kernel_gauss_vec(Xh, nh, p, Xe + (size_t)i*p, h_hist, w);
+        kernel_gauss_vec_stable(Xh, nh, p, Xe + (size_t)i*p, h_hist, w);
         double s = 0.0;
         for (int j = 0; j < nh; ++j) s += w[j];
         if (s > EPS) {
@@ -1201,29 +1243,23 @@ EXPORT int cahb_fit(
         if (s > 1.0) phi = s;
     }
 
-    double *mu0_prev = (double *)malloc(sizeof(double)*(size_t)n);
-    double *mu0_chk  = (double *)malloc(sizeof(double)*(size_t)n);
+    double *mu0_next = (double *)malloc(sizeof(double)*(size_t)n);
 
     for (int it = 0; it < max_iter; ++it) {
-        /* Snapshot tau for the convergence check (Python uses tau before update) */
         cahb_update_mu0(KM, Y, Z, n, tau, phi, out_theta0, mu0);
         double phi_n = cahb_update_phi(Y, Z, mu0, n);
         double *tau_n = (double *)malloc(sizeof(double)*(size_t)n);
         cahb_tau_full(KM, Z, mu0, out_theta0, n, invg2, lt, lam, tau_n);
-        /* Python's convergence check: ((mu0 - _mu0(KM,Y,Z,tau,phi,th0))**2).mean() < 1e-5
-         * That re-runs the update with OLD tau/phi which yields the same mu0.
-         * The condition is therefore trivially true at every iteration → loop
-         * effectively does ONE iteration after the first.  We replicate the
-         * exact behaviour: compute mu0 again with the OLD tau/phi, compare. */
-        cahb_update_mu0(KM, Y, Z, n, tau, phi, out_theta0, mu0_chk);
+        cahb_update_mu0(KM, Y, Z, n, tau_n, phi_n, out_theta0, mu0_next);
         double mse = 0.0;
         for (int i = 0; i < n; ++i) {
-            double d = mu0[i] - mu0_chk[i];
+            double d = mu0_next[i] - mu0[i];
             mse += d * d;
         }
         mse /= (double)n;
         memcpy(tau, tau_n, sizeof(double)*(size_t)n);
         phi = phi_n;
+        memcpy(mu0, mu0_next, sizeof(double)*(size_t)n);
         free(tau_n);
         if (mse < 1e-5) break;
     }
@@ -1231,7 +1267,7 @@ EXPORT int cahb_fit(
     memcpy(out_tau, tau, sizeof(double)*(size_t)n);
     *out_phi = phi;
 
-    free(KM); free(tau); free(mu0); free(mu0_prev); free(mu0_chk);
+    free(KM); free(tau); free(mu0); free(mu0_next);
     return 0;
 }
 
@@ -1303,7 +1339,7 @@ EXPORT double cahb_allocation_prob(
 
     /* allocation kernel weights (single Gaussian kernel) */
     double *wa = (double *)malloc(sizeof(double)*(size_t)n_curr);
-    kernel_gauss_vec(X_curr, n_curr, p, x_new, h_alloc, wa);
+    kernel_gauss_vec_stable(X_curr, n_curr, p, x_new, h_alloc, wa);
     double N0 = 0.0, N1 = 0.0;
     for (int i = 0; i < n_curr; ++i) {
         if (Z_curr[i] == 0.0) N0 += wa[i];

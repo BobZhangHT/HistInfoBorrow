@@ -1,10 +1,11 @@
-"""Run the real-data-calibrated RADISH sensitivity experiment.
+"""Run the HORIZON-FIT semi-synthetic RADISH experiment.
 
 For each conflict level xi, historical-size level eta, method, hypothesis,
 and replication, the script generates a historical control sample and a
-sequential current trial.  The historical mean is shifted by
-b_theta = 2 * xi * sigma_C; eta maps to n_H in [30, 350].  HORIZON-calibrated
-covariate distributions, subgroup response surfaces, and sigma_C are used.
+sequential current trial. The target-distribution average historical shift is
+b_theta = 2 * xi * sigma_C, and the shift differs between the X1 strata for
+every xi > 0; eta maps to n_H in [30, 350]. HORIZON-FIT-calibrated covariate
+distributions, subgroup response surfaces, and sigma_C are used.
 The moderate alternative delta=0.14 avoids saturated power at N=200.  KBCD,
 CAHB, RADISH, and the conflict levels share random-number streams within each
 (eta, effect, replication) block.
@@ -53,10 +54,10 @@ MANIFEST_JSON = ROOT / "real_data" / "real_run_manifest.json"
 
 # The outcome scale uses the HORIZON residual variance. The controlled DGP
 # combines the HORIZON response surface with FIT-calibrated historical
-# covariate distributions and subgroup proportions. Historical conflict is
-# introduced as b_theta = 2 * xi * sigma_C. The combined grid resolves the
-# useful low-conflict region and retains broad stress tests; it is not claimed
-# to duplicate the multiplicative perturbation in Jin et al. (2023).
+# covariate distributions and subgroup proportions. Historical conflict has
+# target-distribution average b_theta = 2 * xi * sigma_C and differs by X1
+# stratum. The compact grid spans compatibility through severe conflict; it is
+# not intended to duplicate the multiplicative perturbation in Jin et al. (2023).
 SIGMA_C_DGP  = float(np.sqrt(0.11))   # ≈ 0.33, from HORIZON residuals
 DELTA_DGP    = 0.140                  # moderate alternative; avoids saturated power
 
@@ -94,10 +95,11 @@ def _gen_X_from_subgroup(rng, n, kdes, sg_dist, moments):
 def _gen_historical(params, eta, xi, rng):
     """Generate n_H historical controls on the additive conflict path.
 
-    The conditional mean uses the HORIZON response surface plus
-    b_theta = 2 * xi * sigma_C. Thus xi=0 is exactly compatible and xi=1
-    is a two-standard-deviation location discrepancy. Historical precision
-    is varied only through n_H(eta), with sigma_H fixed at sigma_C.
+    The conditional mean uses the HORIZON response surface plus an X1-specific
+    shift whose target-distribution average is b_theta = 2 * xi * sigma_C.
+    Thus xi=0 is exactly compatible and xi=1 has an average discrepancy of two
+    standard deviations. Historical precision varies only through n_H(eta),
+    with sigma_H fixed at sigma_C.
     """
     n_H = n_H_of_eta(eta)
     Xh, sg_h = _gen_X_from_subgroup(rng, n_H, params["kde_hist"],
@@ -113,10 +115,20 @@ def _gen_historical(params, eta, xi, rng):
     a1 = params["beta_curr"]["b_menyrs"]
     a2 = params["beta_curr"]["b_Y0"]
     b_theta = 2.0 * float(xi) * sigma_C
+    # Every nonzero-conflict cell is covariate dependent. The lower-conflict
+    # stratum receives half the marginal shift; the multiplier in X1=1 is
+    # chosen so that averaging under the HORIZON target distribution still
+    # gives b_theta. This tests the global safeguard without erasing locality.
+    p_fall = float(params["sg_dist_curr"][1] + params["sg_dist_curr"][3])
+    low_multiplier = 0.5
+    high_multiplier = (
+        1.0 - low_multiplier * (1.0 - p_fall)
+    ) / p_fall
+    shift = b_theta * np.where(Xh[:, 0] == 1, high_multiplier, low_multiplier)
     mu = (a0[sg_h]
           + a1[sg_h] * Xh[:, 2]
           + a2[sg_h] * Xh[:, 3]
-          + b_theta)
+          + shift)
     Yh = mu + rng.standard_normal(n_H) * sigma_h
     # n_H denotes available historical controls, not a randomized cohort.
     return Xh, Yh
@@ -171,6 +183,10 @@ def _run_trial(rng, params, xi, eta, method_cls, delta_true):
         alloc_sg1=alloc_per_sg[0], alloc_sg2=alloc_per_sg[1],
         alloc_sg3=alloc_per_sg[2], alloc_sg4=alloc_per_sg[3],
         mean_W=diag["mean_W"], mean_Rn=diag["mean_Rn"],
+        mean_W_x1_0=diag.get("mean_W_x1_0", np.nan),
+        mean_W_x1_1=diag.get("mean_W_x1_1", np.nan),
+        mean_Rn_x1_0=diag.get("mean_Rn_x1_0", np.nan),
+        mean_Rn_x1_1=diag.get("mean_Rn_x1_1", np.nan),
         n_H=int(Xh_ctrl.shape[0]),
     )
 
@@ -256,6 +272,7 @@ def validate_results(path=OUT_CSV):
     assert len(power_delta) == 1 and np.isclose(power_delta[0], DELTA_DGP)
     required = [
         "est", "lo", "hi", "sq_err", "alloc_overall", "mean_W", "mean_Rn",
+        "mean_W_x1_0", "mean_W_x1_1", "mean_Rn_x1_0", "mean_Rn_x1_1",
     ]
     assert np.isfinite(df[required].to_numpy(float)).all()
     report = {

@@ -1,5 +1,5 @@
 """
-real_setup.py — Real-data parameter estimation for RADISH application.
+real_setup.py - HORIZON-FIT calibration for the RADISH semi-synthetic study.
 
 Mirrors CAHB §5.2 setup so reviewers can compare directly:
   - Current trial : HORIZON (ZOL), age >= 80, race == 1

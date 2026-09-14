@@ -1,18 +1,18 @@
-"""Two-axis real-data-calibrated sensitivity design.
+"""Compact two-axis HORIZON-FIT semi-synthetic design.
 
-The conflict axis combines a dense low-conflict zoom with the original broad
-stress-test range. Historical controls have mean shift
-``b_theta = 2 * xi * sigma_C``; ``xi=0`` is exact compatibility, the positive
-levels double from 0.01 through 0.64, and ``xi=1`` is the severe-conflict
-endpoint. The precision axis changes the number of available historical controls
-from 30 to 350 while holding the historical noise scale fixed. Current-trial
-covariates and response-surface coefficients are calibrated to HORIZON/FIT.
+Historical controls have target-distribution average shift
+``b_theta = 2 * xi * sigma_C`` and an X1-dependent shift whenever ``xi > 0``.
+Five conflict levels trace compatibility through severe conflict. The precision
+axis changes the number of available historical controls from 30 to 350 while
+holding the historical noise scale fixed.
+Current-trial covariates and response-surface coefficients are calibrated to
+HORIZON/FIT.
 """
 from __future__ import annotations
 
-# Dense compatible/low-conflict coverage plus moderate and severe endpoints.
-# Plotting uses a zero-aware base-2 symlog axis.
-XI_GRID  = [0.0, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.00]
+# Five conflict levels give readable trajectories without restoring the former
+# dense nine-point grid.
+XI_GRID  = [0.0, 0.16, 0.32, 0.64, 1.00]
 XI_REGIMES = [
     ("Compatible", -0.0025, 0.0283),
     ("Low conflict", 0.0283, 0.2263),
@@ -20,7 +20,7 @@ XI_REGIMES = [
     ("Severe conflict", 0.80, 1.08),
 ]
 # Historical-precision dial; eta maps to the historical-control count below.
-ETA_GRID = [0.0, 0.25, 0.5, 0.75, 1.0]
+ETA_GRID = [0.0, 1.0]
 
 N_CURRENT     = 200     # Match B-scenarios N (config.N_CURRENT) and CAHB Section 5.2.1.
 N_HISTORICAL  = 200     # Match B-scenarios N_HISTORICAL.

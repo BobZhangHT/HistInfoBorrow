@@ -2,7 +2,7 @@
 
 Reference implementation for **Robust Adaptive Discrepancy-Informed Shrinkage for Historical Borrowing in Clinical Trials** by Hengtao Zhang, Yuanke Qu, and Huaqing Jin.
 
-RADISH is a covariate-adaptive randomized design that borrows information from external controls only where historical and concurrent controls are locally compatible. A single Gaussian product kernel is used throughout planning, sequential allocation, and final estimation. Both sequential allocation and final analysis use the centered excess-surprisal conflict score $D=(-\log\kappa-1)_+$ and the reference-predictive variance scale; incompatible historical information is discounted and the design moves toward the concurrent-only KBCD baseline as conflict increases.
+RADISH is a covariate-adaptive randomized design that borrows information from external controls only where historical and concurrent controls are locally compatible. A single Gaussian product kernel is used throughout planning, sequential allocation, and final estimation. Sequential allocation uses the centered excess-surprisal score $D=(-\log\kappa-1)_+$. Final analysis combines the local score with a locally gated marginal safeguard, so a trial-wide discrepancy strengthens discounting only where local conflict is already present. As conflict increases, the design moves toward the concurrent-only KBCD baseline.
 
 ## Installation
 
@@ -24,53 +24,48 @@ On Windows with MinGW, use `python build_c.py --mingw`. Add `--self-test` to run
 
 ## Synthetic simulation study
 
-The primary experiment is a four-by-two conflict-and-precision design. Historical mean shift is `b_H in {0, 0.1, 0.5, 2.0}`, representing compatible, low-, moderate-, and severe-conflict regimes. Historical outcome standard deviation is `sigma_H in {0.5, 3.0}`. Concurrent and default historical sample sizes are both 200.
+The manuscript's primary experiment is a compact three-by-two conflict-and-precision design. For `X1 in {0,1}`, the historical shift is `b(X1) = (b0,b1)`. Every nonzero-conflict setting differs from the concurrent response surface in both strata, with a larger shift in the `X1=1` stratum. Historical outcome standard deviation is `sigma_H in {0.5,3.0}`; concurrent and historical sample sizes are both 200.
 
-| Scenario | Historical bias | Historical SD | Interpretation |
-|:--|--:|--:|:--|
-| S1 | 0.0 | 0.5 | Compatible and precise |
-| S2 | 0.0 | 3.0 | Compatible but noisy |
-| S3 | 0.1 | 0.5 | Low conflict, precise history |
-| S4 | 0.1 | 3.0 | Low conflict, noisy history |
-| S5 | 0.5 | 0.5 | Moderate conflict, precise history |
-| S6 | 0.5 | 3.0 | Moderate conflict, noisy history |
-| S7 | 2.0 | 0.5 | Severe conflict, precise history |
-| S8 | 2.0 | 3.0 | Severe conflict, noisy history |
+| Scenario | `(b0,b1)` | Historical SD | Interpretation |
+|:--|:--:|--:|:--|
+| S1 | `(0,0)` | 0.5 | Compatible, precise history |
+| S2 | `(0,0)` | 3.0 | Compatible, noisy history |
+| S3 | `(0.25,0.75)` | 0.5 | Moderate local conflict, precise history |
+| S4 | `(0.25,0.75)` | 3.0 | Moderate local conflict, noisy history |
+| S5 | `(1.5,2.5)` | 0.5 | Severe local conflict, precise history |
+| S6 | `(1.5,2.5)` | 3.0 | Severe local conflict, noisy history |
 
-Run from the repository root:
+Run the paper experiments from the repository root:
 
 ```bash
-# Ten replications per cell: smoke test of the complete four-regime grid
-python main.py --mode demo --jobs 4
+# Fast end-to-end check using the paper's six-scenario design
+python main.py --mode six --reps 2 --jobs 4
+python main.py --mode six --reps 2 --validate-only
 
-# Main paper experiment: 1000 replications per cell, 48000 fits total
-python main.py --mode full --jobs 8
+# Main six-scenario experiment: 36,000 fits
+python main.py --mode six --jobs 8
 
-# Validate the formal result contract and recomputed summaries
-python main.py --mode full --validate-only
+# Five-point local-conflict path used for the local-borrowing figure: 30,000 fits
+python main.py --mode local_path --jobs 8
 
-# Supplementary sensitivity experiments
-python main.py --mode precision --jobs 8
-python main.py --mode bias --jobs 8
-python main.py --mode bias --validate-only
-python main.py --mode hist_size --jobs 8
-python main.py --mode hist_size --validate-only
+# Weak/strong global conflict crossed with weak/strong local heterogeneity: 24,000 fits
+python main.py --mode global_local --jobs 8
+
+# Validate existing formal outputs without rerunning simulations
+python main.py --mode six --validate-only
+python main.py --mode local_path --validate-only
+python main.py --mode global_local --validate-only
 ```
 
-The `bias` mode is a focused low-conflict experiment on
-`xi in {0, .01, .02, .04, .08, .16}`, with
-`b_theta = 2 * xi * sigma_C`. Its operating-characteristic figure uses a
-zero-aware base-2 logarithmic axis. The primary `full` mode still contains
-the moderate and severe stress tests, so the focused plot does not replace
-robustness evidence outside the favorable borrowing region.
+The `local_path` mode uses five precise-history shifts, `(0,0)`, `(0.10,0.30)`, `(0.25,0.75)`, `(0.50,1.50)`, and `(1,3)`, to display how borrowing changes across covariate strata. The `global_local` mode uses `b(X1)=g+ell*s(X1)`, where `E{s(X1)}=0`, and crosses weak/strong values of `g` and `ell`. Thus every diagnostic cell remains covariate dependent while marginal and local conflict vary separately.
 
-All modes use seed 2026 by default. `--seed` changes it except for the optimized formal `hist_size` workflow described below. `--reps` is available for short `hist_size` checks. Outputs are written under `results/<mode>/` as `raw_results.csv`, `metrics.csv`, `plots/`, and `tables/`. Generated results are intentionally excluded from Git.
+Additional modes retain broader sensitivity analyses. `full` is the earlier four-by-two local-conflict grid and is the parent run for the paired `hist_size` analysis; `precision` and `bias` provide focused parameter sweeps. The historical-size workflow requires a validated default-seed `results/full/raw_results.csv`, reuses its `N_H=200` rows, and computes the paired `N_H=400` extension. Its pairing contract is written to `results/hist_size/hist_size_pairing_manifest.json`.
 
-The formal historical-size workflow requires a validated `results/full/raw_results.csv` generated with the default seed. It reuses all 48,000 primary `N_H=200` rows and computes only the 48,000 new `N_H=400` rows, halving the two-size fitting workload. Each larger cohort preserves the first 200 historical observations and the concurrent covariate/outcome-innovation stream, then appends 200 observations from a cloned post-prefix RNG state. Adaptive assignments can differ because the historical reference and planning bandwidth change. The resulting `N_H=400` cohort is a deterministic counterfactual extension, not an independent historical draw. The pairing contract is recorded in `results/hist_size/hist_size_pairing_manifest.json`, and dedicated summaries and figures are generated by `historical_size_analysis.py`. A custom `--seed` is rejected because the stored primary result currently has no seed metadata.
+All modes use seed 2026 by default. `--seed` changes it except for the optimized `hist_size` workflow, whose stored parent result has no seed column. `--reps` supports inexpensive checks. Outputs are written under `results/<mode>/` as `raw_results.csv`, `metrics.csv`, `plots/`, and `tables/`; generated results are excluded from Git.
 
-## Real-data-calibrated study
+## HORIZON-FIT semi-synthetic study
 
-The application uses restricted HORIZON and FIT participant-level data, which are not distributed in this repository. After obtaining access under the applicable data-use agreements, place the merged file at `real_data/dat_merge.csv`; the required schema is documented in `real_data/real_setup.py`. The formal grid contains `N=200`, a 20-participant burn-in, historical sizes `{30,110,190,270,350}`, conflict levels `{0,.01,.02,.04,.08,.16,.32,.64,1}`, three methods, two effect settings, and 1000 replications per cell.
+The semi-synthetic study uses restricted HORIZON and FIT participant-level data, which are not distributed in this repository. After obtaining access under the applicable data-use agreements, place the merged file at `real_data/dat_merge.csv`; the required schema is documented in `real_data/real_setup.py`. The scripts use the empirical covariate geometry and a HORIZON-calibrated response surface rather than reporting a new treatment-effect analysis. The formal grid contains `N=200`, a 20-participant burn-in, historical sizes `{30,350}`, conflict levels `{0,.16,.32,.64,1}`, three methods, two effect settings, and 1000 replications per cell.
 
 ```bash
 python real_data/real_setup.py
@@ -79,13 +74,13 @@ python real_data/real_run.py --validate-only
 python real_data/real_figures.py
 ```
 
-The experiment contains 270,000 fits. The integrated validator checks the grid, replication counts, identifiers, finite outputs, and writes a SHA-256 manifest before figures are generated.
+The experiment contains 60,000 fits. Every nonzero historical shift depends on `X1`, with stronger conflict in the `X1=1` stratum while preserving the prespecified marginal severity scale. The integrated validator checks the grid, replication counts, identifiers, finite outputs, and writes a SHA-256 manifest before figures are generated.
 
 ## Methods and implementation
 
 | Method | Implementation | Historical borrowing |
 |:--|:--|:--|
-| RADISH | `methods.py::RADISH` | Local conflict-discounted borrowing |
+| RADISH | `methods.py::RADISH` | Local conflict discount with a gated marginal safeguard |
 | CAHB | `methods.py::CAHB` | Variance-ratio borrowing |
 | KBCD | `methods.py::KBCD` | Concurrent-only baseline |
 
@@ -115,8 +110,8 @@ Generated outputs, native binaries, restricted data, manuscripts, and the local 
 ```bash
 python -B -c "import config, methods, analysis, historical_size_analysis; import real_data.real_scenarios, real_data.real_run, real_data.real_figures"
 python build_c.py --self-test
-python main.py --mode demo --jobs 4
-python main.py --mode demo --validate-only
+python main.py --mode six --reps 2 --jobs 4
+python main.py --mode six --reps 2 --validate-only
 python real_data/real_run.py --validate-only
 ```
 

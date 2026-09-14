@@ -1,16 +1,10 @@
-"""
-main.py — Monte Carlo Simulation Runner (with subgroup tracking)
-=================================================================
-Records per-patient X1 subgroup for allocation ratio analysis,
-plus borrowing diagnostics (mean W, R_n, D_PDC) showing how each
-method responds to historical estimator precision τ²_H.
+"""Monte Carlo runner for the RADISH simulation studies.
 
-Usage:
-  python main.py                              # four-regime demo (10 reps)
-  python main.py --mode full --jobs 4         # four-regime 4×2 grid (1000 reps)
-  python main.py --mode precision --jobs 4    # sigma_H gradient sweep
-  python main.py --mode bias --jobs 4         # focused low-conflict path
-  python main.py --mode hist_size --jobs 4    # paired N_H sensitivity
+The runner records overall and X1-stratum-specific allocation and borrowing
+diagnostics. Paper modes are ``six``, ``local_path``, and ``global_local``;
+``full``, ``precision``, ``bias``, and ``hist_size`` provide supplementary
+sensitivity analyses. Use ``--validate-only`` to verify saved results without
+rerunning a simulation.
 """
 import argparse, copy, hashlib, json, os, time
 
@@ -44,13 +38,31 @@ else:
 print(f"[main] backend = {_BACKEND}")
 
 # ── Data-generating mechanism ────────────────────────────────────
-def gen_cov(n, rng):
-    X = np.zeros((n, 2)); X[:,0] = rng.binomial(1,.5,n); X[:,1] = rng.standard_normal(n)
+def gen_cov(n, rng, p_x1=0.5):
+    X = np.zeros((n, 2)); X[:,0] = rng.binomial(1, p_x1, n); X[:,1] = rng.standard_normal(n)
     return X
 
 def mu0c(X):
     X = np.atleast_2d(X); b = config.BETA
     return b[0] + b[1]*X[:,0] + b[2]*X[:,1] + b[3]*X[:,0]*X[:,1]
+
+def b_hist(X, sc):
+    """Historical location shift at each covariate point.
+
+    Scenarios carrying a b_local pair shift the historical outcome separately
+    inside the two levels of the binary covariate X1. The shifts may differ in
+    both strata; b_theta remains the study-level marginal summary.
+    """
+    if sc.get("b_local") is not None:
+        b0, b1 = sc["b_local"]
+        x1 = np.atleast_2d(X)[:, 0]
+        return np.where(x1 == 1, float(b1), float(b0))
+    return float(sc["b_theta"])
+
+def _b_pair(sc):
+    """Stratum-wise historical shift (b(x1=0), b(x1=1)) of one scenario."""
+    pair = sc.get("b_local")
+    return pair if pair is not None else (sc["b_theta"], sc["b_theta"])
 
 def gen_hist(sc_key, rng, scenarios=None, n_historical=None,
              max_n_historical=None):
@@ -60,8 +72,8 @@ def gen_hist(sc_key, rng, scenarios=None, n_historical=None,
     draw_size = n_historical if max_n_historical is None else int(max_n_historical)
     if n_historical <= 0 or draw_size < n_historical:
         raise ValueError("historical sample sizes must satisfy 0 < n_historical <= max_n_historical")
-    X_full = gen_cov(draw_size, rng)
-    Y_full = (mu0c(X_full) + sc["b_theta"]
+    X_full = gen_cov(draw_size, rng, sc.get("p_x1", 0.5))
+    Y_full = (mu0c(X_full) + b_hist(X_full, sc)
               + rng.standard_normal(draw_size) * sc["sigma_h"])
     # Drawing the largest requested cohort and taking prefixes makes the
     # historical-size sensitivity comparison nested within each replication.
@@ -90,7 +102,7 @@ def run_trial(sc_key, eff_key, mcls, rep, rng, scenarios=None,
         if len(Xh) != n_historical or len(Yh) != n_historical:
             raise ValueError("precomputed historical data has the wrong size")
     m = mcls({"X_h": Xh, "Y_h": Yh}, config.COVARIATE_PARAMS, config.PRIORS)
-    Xs = gen_cov(config.N_CURRENT, rng)
+    Xs = gen_cov(config.N_CURRENT, rng, scenarios[sc_key].get("p_x1", 0.5))
     Xo, Yo, Zo, Pi = [], [], [], []
     for i in range(config.N_CURRENT):
         xn = Xs[i]
@@ -103,12 +115,20 @@ def run_trial(sc_key, eff_key, mcls, rep, rng, scenarios=None,
     Xa, Ya, Za = np.array(Xo), np.array(Yo), np.array(Zo)
     est, cl, ch, pp = m.estimate_treatment_effect(Xa, Ya, Za)
     rej = int(np.isfinite(cl) and np.isfinite(ch) and (cl > 0 or ch < 0))
+    # Wald standard error recovered from the reported interval; analysis.py
+    # uses the same z quantile for the calibrated-power calculation.
+    se_est = ((ch - cl) / (2.0 * 1.959964)
+              if np.isfinite(cl) and np.isfinite(ch) else np.nan)
+    z_abs = (abs(est) / se_est
+             if np.isfinite(se_est) and se_est > 0 else np.nan)
 
     # ── Borrowing diagnostics ──
     try:
         diag = m.compute_diagnostics(Xa, Ya, Za)
     except Exception:
         diag = {"mean_W": np.nan, "mean_Rn": np.nan,
+                "mean_W_x1_0": np.nan, "mean_W_x1_1": np.nan,
+                "mean_Rn_x1_0": np.nan, "mean_Rn_x1_1": np.nan,
                 "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
 
     # ── Subgroup allocation ratios (X1=0 vs X1=1) ──
@@ -121,19 +141,25 @@ def run_trial(sc_key, eff_key, mcls, rep, rng, scenarios=None,
         scenario=sc_key, effect_type=eff_key, method=m.name, rep=rep,
         n_historical=n_historical,
         true_delta=td, estimated_delta=est, ci_low=cl, ci_high=ch,
-        rejected=rej, estimation_bias=est-td,
+        rejected=rej, estimation_bias=est-td, se_est=se_est, z_abs=z_abs,
         allocation_ratio=float(np.mean(Za)),
         alloc_x1_0=alloc_x1_0,
         alloc_x1_1=alloc_x1_1,
         n_x1_0=int(mask0.sum()),
         n_x1_1=int(mask1.sum()),
-        mean_W=diag["mean_W"],
-        mean_Rn=diag["mean_Rn"],
-        mean_Dpdc=diag["mean_Dpdc"],
-        mean_tau2_H=diag["mean_tau2_H"],
+        mean_W=diag.get("mean_W", np.nan),
+        mean_Rn=diag.get("mean_Rn", np.nan),
+        mean_W_x1_0=diag.get("mean_W_x1_0", np.nan),
+        mean_W_x1_1=diag.get("mean_W_x1_1", np.nan),
+        mean_Rn_x1_0=diag.get("mean_Rn_x1_0", np.nan),
+        mean_Rn_x1_1=diag.get("mean_Rn_x1_1", np.nan),
+        mean_Dpdc=diag.get("mean_Dpdc", np.nan),
+        mean_tau2_H=diag.get("mean_tau2_H", np.nan),
         # Scenario factors (for precision-grid plots)
         b_theta=float(scenarios[sc_key]["b_theta"]),
         sigma_h=float(scenarios[sc_key]["sigma_h"]),
+        b_local_x1_0=float(_b_pair(scenarios[sc_key])[0]),
+        b_local_x1_1=float(_b_pair(scenarios[sc_key])[1]),
     )
 
 def _task(sc, ef, mc, r, seed, scenarios):
@@ -163,23 +189,20 @@ def _hist_size_task(sc, ef, mc, r, seed, scenarios, n_historical,
 def _primary_full_task_seed(base_seed, sc, ef, mcls, rep, scenarios):
     """Return the seed used by run_sim('full') for one task.
 
-    run_sim enumerates scenario, effect, method, and replication in this
-    order and increments a single task index. Keeping this mapping explicit
-    makes the historical-size extension a genuine common-random-number
-    comparison with the primary full experiment.
+    The seed depends only on the effect index and the replication index.
+    Scenario and method are deliberately absent from the mapping, so every
+    scenario and method is paired inside a replication and the
+    historical-size extension is a genuine common-random-number comparison
+    with the primary full experiment.
     """
-    scenario_order = list(scenarios.keys())
     effect_order = list(config.EFFECT_SIZES.keys())
-    method_order = [RADISH, CAHB, KBCD]
+    if sc not in scenarios:
+        raise ValueError("task is not in the primary full grid")
     try:
-        si = scenario_order.index(sc)
         ei = effect_order.index(ef)
-        mi = method_order.index(mcls)
     except ValueError as exc:
         raise ValueError("task is not in the primary full grid") from exc
-    offset = (((si * len(effect_order) + ei) * len(method_order) + mi)
-              * config.N_REPS_FULL + int(rep))
-    return int(base_seed) + offset
+    return int(base_seed) + int(rep) + config.N_REPS_FULL * ei
 
 
 def _load_primary_full_rows(seed, nreps, scenarios):
@@ -305,7 +328,8 @@ def _validate_primary_stream_alignment(primary_rows, seed, scenarios):
     ]
     method_names = {RADISH: "RADISH", CAHB: "CAHB", KBCD: "KBCD"}
     cols = ["estimated_delta", "ci_low", "ci_high", "allocation_ratio",
-            "mean_W", "mean_Rn", "mean_Dpdc"]
+            "mean_W", "mean_Rn", "mean_Dpdc",
+            "mean_W_x1_0", "mean_W_x1_1", "mean_Rn_x1_0", "mean_Rn_x1_1"]
     for sc, ef, mc, rep in probes:
         task_seed = _primary_full_task_seed(seed, sc, ef, mc, rep, scenarios)
         generated = run_trial(
@@ -341,30 +365,25 @@ def _validate_primary_stream_alignment(primary_rows, seed, scenarios):
     return True
 
 # ── Parallel runner ──────────────────────────────────────────────
-def run_sim(mode, seed=2026, n_jobs=4):
-    nreps = config.get_mode_replications(mode)
+def run_sim(mode, seed=2026, n_jobs=4, nreps=None):
+    nreps = config.get_mode_replications(mode) if nreps is None else int(nreps)
     scenarios = config.get_mode_scenarios(mode)
-    tasks, idx = [], 0
-    if mode == "bias":
-        # Common random numbers pair all methods and xi values within each
-        # (effect, replication) block.  The historical location shift then
-        # changes deterministically along xi while covariates, innovations,
-        # and the current-trial stream are held fixed.  In particular, the
-        # KBCD path is constant across xi, as it should be for a method that
-        # does not use historical outcomes.
-        effect_order = list(config.EFFECT_SIZES)
-        for sc in scenarios:
-            for i_eff, ef in enumerate(effect_order):
-                for mc in [RADISH, CAHB, KBCD]:
-                    for r in range(nreps):
-                        paired_seed = int(seed) + r + nreps * i_eff
-                        tasks.append((sc, ef, mc, r, paired_seed, scenarios))
-    else:
-        for sc in scenarios:
-            for ef in config.EFFECT_SIZES:
-                for mc in [RADISH, CAHB, KBCD]:
-                    for r in range(nreps):
-                        tasks.append((sc, ef, mc, r, seed+idx, scenarios)); idx += 1
+    # Common random numbers: the task seed depends only on the effect and
+    # the replication, never on the scenario or the method. Covariates,
+    # innovations, and the concurrent trial stream are therefore identical
+    # across scenarios and methods, while the historical location shift
+    # changes deterministically with the scenario. A method that ignores
+    # historical outcomes is then exactly invariant across scenarios, which
+    # is what the KBCD column of the operating-characteristics table must
+    # show, and all methods remain paired within a replication.
+    effect_order = list(config.EFFECT_SIZES)
+    tasks = []
+    for sc in scenarios:
+        for i_eff, ef in enumerate(effect_order):
+            for mc in [RADISH, CAHB, KBCD]:
+                for r in range(nreps):
+                    paired_seed = int(seed) + r + nreps * i_eff
+                    tasks.append((sc, ef, mc, r, paired_seed, scenarios))
     print(f"[{mode}] {len(tasks)} tasks  (reps={nreps}, jobs={n_jobs}, "
           f"scenarios={len(scenarios)})")
     res = Parallel(n_jobs=n_jobs, backend="loky", verbose=5)(
@@ -452,12 +471,46 @@ def run_hist_size_sim(seed=2026, n_jobs=4, nreps=None):
     return out
 
 # ── Metrics ──────────────────────────────────────────────────────
+def _abs_z(part):
+    """Equivalence-test statistic |estimate| / SE from the reported interval."""
+    half = (part.ci_high.to_numpy(float)
+            - part.ci_low.to_numpy(float)) / (2.0 * 1.959964)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z = np.abs(part.estimated_delta.to_numpy(float)) / half
+    z[~np.isfinite(z)] = np.nan
+    return z
+
+
+def _calibrated_power(df, sc_order, alpha=None):
+    """Calibrated power per (scenario, method).
+
+    Each cell uses its own finite-sample critical value: the empirical
+    (1 - alpha) quantile of |z| under the null effect. Nominal size is met
+    before the power of the alternative is read off.
+    """
+    alpha = config.ALPHA if alpha is None else float(alpha)
+    out = {}
+    for sc in sc_order:
+        for mt in config.METHOD_ORDER:
+            cell = df[(df.scenario == sc) & (df.method == mt)]
+            zn = _abs_z(cell[cell.effect_type == "Null"])
+            zn = zn[np.isfinite(zn)]
+            zp = _abs_z(cell[cell.effect_type == "Power"])
+            zp = zp[np.isfinite(zp)]
+            if zn.size == 0 or zp.size == 0:
+                out[(sc, mt)] = np.nan
+                continue
+            out[(sc, mt)] = float(np.mean(zp > np.quantile(zn, 1 - alpha)))
+    return out
+
+
 def metrics(df, scenarios=None):
     df = df.copy(); td = df["true_delta"]
     df["coverage"] = ((df.ci_low <= td) & (td <= df.ci_high)).astype(int)
     df["width"] = df.ci_high - df.ci_low
     df["sq_err"] = (df.estimated_delta - td)**2
     sc_order = list(scenarios.keys()) if scenarios is not None else config.SCENARIO_ORDER
+    cal_power = _calibrated_power(df, sc_order)
     rows = []
     for sc in sc_order:
         for ef in config.EFFECT_ORDER:
@@ -477,6 +530,9 @@ def metrics(df, scenarios=None):
                     Mean_Rn=round(s.mean_Rn.mean(skipna=True),4) if "mean_Rn" in s else "",
                     Mean_Dpdc=round(s.mean_Dpdc.mean(skipna=True),4) if "mean_Dpdc" in s else "",
                     Type_I_Error=round(rr,4) if ef=="Null" else "",
+                    Power_calibrated=(round(cal_power[(sc, mt)], 4)
+                                      if ef == "Power"
+                                      and np.isfinite(cal_power[(sc, mt)]) else ""),
                     Power=round(rr,4) if ef=="Power" else ""))
     return pd.DataFrame(rows)
 
@@ -499,7 +555,7 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def validate_saved_results(mode="full", result_dir=None):
+def validate_saved_results(mode="full", result_dir=None, reps=None):
     """Validate a saved synthetic experiment against the code contract."""
     out = Path(result_dir) if result_dir else config.get_mode_output_dir(mode)
     raw_path, metrics_path = out / "raw_results.csv", out / "metrics.csv"
@@ -507,12 +563,15 @@ def validate_saved_results(mode="full", result_dir=None):
         raise FileNotFoundError(f"missing raw results: {raw_path}")
     df = pd.read_csv(raw_path)
     scenarios = config.get_mode_scenarios(mode)
-    reps = config.get_mode_replications(mode)
+    reps = config.get_mode_replications(mode) if reps is None else int(reps)
+    if reps < 1:
+        raise ValueError("replications must be positive")
     methods, effects = tuple(config.METHOD_ORDER), tuple(config.EFFECT_ORDER)
     required = {
         "scenario", "effect_type", "method", "rep", "true_delta",
         "estimated_delta", "ci_low", "ci_high", "rejected",
         "estimation_bias", "allocation_ratio", "b_theta", "sigma_h",
+        "se_est", "z_abs", "b_local_x1_0", "b_local_x1_1",
     }
     if mode == "hist_size":
         required.add("n_historical")
@@ -540,10 +599,15 @@ def validate_saved_results(mode="full", result_dir=None):
     assert df["allocation_ratio"].between(0, 1).all()
     assert df["rejected"].isin([0, 1]).all()
     assert (df["ci_low"] <= df["ci_high"]).all()
+    assert np.isfinite(df["se_est"].to_numpy(float)).all()
+    assert (df["se_est"] >= 0).all()
     for name, spec in scenarios.items():
         part = df[df["scenario"] == name]
         assert np.allclose(part["b_theta"], spec["b_theta"])
         assert np.allclose(part["sigma_h"], spec["sigma_h"])
+        b0, b1 = _b_pair(spec)
+        assert np.allclose(part["b_local_x1_0"], b0)
+        assert np.allclose(part["b_local_x1_1"], b1)
     expected = (
         metrics_by_history_size(df, scenarios)
         if mode == "hist_size" else metrics(df, scenarios)
@@ -580,7 +644,8 @@ def validate_saved_results(mode="full", result_dir=None):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["demo", "full", "precision", "bias",
-                                       "hist_size"], default="demo")
+                                       "hist_size", "global_local", "six",
+                                       "local_path"], default="demo")
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--jobs", type=int, default=config.N_JOBS)
     ap.add_argument("--reps", type=int, default=None,
@@ -591,15 +656,13 @@ if __name__ == "__main__":
     )
     args = ap.parse_args()
     if args.validate_only:
-        print(json.dumps(validate_saved_results(args.mode), indent=2))
+        print(json.dumps(validate_saved_results(args.mode, reps=args.reps), indent=2))
         raise SystemExit(0)
     t0 = time.time()
     if args.mode == "hist_size":
         df = run_hist_size_sim(args.seed, args.jobs, args.reps)
     else:
-        if args.reps is not None:
-            raise ValueError("--reps is currently supported only for --mode hist_size")
-        df = run_sim(args.mode, args.seed, args.jobs)
+        df = run_sim(args.mode, args.seed, args.jobs, args.reps)
     print(f"\nDone in {(time.time()-t0)/60:.1f} min  ({len(df)} results)")
     out = config.get_mode_output_dir(args.mode); out.mkdir(parents=True, exist_ok=True)
     df.to_csv(out/"raw_results.csv", index=False)

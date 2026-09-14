@@ -1,4 +1,4 @@
-"""Generate publication figures and tables for the real-data study."""
+"""Generate figures and tables for the HORIZON-FIT semi-synthetic study."""
 from __future__ import annotations
 
 import pickle
@@ -124,6 +124,14 @@ def summarize_results(raw, alpha=ALPHA):
                 ),
                 mean_W=float(power["mean_W"].mean()),
                 mean_W_se=float(power["mean_W"].std(ddof=1) / np.sqrt(len(power))),
+                mean_W_x1_0=float(power["mean_W_x1_0"].mean()),
+                mean_W_x1_1=float(power["mean_W_x1_1"].mean()),
+                mean_W_x1_0_se=float(
+                    power["mean_W_x1_0"].std(ddof=1) / np.sqrt(len(power))
+                ),
+                mean_W_x1_1_se=float(
+                    power["mean_W_x1_1"].std(ddof=1) / np.sqrt(len(power))
+                ),
             )
         )
 
@@ -151,9 +159,11 @@ def make_T1(params):
         ),
         dict(
             Component="Historical-control model",
-            Symbol=r"$Y_H=m_0(X)+b_\theta+\varepsilon_H$",
-            Meaning="Same response surface plus a location discrepancy",
-            Values=r"$b_\theta=2\xi\sigma_C$; $\sigma_H=\sigma_C$",
+            Symbol=r"$Y_H=m_0(X)+b(X_1)+\varepsilon_H$",
+            Meaning="Same response surface; conflict intensity varies with X1",
+            Values=(r"$b(0)=\xi\sigma_C$; "
+                    r"$b(1)=\xi\sigma_C(1+p_1)/p_1$; "
+                    r"$p_1=P_C(X_1=1)$; $\sigma_H=\sigma_C$"),
         ),
         dict(
             Component="Subgroup distributions",
@@ -175,7 +185,7 @@ def make_T1(params):
         dict(
             Component="Conflict grid",
             Symbol=r"$\xi$",
-            Meaning=r"$b_\theta=2\xi\sigma_C$",
+            Meaning=r"$E_C\{b(X_1)\}=2\xi\sigma_C$",
             Values="{" + ", ".join(f"{x:g}" for x in XI_GRID) + "}",
         ),
         dict(
@@ -209,7 +219,7 @@ def make_T1(params):
     table = pd.DataFrame(rows)
     table.to_csv(TABLE1_CSV, index=False, encoding="utf-8")
     md = [
-        "# Real-data-calibrated simulation design",
+        "# HORIZON-FIT semi-synthetic simulation design",
         "",
         "| Component | Symbol | Meaning | Values |",
         "|---|---|---|---|",
@@ -328,9 +338,9 @@ def make_F1(params):
 
 
 def _set_xi_axis(ax):
-    """Use base-2 log spacing for positive xi while retaining xi=0."""
-    ax.set_xscale("symlog", base=2, linthresh=0.01, linscale=0.8)
-    ax.set_xlim(-0.0025, 1.08)
+    """Format the three prespecified conflict levels."""
+    ax.set_xscale("linear")
+    ax.set_xlim(-0.05, 1.05)
     ax.set_xticks(XI_GRID)
     ax.set_xticklabels([f"{x:g}" for x in XI_GRID], fontsize=7.5)
     ax.xaxis.set_minor_formatter(NullFormatter())
@@ -339,7 +349,7 @@ def _set_xi_axis(ax):
 
 def _regime_bands(ax, label=False):
     colors = ("#EAF4EA", "#EAF1F8", "#FFF3DA", "#F7E6E6")
-    label_x = (0.006, 0.08, 0.43, 0.93)
+    label_x = (0.006, 0.08, 0.64, 0.64)
     for (name, lo, hi), color, xpos in zip(XI_REGIMES, colors, label_x):
         ax.axvspan(lo, hi, color=color, alpha=0.62, zorder=0)
         if label:
@@ -351,9 +361,13 @@ def _regime_bands(ax, label=False):
                 display_name,
                 xy=(xpos, 0.985),
                 xycoords=("data", "axes fraction"),
-                ha="center",
+                xytext=(-2, 0) if name.startswith("Moderate") else
+                       ((2, 0) if name.startswith("Severe") else (0, 0)),
+                textcoords="offset points",
+                ha="right" if name.startswith("Moderate") else
+                   ("left" if name.startswith("Severe") else "center"),
                 va="top",
-                fontsize=6.3,
+                fontsize=5.8,
                 color="0.28",
             )
 
@@ -367,15 +381,16 @@ def _heatmap_grid(df, value_col):
 
 
 def make_F2(df):
-    """Plot the conflict path at the largest historical sample size."""
+    """Plot operating characteristics and local borrowing at large n_H."""
     d = df[np.isclose(df["eta"], max(ETA_GRID))].copy()
-    fig, axes = plt.subplots(1, 3, figsize=(COL2_W * 1.72, 3.05))
+    fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.35))
     fig.subplots_adjust(
-        left=0.065, right=0.99, top=0.82, bottom=0.22, wspace=0.29
+        left=0.08, right=0.985, top=0.89, bottom=0.11,
+        wspace=0.27, hspace=0.38,
     )
     panels = [
         ("mae_h1", "mae_h1_se", "Mean absolute error", "(a) Estimation error"),
-        ("power", "power_se", "Size-calibrated power", "(b) Power"),
+        ("power", "power_se", "Calibrated power", "(b) Power"),
         (
             "alloc_overall",
             "alloc_se",
@@ -384,8 +399,7 @@ def make_F2(df):
         ),
     ]
     for j, (col, se_col, ylabel, title) in enumerate(panels):
-        ax = axes[j]
-        _regime_bands(ax, label=(j == 0))
+        ax = axes.flat[j]
         for method in METHOD_ORDER:
             dm = d[d["method"] == method].sort_values("xi")
             x = dm["xi"].to_numpy(float)
@@ -407,11 +421,41 @@ def make_F2(df):
         if col == "alloc_overall":
             ax.axhline(0.5, color="0.35", linestyle=":", linewidth=1.0)
         _set_xi_axis(ax)
-        ax.set_xlabel(r"Conflict $\xi$ (base-2 scale for $\xi>0$)")
+        ax.set_xlabel(r"Conflict $\xi$")
         ax.set_ylabel(ylabel)
         ax.set_title(title, fontsize=10)
         ax.grid(axis="y", alpha=0.22, linewidth=0.5)
         ax.spines[["top", "right"]].set_visible(False)
+
+    ax = axes.flat[3]
+    stratum_styles = [("mean_W_x1_0", "mean_W_x1_0_se", "-", r"$X_1=0$"),
+                      ("mean_W_x1_1", "mean_W_x1_1_se", "--", r"$X_1=1$")]
+    for method in ("CAHB", "RADISH"):
+        dm = d[d["method"] == method].sort_values("xi")
+        x = dm["xi"].to_numpy(float)
+        for col, se_col, linestyle, _ in stratum_styles:
+            y = dm[col].to_numpy(float)
+            se = dm[se_col].to_numpy(float)
+            ax.fill_between(
+                x, np.clip(y - 1.96 * se, 0, 1), np.clip(y + 1.96 * se, 0, 1),
+                color=METHOD_COLORS[method], alpha=0.10, linewidth=0,
+            )
+            ax.plot(
+                x, y, color=METHOD_COLORS[method], linestyle=linestyle,
+                marker=METHOD_MARKERS[method], linewidth=1.8, markersize=4.8,
+            )
+    _set_xi_axis(ax)
+    ax.set_xlabel(r"Conflict $\xi$")
+    ax.set_ylabel("Mean final borrowing weight")
+    ax.set_title(r"(d) Local borrowing by $X_1$", fontsize=10)
+    ax.grid(axis="y", alpha=0.22, linewidth=0.5)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(
+        handles=[Line2D([0], [0], color="0.25", linestyle=ls, linewidth=1.8,
+                        label=label) for _, _, ls, label in stratum_styles],
+        loc="center right", bbox_to_anchor=(1.0, 0.34),
+        frameon=False, fontsize=7.5,
+    )
     handles = [
         Line2D(
             [0], [0], color=METHOD_COLORS[m], linestyle=METHOD_STYLES[m],
@@ -477,38 +521,30 @@ def make_F3(df):
             plt.Normalize(vmin=0.0, vmax=w_max), "{:.2f}", r"$\bar W$",
         ),
     ]
-    fig, axes = plt.subplots(2, 3, figsize=(COL2_W * 1.68, 6.45))
+    fig, axes = plt.subplots(2, 3, figsize=(COL2_W, 4.80))
     fig.subplots_adjust(
-        left=0.11, right=0.93, top=0.93, bottom=0.09,
-        wspace=0.27, hspace=0.24,
+        left=0.11, right=0.93, top=0.91, bottom=0.13,
+        wspace=0.30, hspace=0.34,
     )
     images = []
     for row, method in enumerate(methods):
         for col, (key, title, cmap, norm, fmt, cbar_label) in enumerate(columns):
             ax = axes[row, col]
             grid = grids[(method, key)]
-            image = ax.imshow(
-                grid, origin="lower", cmap=cmap, norm=norm,
-                aspect="auto", extent=extent,
+            image = ax.pcolormesh(
+                np.arange(nx + 1) - 0.5,
+                np.arange(ny + 1) - 0.5,
+                grid,
+                cmap=cmap,
+                norm=norm,
+                shading="flat",
             )
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+            ax.set_box_aspect(1.0)
             images.append((col, image, cbar_label))
-            cmap_obj = plt.get_cmap(cmap)
-            for i in range(ny):
-                for k in range(nx):
-                    value = grid[i, k]
-                    if not np.isfinite(value):
-                        continue
-                    rgba = cmap_obj(norm(value))
-                    luminance = (
-                        0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
-                    )
-                    ax.text(
-                        k, i, fmt.format(value), ha="center", va="center",
-                        fontsize=6.7,
-                        color="white" if luminance < 0.52 else "black",
-                    )
             ax.set_xticks(np.arange(nx))
-            ax.set_xticklabels(xtick, fontsize=7.5)
+            ax.set_xticklabels(xtick, fontsize=6.8, rotation=45, ha="right")
             ax.set_yticks(np.arange(ny))
             ax.set_yticklabels(ytick if col == 0 else [], fontsize=7.3)
             if row == 1:
@@ -536,11 +572,10 @@ def make_F3(df):
 
 
 def make_T2(summary):
-    """Write representative points from all four conflict regimes."""
+    """Write the three conflict levels at the larger historical size."""
     anchors = [
         (0.0, "Exact compatibility"),
-        (0.08, "Low conflict"),
-        (0.64, "Moderate conflict"),
+        (0.32, "Moderate conflict"),
         (1.0, "Severe conflict"),
     ]
     rows = []
@@ -573,7 +608,7 @@ def make_T2(summary):
         r"\begin{table}[htbp]",
         r"\centering",
         (
-            r"\caption{Real-data-calibrated operating characteristics at "
+            r"\caption{HORIZON--FIT semi-synthetic operating characteristics at "
             r"$n_H=350$ for representative conflict levels.}"
         ),
         r"\label{tab:real_operating}",
@@ -604,9 +639,7 @@ def main():
     raw = pd.read_csv(RUN_CSV)
     summary = summarize_results(raw)
     make_T1(params)
-    make_F1(params)
     make_F2(summary)
-    make_F3(summary)
     make_T2(summary)
 
 

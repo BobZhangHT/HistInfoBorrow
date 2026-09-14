@@ -57,12 +57,55 @@ def gaussian_weights(X_ref, x_star, h):
     diff = (X_ref - x) / np.asarray(h, float)
     return np.exp(-0.5 * np.sum(diff**2, axis=1))
 
+
+def _stable_gaussian_weights(X_ref, x_star, h):
+    """Return normalized Gaussian weights using a log-weight shift.
+
+    Historical local summaries depend only on relative kernel weights.  We
+    therefore subtract the largest log weight before exponentiation and
+    normalize the resulting positive vector.  This is algebraically
+    equivalent to normalizing the original Gaussian weights, while avoiding
+    an all-zero vector when every unscaled weight underflows.
+    """
+    X_ref = _as_2d(X_ref)
+    x = np.asarray(x_star, float).ravel()
+    if X_ref.shape[0] == 0:
+        return np.zeros(0, dtype=float)
+    diff = (X_ref - x) / np.asarray(h, float)
+    with np.errstate(over="ignore", invalid="ignore"):
+        logw = -0.5 * np.sum(diff**2, axis=1)
+    finite = np.isfinite(logw)
+    if not np.any(finite):
+        # Finite covariates normally imply at least one finite log weight;
+        # retain a positive row even for inputs beyond floating-point range.
+        out = np.zeros(logw.shape, dtype=float)
+        out[0] = 1.0
+        return out
+    shift = float(np.max(logw[finite]))
+    out = np.zeros(logw.shape, dtype=float)
+    with np.errstate(under="ignore", invalid="ignore"):
+        out[finite] = np.exp(logw[finite] - shift)
+    total = float(np.sum(out))
+    if not np.isfinite(total) or total <= 0.0:
+        out[:] = 0.0
+        out[int(np.flatnonzero(finite)[np.argmax(logw[finite])])] = 1.0
+        return out
+    return out / total
+
 def gaussian_weight_matrix(X_ref, X_eval, h):
     """Batch kernel: returns (n_eval, n_ref) matrix."""
     Xr = _as_2d(X_ref); Xe = _as_2d(X_eval)
     h = np.asarray(h, float)
     d = Xr[None, :, :] - Xe[:, None, :]
     return np.exp(-0.5 * np.sum((d / h)**2, axis=2))
+
+
+def _stable_gaussian_weight_matrix(X_ref, X_eval, h):
+    """Row-normalized Gaussian weights with log-sum-exp stabilization."""
+    Xr = _as_2d(X_ref); Xe = _as_2d(X_eval)
+    if Xe.shape[0] == 0:
+        return np.zeros((0, Xr.shape[0]), dtype=float)
+    return np.vstack([_stable_gaussian_weights(Xr, x, h) for x in Xe])
 
 def normalise_rows(W):
     return W / np.maximum(W.sum(axis=1, keepdims=True), _EPS)
@@ -118,9 +161,12 @@ def estimate_ate(X_eval, X0, Y0, X1, Y1, X_H, Y_H, h, W_vec, alpha=0.05):
         return float(np.nanmean(Y1) - np.nanmean(Y0)), np.nan, np.nan, 0.5
 
     # Normalised kernel weight matrices
-    S0 = normalise_rows(gaussian_weight_matrix(X0, X_eval, h))
-    S1 = normalise_rows(gaussian_weight_matrix(X1, X_eval, h))
-    SH = normalise_rows(gaussian_weight_matrix(X_H, X_eval, h))
+    S0 = _stable_gaussian_weight_matrix(X0, X_eval, h)
+    S1 = _stable_gaussian_weight_matrix(X1, X_eval, h)
+    # Historical rows use a log-weight shift before exponentiation.  Their
+    # normalized values are unchanged, including when all unscaled Gaussian
+    # values underflow at a distant query point.
+    SH = _stable_gaussian_weight_matrix(X_H, X_eval, h)
 
     # Modulate by borrowing weight
     W = np.asarray(W_vec, float).ravel()[:, None]
@@ -213,7 +259,7 @@ def _kernel_resid_var(X_arm, Y_arm, h):
     na = len(Y_arm)
     if na < 3:
         return max(float(np.var(Y_arm, ddof=1)), _EPS) if na > 1 else _EPS
-    S_self = normalise_rows(gaussian_weight_matrix(X_arm, X_arm, h))
+    S_self = _stable_gaussian_weight_matrix(X_arm, X_arm, h)
     resid = Y_arm - S_self @ Y_arm
     tr_S = np.trace(S_self)
     tr_StS = float(np.sum(S_self * S_self))   # ‖S‖_F²
@@ -290,10 +336,8 @@ def _compute_borrowing_weight(theta, tau2_H, ybar, sigma2_0c, Nc, nc_floor,
 
 def radish_stage1(x, X_H, Y_H, h):
     """Stage I: local historical summary theta(x), tau2_H(x)."""
-    wH = gaussian_weights(_as_2d(X_H), np.asarray(x, float).ravel(), h)
-    swH = wH.sum()
-    if swH <= _EPS:
-        return float(np.mean(Y_H)), 1e6
+    wH = _stable_gaussian_weights(_as_2d(X_H), np.asarray(x, float).ravel(), h)
+    swH = float(wH.sum())
     th = float(wH @ Y_H / swH)
     s2 = max(float(np.sum(wH * (Y_H - th)**2) / swH), _EPS)
     neff = max(swH**2 / max(float(wH @ wH), _EPS), 1e-6)
@@ -330,7 +374,7 @@ class KBCD:
         if len(X_curr) < 2:
             return AllocationResult(0.5, {"R_n": 1.0, "method": "KBCD"})
         X_curr = _as_2d(X_curr); Z = np.asarray(Z_curr, float).ravel()
-        w = gaussian_weights(X_curr, X_new, self.h)
+        w = _stable_gaussian_weights(X_curr, X_new, self.h)
         n0 = float(w @ (1.0 - Z)); n1 = float(w @ Z)
         return AllocationResult(phi_from_counts(n0, n1),
                                 {"R_n": 1.0, "method": "KBCD"})
@@ -344,8 +388,10 @@ class KBCD:
 
     def compute_diagnostics(self, X, Y, Z):
         """Borrowing diagnostics: KBCD never borrows."""
-        return {"mean_W": 0.0, "mean_Rn": 1.0, "mean_Dpdc": np.nan,
-                "mean_tau2_H": np.nan}
+        return {"mean_W": 0.0, "mean_Rn": 1.0,
+                "mean_W_x1_0": 0.0, "mean_W_x1_1": 0.0,
+                "mean_Rn_x1_0": 1.0, "mean_Rn_x1_1": 1.0,
+                "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
 
 # =====================================================================
 # CAHB — Jin et al. (2023) coordinate-ascent borrowing
@@ -386,9 +432,8 @@ class CAHB:
     def _hist_mean(self, Xe):
         Xe = _as_2d(Xe); out = np.zeros(Xe.shape[0])
         for i in range(Xe.shape[0]):
-            w = gaussian_weights(self.X_h, Xe[i], self.h)
-            s = w.sum()
-            out[i] = float(w @ self.Y_h / s) if s > _EPS else 0.0
+            w = _stable_gaussian_weights(self.X_h, Xe[i], self.h)
+            out[i] = float(w @ self.Y_h)
         return out
 
     # ── Coordinate ascent ──
@@ -415,9 +460,12 @@ class CAHB:
             mu0 = self._mu0(KM, Y, Z, tau, phi, th0)
             phi_n = self._phi(Y, Z, mu0)
             tau_n = self._tau(KM, Z, mu0, th0, lt)
-            if np.mean((mu0 - self._mu0(KM, Y, Z, tau, phi, th0))**2) < 1e-5:
-                phi, tau = phi_n, tau_n; break
+            mu0_n = self._mu0(KM, Y, Z, tau_n, phi_n, th0)
+            mse = np.mean((mu0_n - mu0)**2)
             phi, tau = phi_n, tau_n
+            mu0 = mu0_n
+            if mse < 1e-5:
+                break
         m = _CAHBModel()
         m.X = X; m.Y = Y; m.Z = Z; m.sZ = sZ; m.KM = KM
         m.theta0 = th0; m.mu0 = mu0; m.tau = tau
@@ -486,7 +534,7 @@ class CAHB:
         m = self._fit(X_curr, Y_curr, np.asarray(Z_curr, float))
         if m is None:
             return AllocationResult(0.5, {"R_n": 1.0, "method": "CAHB"})
-        w = gaussian_weights(m.X, X_new, self.h)
+        w = _stable_gaussian_weights(m.X, X_new, self.h)
         n0 = float(m.sZ @ w); n1 = float(m.Z @ w)
         Rn = self._Rn(m, X_new)
         return AllocationResult(phi_from_counts(Rn * n0, n1),
@@ -513,15 +561,25 @@ class CAHB:
         X = _as_2d(X); Y = np.asarray(Y, float); Z = np.asarray(Z, int)
         if (Z == 0).sum() < 2 or (Z == 1).sum() < 2:
             return {"mean_W": np.nan, "mean_Rn": np.nan,
+                    "mean_W_x1_0": np.nan, "mean_W_x1_1": np.nan,
+                    "mean_Rn_x1_0": np.nan, "mean_Rn_x1_1": np.nan,
                     "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
         m = self._fit(X, Y, Z.astype(float))
         if m is None:
             return {"mean_W": np.nan, "mean_Rn": np.nan,
+                    "mean_W_x1_0": np.nan, "mean_W_x1_1": np.nan,
+                    "mean_Rn_x1_0": np.nan, "mean_Rn_x1_1": np.nan,
                     "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
         Rns = np.array([self._Rn(m, X[i]) for i in range(X.shape[0])])
         Ws = (Rns - 1.0) / np.maximum(Rns, _EPS)
+        x1_0 = X[:, 0] == 0
+        x1_1 = X[:, 0] == 1
         return {"mean_W": float(np.mean(Ws)),
                 "mean_Rn": float(np.mean(Rns)),
+                "mean_W_x1_0": float(np.mean(Ws[x1_0])) if np.any(x1_0) else np.nan,
+                "mean_W_x1_1": float(np.mean(Ws[x1_1])) if np.any(x1_1) else np.nan,
+                "mean_Rn_x1_0": float(np.mean(Rns[x1_0])) if np.any(x1_0) else np.nan,
+                "mean_Rn_x1_1": float(np.mean(Rns[x1_1])) if np.any(x1_1) else np.nan,
                 "mean_Dpdc": np.nan,           # CAHB has no PDC metric
                 "mean_tau2_H": np.nan}         # CAHB has no explicit tau^2_H
 
@@ -562,11 +620,12 @@ class RADISH:
         # Stage I
         th, t2 = radish_stage1(X_new, self.X_h, self.Y_h, self.h)
         # Stage II control summary
-        w0 = gaussian_weights(_as_2d(X0), np.asarray(X_new, float).ravel(),
-                              self.h) if X0.shape[0] > 0 else np.zeros(0)
+        w0 = (_stable_gaussian_weights(_as_2d(X0),
+                                       np.asarray(X_new, float).ravel(), self.h)
+              if X0.shape[0] > 0 else np.zeros(0))
         Nc_raw = float(w0.sum())
         Nc_eff = _kernel_effective_n(w0)
-        if Nc_raw > _EPS:
+        if X0.shape[0] > 0:
             yb = float(w0 @ Y0 / Nc_raw)
             s2c = max(float(np.sum(w0 * (Y0 - yb)**2) / Nc_raw), _EPS)
         else:
@@ -578,7 +637,7 @@ class RADISH:
         Rn, W = _compute_borrowing_weight(th, t2, yb, s2c, Nc_eff, self.nc_stab,
                                           legacy=False, use_tau=False)
         # Allocation
-        wa = gaussian_weights(X_curr, X_new, self.h)
+        wa = _stable_gaussian_weights(X_curr, X_new, self.h)
         N0 = float(wa @ (1.0 - Z.astype(float)))
         N1 = float(wa @ Z.astype(float))
         pi = phi_from_counts(Rn * N0, N1)
@@ -595,27 +654,25 @@ class RADISH:
         # Trial-level (root-node) PDC surprisal, computed once and folded
         # uniformly into every local D_PDC via Fisher-style addition.
         Dg = _global_pdc_surprisal(X, X0, Y0, self.X_h, self.Y_h, h)
-        KH = gaussian_weight_matrix(self.X_h, X, h)
+        KH = _stable_gaussian_weight_matrix(self.X_h, X, h)
         Wv = np.zeros(n)
         for i in range(n):
-            wH = KH[i]; swH = wH.sum()
-            if swH > _EPS:
-                th = float(wH @ self.Y_h / swH)
-                s2H = max(float(np.sum(wH*(self.Y_h - th)**2)/swH), _EPS)
-                ne = max(swH**2 / max(float(wH @ wH), _EPS), 1e-6)
-                t2 = max(s2H / ne, _EPS)
-            else:
-                th = float(np.mean(self.Y_h)); t2 = 1e6
-            w0 = gaussian_weights(X0, X[i], h)
+            wH = KH[i]; swH = float(wH.sum())
+            th = float(wH @ self.Y_h / swH)
+            s2H = max(float(np.sum(wH*(self.Y_h - th)**2)/swH), _EPS)
+            ne = max(swH**2 / max(float(wH @ wH), _EPS), 1e-6)
+            t2 = max(s2H / ne, _EPS)
+            w0 = _stable_gaussian_weights(X0, X[i], h)
             Nc_raw = float(w0.sum())
             Nc_eff = _kernel_effective_n(w0)
-            if Nc_raw > _EPS:
-                yb = float(w0 @ Y0 / Nc_raw)
-                s2c = max(float(np.sum(w0*(Y0-yb)**2)/Nc_raw), _EPS)
-            else:
-                yb, s2c = 0.0, 1.0
+            yb = float(w0 @ Y0 / Nc_raw)
+            s2c = max(float(np.sum(w0*(Y0-yb)**2)/Nc_raw), _EPS)
+            _, _, Dl = _pdc_discrepancy(
+                th, t2, yb, s2c, max(Nc_eff, self.n0_fin)
+            )
+            Dg_local = (1.0 - np.exp(-Dl)) * Dg
             _, Wv[i] = _compute_borrowing_weight(th, t2, yb, s2c, Nc_eff,
-                                                 self.n0_fin, Dg=Dg)
+                                                 self.n0_fin, Dg=Dg_local)
         return estimate_ate(X, X0, Y0, X[i1], Y[i1],
                             self.X_h, self.Y_h, h, Wv, self.alpha)
 
@@ -625,35 +682,38 @@ class RADISH:
         i0 = np.where(Z == 0)[0]
         if len(i0) < 2:
             return {"mean_W": np.nan, "mean_Rn": np.nan,
+                    "mean_W_x1_0": np.nan, "mean_W_x1_1": np.nan,
+                    "mean_Rn_x1_0": np.nan, "mean_Rn_x1_1": np.nan,
                     "mean_Dpdc": np.nan, "mean_tau2_H": np.nan}
         X0, Y0 = X[i0], Y[i0]; h = self.h; n = X.shape[0]
         Dg = _global_pdc_surprisal(X, X0, Y0, self.X_h, self.Y_h, h)
-        KH = gaussian_weight_matrix(self.X_h, X, h)
+        KH = _stable_gaussian_weight_matrix(self.X_h, X, h)
         Rns = np.zeros(n); Ws = np.zeros(n); Ds = np.zeros(n); T2 = np.zeros(n)
         for i in range(n):
-            wH = KH[i]; swH = wH.sum()
-            if swH > _EPS:
-                th = float(wH @ self.Y_h / swH)
-                s2H = max(float(np.sum(wH*(self.Y_h - th)**2)/swH), _EPS)
-                ne = max(swH**2 / max(float(wH @ wH), _EPS), 1e-6)
-                t2 = max(s2H / ne, _EPS)
-            else:
-                th = float(np.mean(self.Y_h)); t2 = 1e6
-            w0 = gaussian_weights(X0, X[i], h)
+            wH = KH[i]; swH = float(wH.sum())
+            th = float(wH @ self.Y_h / swH)
+            s2H = max(float(np.sum(wH*(self.Y_h - th)**2)/swH), _EPS)
+            ne = max(swH**2 / max(float(wH @ wH), _EPS), 1e-6)
+            t2 = max(s2H / ne, _EPS)
+            w0 = _stable_gaussian_weights(X0, X[i], h)
             Nc_raw = float(w0.sum())
             Nc_eff = _kernel_effective_n(w0)
-            if Nc_raw > _EPS:
-                yb = float(w0 @ Y0 / Nc_raw)
-                s2c = max(float(np.sum(w0*(Y0-yb)**2)/Nc_raw), _EPS)
-            else:
-                yb, s2c = 0.0, 1.0
+            yb = float(w0 @ Y0 / Nc_raw)
+            s2c = max(float(np.sum(w0*(Y0-yb)**2)/Nc_raw), _EPS)
             _, _, Dl = _pdc_discrepancy(th, t2, yb, s2c, max(Nc_eff, self.n0_fin))
-            Ds[i] = Dl + Dg
+            Dg_local = (1.0 - np.exp(-Dl)) * Dg
+            Ds[i] = Dl + Dg_local
             Rns[i], Ws[i] = _compute_borrowing_weight(th, t2, yb, s2c, Nc_eff,
-                                                     self.n0_fin, Dg=Dg)
+                                                     self.n0_fin, Dg=Dg_local)
             T2[i] = t2
+        x1_0 = X[:, 0] == 0
+        x1_1 = X[:, 0] == 1
         return {"mean_W": float(np.mean(Ws)),
                 "mean_Rn": float(np.mean(Rns)),
+                "mean_W_x1_0": float(np.mean(Ws[x1_0])) if np.any(x1_0) else np.nan,
+                "mean_W_x1_1": float(np.mean(Ws[x1_1])) if np.any(x1_1) else np.nan,
+                "mean_Rn_x1_0": float(np.mean(Rns[x1_0])) if np.any(x1_0) else np.nan,
+                "mean_Rn_x1_1": float(np.mean(Rns[x1_1])) if np.any(x1_1) else np.nan,
                 "mean_Dpdc": float(np.mean(Ds)),
                 "mean_tau2_H": float(np.mean(T2))}
 

@@ -1,19 +1,11 @@
-"""
-config.py — Simulation configuration for the primary 4×2 design.
+"""Simulation scenarios and runtime settings for RADISH.
 
-Primary 4×2 conflict-by-precision grid:
-                    High precision (σ_H=0.5)        Low precision (σ_H=3.0)
-  No bias (b=0)     B1: ideal borrowing              B2: noisy but unbiased
-  Low bias (b=0.1)  L1: useful borrowing remains     L2: noisy low conflict
-  Mod bias (b=0.5)  B3: precise bias → CAHB traps    B4: hidden bias in noise
-  Large bias (b=2)  B5: all methods detect            B6: all methods detect
-
-Key B3 vs B4 insight:
-  B3: θ₀(x) precise → CAHB's variance-ratio sees high value + circular trap
-      → OVER-borrows biased data → severe ATE contamination
-  B4: θ₀(x) noisy → less variance reduction value → CAHB borrows less
-      but still cannot detect hidden bias
-  RADISH: limits borrowing in both via PDC (B3) and precision cap (B4)
+Historical conflict is covariate dependent. For the binary covariate X1,
+``b_local=(b0,b1)`` defines the two stratum-specific shifts and ``b_theta``
+records their marginal summary. The manuscript uses three complementary grids:
+the six-cell conflict-by-precision experiment, a five-point local-conflict path,
+and a four-cell diagnostic crossing marginal conflict with local heterogeneity.
+The broader ``full`` grid is retained for supplementary sensitivity analyses.
 """
 import numpy as np
 from pathlib import Path
@@ -33,40 +25,66 @@ SIGMA_1 = 1.2    # treatment arm noise SD (heteroscedastic)
 
 EFFECT_SIZES = {"Null": 0.0, "Power": 0.5}
 
-# ── Original six-scenario subset (stable B1--B6 identifiers) ───────
+# ── Manuscript six-scenario grid (stable B1--B6 identifiers) ─────────
 # Y^H = μ₀^C(X) + b_θ + ε_H,   ε_H ~ N(0, σ_H²)
 #
 # Bias levels:   b = 0.0 (none), 0.5 (moderate), 2.0 (large)
 # Precision:     σ_H = 0.5 (high precision), 3.0 (low precision)
 
 SCENARIOS = {
-    "B1_noBias_highPrec":  {"b_theta": 0.0, "sigma_h": 0.5,
+    "B1_noBias_highPrec":  {"b_local": (0.0, 0.0), "b_theta": 0.0, "sigma_h": 0.5,
         "description": "Ideal: unbiased, precise — maximum borrowing benefit"},
-    "B2_noBias_lowPrec":   {"b_theta": 0.0, "sigma_h": 3.0,
+    "B2_noBias_lowPrec":   {"b_local": (0.0, 0.0), "b_theta": 0.0, "sigma_h": 3.0,
         "description": "Unbiased but noisy — limited borrowing value"},
-    "B3_mdBias_highPrec":  {"b_theta": 0.5, "sigma_h": 0.5,
+    "B3_mdBias_highPrec":  {"b_local": (0.25, 0.75), "b_theta": 0.5, "sigma_h": 0.5,
         "description": "Moderate bias, precise — CAHB over-borrows via circular trap"},
-    "B4_mdBias_lowPrec":   {"b_theta": 0.5, "sigma_h": 3.0,
+    "B4_mdBias_lowPrec":   {"b_local": (0.25, 0.75), "b_theta": 0.5, "sigma_h": 3.0,
         "description": "Moderate bias, noisy — bias hidden; less borrowing but still contaminated"},
-    "B5_lgBias_highPrec":  {"b_theta": 2.0, "sigma_h": 0.5,
+    "B5_lgBias_highPrec":  {"b_local": (1.5, 2.5), "b_theta": 2.0, "sigma_h": 0.5,
         "description": "Large bias, precise — all methods detect conflict"},
-    "B6_lgBias_lowPrec":   {"b_theta": 2.0, "sigma_h": 3.0,
+    "B6_lgBias_lowPrec":   {"b_local": (1.5, 2.5), "b_theta": 2.0, "sigma_h": 3.0,
         "description": "Large bias, noisy — all methods detect conflict"},
 }
 
-# ── Primary four-regime grid used by demo and full modes ────────────────
-# L1/L2 add the low-conflict transition while preserving B1--B6 meanings.
+def _local(b0, b1, sigma_h, description):
+    """Primary-grid scenario defined by stratum-wise historical shifts."""
+    return {"b_local": (float(b0), float(b1)),
+            "b_theta": 0.5 * (float(b0) + float(b1)),
+            "sigma_h": float(sigma_h),
+            "description": description}
+
+
+# Five-point precise-history path used only for the local-borrowing mechanism
+# figure. The three anchor cells coincide with S1, S3, and S5.
+LOCAL_PATH_SCENARIOS = {
+    "P0_compatible": _local(0.0, 0.0, 0.5, "Exact compatibility"),
+    "P1_low_local": _local(0.10, 0.30, 0.5, "Low local conflict"),
+    "P2_moderate_local": _local(0.25, 0.75, 0.5, "Moderate local conflict"),
+    "P3_high_local": _local(0.50, 1.50, 0.5, "High local conflict"),
+    "P4_severe_local": _local(1.0, 3.0, 0.5, "Severe local conflict"),
+}
+
+
+# ── Extended four-regime grid used by demo, full, and hist_size modes ───
+# The compatible stratum is b0 = 0 throughout; the conflict lives in the
+# x1 = 1 stratum only, at twice the marginal level of the legacy grid.
 PRIMARY_SCENARIOS = {
-    "B1_noBias_highPrec":  SCENARIOS["B1_noBias_highPrec"],
-    "B2_noBias_lowPrec":   SCENARIOS["B2_noBias_lowPrec"],
-    "L1_lowBias_highPrec": {"b_theta": 0.1, "sigma_h": 0.5,
-        "description": "Low conflict and precise — useful borrowing should remain"},
-    "L2_lowBias_lowPrec":  {"b_theta": 0.1, "sigma_h": 3.0,
-        "description": "Low conflict but noisy — limited information gain"},
-    "B3_mdBias_highPrec":  SCENARIOS["B3_mdBias_highPrec"],
-    "B4_mdBias_lowPrec":   SCENARIOS["B4_mdBias_lowPrec"],
-    "B5_lgBias_highPrec":  SCENARIOS["B5_lgBias_highPrec"],
-    "B6_lgBias_lowPrec":   SCENARIOS["B6_lgBias_lowPrec"],
+    "B1_noBias_highPrec":  _local(0.0, 0.0, 0.5,
+        "Exactly compatible strata, precise history — maximum borrowing benefit"),
+    "B2_noBias_lowPrec":   _local(0.0, 0.0, 3.0,
+        "Exactly compatible strata, noisy history — limited borrowing value"),
+    "L1_lowBias_highPrec": _local(0.0, 0.2, 0.5,
+        "Low local conflict, precise history — useful borrowing should remain"),
+    "L2_lowBias_lowPrec":  _local(0.0, 0.2, 3.0,
+        "Low local conflict, noisy history — limited information gain"),
+    "B3_mdBias_highPrec":  _local(0.0, 0.6, 0.5,
+        "Moderate local conflict, precise history — global screening misses it"),
+    "B4_mdBias_lowPrec":   _local(0.0, 0.6, 3.0,
+        "Moderate local conflict, noisy history — local screen is decisive"),
+    "B5_lgBias_highPrec":  _local(0.0, 2.0, 0.5,
+        "Severe local conflict, precise history — all methods detect it"),
+    "B6_lgBias_lowPrec":   _local(0.0, 2.0, 3.0,
+        "Severe local conflict, noisy history — all methods detect it"),
 }
 
 # ── Kernel ───────────────────────────────────────────────────────
@@ -78,11 +96,41 @@ PRIMARY_SCENARIOS = {
 # Backwards-compatible name used by older downstream scripts.
 DEMO_SCENARIOS = PRIMARY_SCENARIOS
 
+# Orthogonal global-by-local diagnostic. This compact four-cell experiment is
+# separate from the retained six-scenario bias-by-precision study.
+# The diagnostic uses P(X1=1)=1/3 and the centered contrast
+# s(0)=-1/2, s(1)=1. Hence E{s(X1)}=0, while unequal absolute contrasts let
+# the borrowing diagnostic visibly distinguish the two local regions.
+GLOBAL_LOCAL_X1_PROB = 1.0 / 3.0
+GLOBAL_SIGNAL_STRONG = 0.6
+LOCAL_SIGNAL_WEAK = 0.1
+LOCAL_SIGNAL_STRONG = 1.2
+
+
+def _global_local(g, ell, description):
+    """Scenario with b(x)=g+ell*s(x), E{s(X1)}=0, at high precision."""
+    scenario = _local(g - 0.5 * ell, g + ell, 0.5, description)
+    scenario["p_x1"] = GLOBAL_LOCAL_X1_PROB
+    return scenario
+
+
+GLOBAL_LOCAL_SCENARIOS = {
+    "GL00_weak_global_weak_local": _global_local(
+        0.0, LOCAL_SIGNAL_WEAK, "Weak global and weak local conflict"),
+    "GL10_strong_global_weak_local": _global_local(
+        GLOBAL_SIGNAL_STRONG, LOCAL_SIGNAL_WEAK,
+        "Strong global and weak local conflict"),
+    "GL01_weak_global_strong_local": _global_local(
+        0.0, LOCAL_SIGNAL_STRONG, "Weak global and strong local conflict"),
+    "GL11_strong_global_strong_local": _global_local(
+        GLOBAL_SIGNAL_STRONG, LOCAL_SIGNAL_STRONG,
+        "Strong global and strong local conflict; one stratum remains compatible"),
+}
+
 # ── Method hyperparameters ───────────────────────────────────────
 PRIORS = {
     # RADISH (proposed)
     "radish_nc_stabilizer":    5.0,   # N_c floor for Stage II
-    "radish_n_min_discrepancy": 3.0,
     "radish_n0_final":         5.0,   # N_c floor for Stage III
     # CAHB (Jin et al., 2023)
     "cahb_lambda":            300.0, # L1 projection radius
@@ -101,7 +149,9 @@ def _build_precision_scenarios():
     for blab, bv in PRECISION_BIAS_LEVELS.items():
         for sh in PRECISION_GRID:
             key = f"P_{blab}_sH{sh:g}".replace(".", "p")
-            out[key] = {"b_theta": float(bv), "sigma_h": float(sh),
+            ell = 0.5 * float(bv)
+            out[key] = {"b_local": (float(bv) - ell, float(bv) + ell),
+                        "b_theta": float(bv), "sigma_h": float(sh),
                         "description": f"Precision sweep b={bv}, σ_H={sh}",
                         "_grid_bias": blab, "_grid_sigma": float(sh)}
     return out
@@ -114,7 +164,7 @@ PRECISION_SCENARIOS = _build_precision_scenarios()
 # of D_PDC and the exponential collapse of W in the unsaturated
 # regime (i.e. before D_PDC hits the −log(ε_p) ≈ 27.6 cap).
 # Focused low-conflict grid.  We use the same dimensionless parameter as the
-# real-data-calibrated study: b_theta = 2 * xi * sigma_C.  Here
+# HORIZON-FIT semi-synthetic study: b_theta = 2 * xi * sigma_C. Here
 # sigma_C=SIGMA_0=1, so the requested doubling grid maps to
 # b_theta={0,.02,.04,.08,.16,.32}.  Moderate and severe conflict remain in
 # the primary 4x2 experiment at b_theta=.5 and 2.
@@ -126,7 +176,9 @@ def _build_bias_scenarios():
     out = {}
     for xi, b in zip(BIAS_XI_GRID, BIAS_GRID):
         key = f"G_xi{xi:g}".replace(".", "p")
-        out[key] = {"b_theta": float(b), "sigma_h": float(BIAS_GRID_SIGMA_H),
+        ell = 0.5 * float(b)
+        out[key] = {"b_local": (float(b) - ell, float(b) + ell),
+                    "b_theta": float(b), "sigma_h": float(BIAS_GRID_SIGMA_H),
                     "xi": float(xi),
                     "description": (f"Low-conflict gradient xi={xi}, "
                                     f"b_theta={b}, sigma_H={BIAS_GRID_SIGMA_H}"),
@@ -142,6 +194,9 @@ N_REPS_FULL       = 1000
 N_REPS_PRECISION  = 500   # 12 cells × 500 reps = 6000 trials/method
 N_REPS_BIAS       = 500   # 6 xi cells x 2 effects x 3 methods x 500 reps
 N_REPS_HIST_SIZE  = 1000
+N_REPS_GLOBAL_LOCAL = 1000
+N_REPS_SIX = 1000
+N_REPS_LOCAL_PATH = 1000
 
 # Historical-sample-size sensitivity analysis. The larger case doubles the
 # historical cohort while holding the concurrent trial size fixed at N=200.
@@ -152,7 +207,10 @@ def get_mode_replications(mode):
             "full": N_REPS_FULL,
             "precision": N_REPS_PRECISION,
             "bias":  N_REPS_BIAS,
-            "hist_size": N_REPS_HIST_SIZE}[mode]
+            "hist_size": N_REPS_HIST_SIZE,
+            "global_local": N_REPS_GLOBAL_LOCAL,
+            "six": N_REPS_SIX,
+            "local_path": N_REPS_LOCAL_PATH}[mode]
 
 def get_mode_scenarios(mode):
     """Return the scenario dict for a given mode."""
@@ -162,6 +220,12 @@ def get_mode_scenarios(mode):
         return PRECISION_SCENARIOS
     if mode == "bias":
         return BIAS_SCENARIOS
+    if mode == "global_local":
+        return GLOBAL_LOCAL_SCENARIOS
+    if mode == "six":
+        return SCENARIOS
+    if mode == "local_path":
+        return LOCAL_PATH_SCENARIOS
     return SCENARIOS
 
 # ── Output & Runtime ─────────────────────────────────────────────

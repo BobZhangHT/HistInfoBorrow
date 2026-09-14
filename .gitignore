@@ -1,5 +1,7 @@
 # Local research archive. It may contain private trial data and is never pushed.
 archive/
+manuscript/
+.aris/
 
 # Python caches and environments
 __pycache__/
@@ -96,5 +98,6 @@ desktop.ini
 *~
 tmp/
 reports/
+tmp_*.txt
 # Internal revision notes are not part of the public package
 REVISION_PLAN.md
