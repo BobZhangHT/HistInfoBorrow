@@ -3,7 +3,7 @@
 Historical conflict is covariate dependent. For the binary covariate X1,
 ``b_local=(b0,b1)`` defines the two stratum-specific shifts and ``b_theta``
 records their marginal summary. The manuscript uses three complementary grids:
-the six-cell conflict-by-precision experiment, a five-point local-conflict path,
+the eight-cell conflict-by-precision experiment, a nine-point local-conflict path,
 and a four-cell diagnostic crossing marginal conflict with local heterogeneity.
 The broader ``full`` grid is retained for supplementary sensitivity analyses.
 """
@@ -36,6 +36,10 @@ SCENARIOS = {
         "description": "Ideal: unbiased, precise — maximum borrowing benefit"},
     "B2_noBias_lowPrec":   {"b_local": (0.0, 0.0), "b_theta": 0.0, "sigma_h": 3.0,
         "description": "Unbiased but noisy — limited borrowing value"},
+    "L1_lowBias_highPrec": {"b_local": (0.04, 0.12), "b_theta": 0.08, "sigma_h": 0.5,
+        "description": "Small local conflict, precise — useful borrowing should remain"},
+    "L2_lowBias_lowPrec":  {"b_local": (0.04, 0.12), "b_theta": 0.08, "sigma_h": 3.0,
+        "description": "Small local conflict, noisy — limited information gain"},
     "B3_mdBias_highPrec":  {"b_local": (0.25, 0.75), "b_theta": 0.5, "sigma_h": 0.5,
         "description": "Moderate bias, precise — CAHB over-borrows via circular trap"},
     "B4_mdBias_lowPrec":   {"b_local": (0.25, 0.75), "b_theta": 0.5, "sigma_h": 3.0,
@@ -54,38 +58,28 @@ def _local(b0, b1, sigma_h, description):
             "description": description}
 
 
-# Five-point precise-history path used only for the local-borrowing mechanism
-# figure. The three anchor cells coincide with S1, S3, and S5.
+def _path(b1, description):
+    """One-to-three local-shift path used by the mechanism figure."""
+    return _local(float(b1) / 3.0, float(b1), 0.5, description)
+
+
 LOCAL_PATH_SCENARIOS = {
     "P0_compatible": _local(0.0, 0.0, 0.5, "Exact compatibility"),
-    "P1_low_local": _local(0.10, 0.30, 0.5, "Low local conflict"),
-    "P2_moderate_local": _local(0.25, 0.75, 0.5, "Moderate local conflict"),
-    "P3_high_local": _local(0.50, 1.50, 0.5, "High local conflict"),
-    "P4_severe_local": _local(1.0, 3.0, 0.5, "Severe local conflict"),
+    "P1_0p001": _path(0.001, "Very small local conflict"),
+    "P2_0p003": _path(0.003, "Very small local conflict"),
+    "P3_0p01": _path(0.01, "Small local conflict"),
+    "P4_0p03": _path(0.03, "Small local conflict"),
+    "P5_0p10": _path(0.10, "Low local conflict"),
+    "P6_0p30": _path(0.30, "Moderate local conflict"),
+    "P7_1p0": _path(1.00, "High local conflict"),
+    "P8_3p0": _path(3.00, "Severe local conflict"),
 }
 
 
 # ── Extended four-regime grid used by demo, full, and hist_size modes ───
 # The compatible stratum is b0 = 0 throughout; the conflict lives in the
 # x1 = 1 stratum only, at twice the marginal level of the legacy grid.
-PRIMARY_SCENARIOS = {
-    "B1_noBias_highPrec":  _local(0.0, 0.0, 0.5,
-        "Exactly compatible strata, precise history — maximum borrowing benefit"),
-    "B2_noBias_lowPrec":   _local(0.0, 0.0, 3.0,
-        "Exactly compatible strata, noisy history — limited borrowing value"),
-    "L1_lowBias_highPrec": _local(0.0, 0.2, 0.5,
-        "Low local conflict, precise history — useful borrowing should remain"),
-    "L2_lowBias_lowPrec":  _local(0.0, 0.2, 3.0,
-        "Low local conflict, noisy history — limited information gain"),
-    "B3_mdBias_highPrec":  _local(0.0, 0.6, 0.5,
-        "Moderate local conflict, precise history — global screening misses it"),
-    "B4_mdBias_lowPrec":   _local(0.0, 0.6, 3.0,
-        "Moderate local conflict, noisy history — local screen is decisive"),
-    "B5_lgBias_highPrec":  _local(0.0, 2.0, 0.5,
-        "Severe local conflict, precise history — all methods detect it"),
-    "B6_lgBias_lowPrec":   _local(0.0, 2.0, 3.0,
-        "Severe local conflict, noisy history — all methods detect it"),
-}
+PRIMARY_SCENARIOS = SCENARIOS
 
 # ── Kernel ───────────────────────────────────────────────────────
 # A single Gaussian product kernel is used for every stage (Stage I/II/III
@@ -96,8 +90,9 @@ PRIMARY_SCENARIOS = {
 # Backwards-compatible name used by older downstream scripts.
 DEMO_SCENARIOS = PRIMARY_SCENARIOS
 
-# Orthogonal global-by-local diagnostic. This compact four-cell experiment is
-# separate from the retained six-scenario bias-by-precision study.
+# Orthogonal marginal-shift-by-local-heterogeneity diagnostic. This compact
+# four-cell experiment is
+# separate from the retained eight-scenario bias-by-precision study.
 # The diagnostic uses P(X1=1)=1/3 and the centered contrast
 # s(0)=-1/2, s(1)=1. Hence E{s(X1)}=0, while unequal absolute contrasts let
 # the borrowing diagnostic visibly distinguish the two local regions.
@@ -111,6 +106,7 @@ def _global_local(g, ell, description):
     """Scenario with b(x)=g+ell*s(x), E{s(X1)}=0, at high precision."""
     scenario = _local(g - 0.5 * ell, g + ell, 0.5, description)
     scenario["p_x1"] = GLOBAL_LOCAL_X1_PROB
+    scenario["b_theta"] = float(g)
     return scenario
 
 
@@ -124,7 +120,7 @@ GLOBAL_LOCAL_SCENARIOS = {
         0.0, LOCAL_SIGNAL_STRONG, "Weak global and strong local conflict"),
     "GL11_strong_global_strong_local": _global_local(
         GLOBAL_SIGNAL_STRONG, LOCAL_SIGNAL_STRONG,
-        "Strong global and strong local conflict; one stratum remains compatible"),
+        "Strong marginal shift and strong local heterogeneity; X1=0 remains compatible"),
 }
 
 # ── Method hyperparameters ───────────────────────────────────────
@@ -222,7 +218,7 @@ def get_mode_scenarios(mode):
         return BIAS_SCENARIOS
     if mode == "global_local":
         return GLOBAL_LOCAL_SCENARIOS
-    if mode == "six":
+    if mode == "six":  # backwards-compatible mode name; now eight cells
         return SCENARIOS
     if mode == "local_path":
         return LOCAL_PATH_SCENARIOS

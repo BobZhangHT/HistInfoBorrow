@@ -5,7 +5,7 @@ Three covariate-adaptive randomisation methods for two-arm trials
 with optional historical control borrowing.
 
 Stage II  : adaptive allocation (method-specific R_n)
-Stage III : unified linearized ATE estimator for all methods
+Stage III : unified kernel-standardized ATE estimator for all methods
 
     Delta_hat = a1'Y1 - a0'Y0 - aH'Y_H
     V_hat     = sigma1^2 ||a1||^2 + sigma0^2 ||a0||^2 + sigmaH^2 ||aH||^2
@@ -124,7 +124,7 @@ def kernel_bandwidths(X_pool):
     return np.maximum(f * sig, _EPS)
 
 # =====================================================================
-# Unified linearized ATE (Stage III for ALL methods)
+# Unified kernel-standardized ATE (Stage III for ALL methods)
 # =====================================================================
 
 def estimate_ate(X_eval, X0, Y0, X1, Y1, X_H, Y_H, h, W_vec, alpha=0.05):
@@ -195,6 +195,25 @@ def estimate_ate(X_eval, X0, Y0, X1, Y1, X_H, Y_H, h, W_vec, alpha=0.05):
     se = np.sqrt(V)
     z = norm.ppf(1.0 - alpha / 2.0)
     return ate, ate - z*se, ate + z*se, float(norm.cdf(ate/se)) if se > _EPS else 0.5
+
+
+def _variance_safeguarded_result(borrow_result, reference_result, alpha=0.05):
+    """Keep the borrowing estimate but impose the concurrent-only SE floor.
+
+    Terminal borrowing weights are estimated from the same outcomes used in
+    the effect estimator.  The fixed-weight sandwich can therefore be too
+    optimistic in finite samples.  The concurrent-only kernel estimator gives
+    a concurrent-only reference variance; the reported RADISH variance is the
+    larger of the borrowing and reference variances.
+    """
+    ate, lo, hi, _ = borrow_result
+    _, ref_lo, ref_hi, _ = reference_result
+    z = norm.ppf(1.0 - alpha / 2.0)
+    se_borrow = (hi - lo) / (2.0 * z)
+    se_reference = (ref_hi - ref_lo) / (2.0 * z)
+    se = max(float(se_borrow), float(se_reference))
+    return (ate, ate - z * se, ate + z * se,
+            float(norm.cdf(ate / se)) if se > _EPS else 0.5)
 
 # =====================================================================
 # RADISH helper: PDC discrepancy
@@ -593,7 +612,7 @@ class RADISH:
       Stage I  : local historical prior {theta(x), tau2_H(x)}
       Stage II : centered PDC discrepancy D(x) = (-log(p_n)-1)_+ drives
                   the exp(-D) discount
-      Stage III: linearized ATE with data-adaptive W(x) = (R_n-1)/R_n
+      Stage III: kernel-standardized ATE with data-adaptive W(x) = (R_n-1)/R_n
     """
 
     def __init__(self, historical_data, scenario_params, priors):
@@ -673,8 +692,12 @@ class RADISH:
             Dg_local = (1.0 - np.exp(-Dl)) * Dg
             _, Wv[i] = _compute_borrowing_weight(th, t2, yb, s2c, Nc_eff,
                                                  self.n0_fin, Dg=Dg_local)
-        return estimate_ate(X, X0, Y0, X[i1], Y[i1],
-                            self.X_h, self.Y_h, h, Wv, self.alpha)
+        borrowed = estimate_ate(X, X0, Y0, X[i1], Y[i1],
+                                self.X_h, self.Y_h, h, Wv, self.alpha)
+        concurrent = estimate_ate(X, X0, Y0, X[i1], Y[i1],
+                                  self.X_h, self.Y_h, h,
+                                  np.zeros(n), self.alpha)
+        return _variance_safeguarded_result(borrowed, concurrent, self.alpha)
 
     def compute_diagnostics(self, X, Y, Z):
         """Mean borrowing weight, R_n, D_PDC and tau^2_H averaged over subjects."""

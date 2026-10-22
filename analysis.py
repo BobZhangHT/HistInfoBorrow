@@ -2,7 +2,7 @@
 
 Factorial modes produce allocation, interval, calibrated-power, borrowing, and
 precision diagnostics. Dedicated paths handle the local-conflict,
-global-by-local, precision, bias, and historical-size studies. Figures are
+marginal-shift-by-local-heterogeneity, precision, bias, and historical-size studies. Figures are
 written as publication-quality vector PDFs.
 """
 from __future__ import annotations
@@ -93,12 +93,12 @@ EFFECT_DISPLAY = {"Null": r"$\Delta = 0$ (Null)", "Power": r"$\Delta = 0.5$ (Pow
 SCENARIO_DISPLAY = {
     "B1_noBias_highPrec": "S1",
     "B2_noBias_lowPrec": "S2",
-    "B3_mdBias_highPrec": "S3",
-    "B4_mdBias_lowPrec": "S4",
-    "B5_lgBias_highPrec": "S5",
-    "B6_lgBias_lowPrec": "S6",
-    "L1_lowBias_highPrec": "L1",
-    "L2_lowBias_lowPrec": "L2",
+    "L1_lowBias_highPrec": "S3",
+    "L2_lowBias_lowPrec": "S4",
+    "B3_mdBias_highPrec": "S5",
+    "B4_mdBias_lowPrec": "S6",
+    "B5_lgBias_highPrec": "S7",
+    "B6_lgBias_lowPrec": "S8",
 }
 
 
@@ -237,7 +237,7 @@ def _aggregate(df, scenarios):
     return out
 
 
-# Regime layouts for the retained six-cell subset and primary eight-cell grid.
+# Regime layouts for legacy six-cell results and the primary eight-cell grid.
 _REGIME_LAYOUTS = {
     6: [("Compatible", 0, 2), ("Moderate conflict", 2, 4),
         ("Severe conflict", 4, 6)],
@@ -418,7 +418,7 @@ def plot_figure4_testing(df, scen_order, out_dir):
     agg = _aggregate(df, scen_order)
     if agg.empty: return
     n_rep = int(agg["n"].max()) if "n" in agg else 1000
-    # Binomial 95% reference band for a nominal 0.05 rate at this M.
+    # Normal-approximation 95% reference band for a nominal 0.05 rate at this M.
     half = 1.959964 * np.sqrt(0.05 * 0.95 / max(n_rep, 1))
     fig, axes = plt.subplots(1, 2, figsize=(COL2_W, 3.1))
     for ax, eff, ttl in zip(axes, ["Null", "Power"],
@@ -432,7 +432,7 @@ def plot_figure4_testing(df, scen_order, out_dir):
             # that "inside the band" is a visual judgement rather than an
             # arithmetic one.
             ax.axhspan(0.05 - half, 0.05 + half, color="0.45", alpha=0.13,
-                       zorder=0, label="binomial 95% band")
+                       zorder=0, label="normal-approximation 95% band")
             _grouped_bar(ax, sub, scen, "Rejection", "Rejection rate",
                          ref_line=0.05, ref_label=r"$\alpha = 0.05$",
                          err_metric="Rejection_ci95",
@@ -588,7 +588,11 @@ def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
     precise = []
     for sc in scen_order:
         meta = scenario_meta.get(sc, {})
-        if meta.get("sigma_h") == 0.5:
+        # A true logarithmic axis cannot display exact compatibility at zero.
+        # The compatible cell remains in the tables and text; this mechanism
+        # plot starts at the prespecified positive shift b(1)=1e-3.
+        b_local = meta.get("b_local", (np.nan, np.nan))
+        if meta.get("sigma_h") == 0.5 and float(b_local[1]) >= 1e-3:
             precise.append(sc)
     if not precise:
         return
@@ -597,6 +601,9 @@ def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
     x = np.array([scenario_meta[s]["b_local"][1] for s in precise])
 
     fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.15), sharex=True)
+    log_edges = np.geomspace(1e-3, 3.0, 5)
+    regime_names = ("Compatible / minimal", "Low", "Medium", "High")
+    regime_colors = ("#EAF4EA", "#EAF1F8", "#FFF3DA", "#F7E6E6")
 
     ax = axes[0, 0]
     for mt in METHOD_ORDER:
@@ -652,12 +659,25 @@ def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
 
     for label, ax in zip("abcd", axes.ravel()):
         ax.set_title(f"({label})", loc="left", pad=5, fontweight="bold")
+        ax.set_xscale("log", base=10)
+        for lo, hi, color in zip(log_edges[:-1], log_edges[1:], regime_colors):
+            ax.axvspan(lo, hi, color=color, alpha=0.42, zorder=0)
         ax.set_xticks(x)
-        span = max(float(np.ptp(x)), 1.0)
-        ax.set_xlim(float(np.min(x)) - 0.04 * span,
-                    float(np.max(x)) + 0.04 * span)
+        ax.set_xticklabels([f"{value:g}" for value in x], fontsize=6.8)
+        ax.set_xlim(1e-3, float(np.max(x)) * 1.15)
+    for ax in axes[0, :]:
+        # Keep the regime names in a dedicated header band rather than on top
+        # of high-valued curves and their confidence intervals.
+        y_lo, y_hi = ax.get_ylim()
+        ax.set_ylim(y_lo, y_hi + 0.14 * (y_hi - y_lo))
+        for lo, hi, name in zip(log_edges[:-1], log_edges[1:], regime_names):
+            display_name = "Compatible /\nminimal" if name == "Compatible / minimal" else name
+            ax.annotate(display_name, xy=(np.sqrt(lo * hi), 0.985),
+                        xycoords=("data", "axes fraction"), ha="center",
+                        va="top", fontsize=5.5, linespacing=0.85,
+                        color="0.30")
     for ax in axes[1, :]:
-        ax.set_xlabel(r"Local conflict in $X_1=1$ stratum, $b_1$")
+        ax.set_xlabel(r"Local conflict $b(1)$ (log scale)")
 
     method_handles = [plt.Line2D([], [], color=METHOD_COLORS[m],
                       marker=METHOD_MARKERS[m], label=METHOD_LABELS[m])
@@ -674,8 +694,8 @@ def plot_figure5_borrowing_diagnostics(df, scen_order, out_dir):
 
 
 def plot_global_local_quadrants(df, scen_order, out_dir):
-    """Compact diagnostic for the orthogonal global-by-local experiment."""
-    labels = [r"$G^-L^-$", r"$G^+L^-$", r"$G^-L^+$", r"$G^+L^+$"]
+    """Compact diagnostic for marginal shift and local heterogeneity."""
+    labels = [r"$g^-\ell^-$", r"$g^+\ell^-$", r"$g^-\ell^+$", r"$g^+\ell^+$"]
     x = np.arange(len(scen_order))
     fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.0), sharex=True)
 
@@ -741,7 +761,7 @@ def plot_figure6_precision_map(df, scen_order, out_dir):
     for sc in scen_order:
         primary = getattr(config, "PRIMARY_SCENARIOS", getattr(config, "DEMO_SCENARIOS", {}))
         meta = primary.get(sc, config.SCENARIOS.get(sc, {}))
-        # The x coordinate is the LOCAL conflict b1 whenever the grid defines
+        # The x coordinate is the local conflict b(1) whenever the grid defines
         # it: the marginal shift would plot a cell whose X1 = 0 stratum is
         # exactly compatible at the same coordinate as a uniformly shifted one.
         bl = meta.get("b_local") if isinstance(meta, dict) else None
@@ -768,7 +788,7 @@ def plot_figure6_precision_map(df, scen_order, out_dir):
                        vmin=0, vmax=max(0.4, np.nanmax(Z)*1.05))
         ax.set_xticks(range(len(bvals))); ax.set_xticklabels([f"{b:g}" for b in bvals])
         ax.set_yticks(range(len(svals))); ax.set_yticklabels([f"{s:g}" for s in svals])
-        ax.set_xlabel(r"Local conflict  $b_1$")
+        ax.set_xlabel(r"Local conflict  $b(1)$")
         if mt == "CAHB": ax.set_ylabel(r"Historical noise SD  $\sigma_H$")
         ax.set_title(f"{mt}: mean $W(x)$")
         for i in range(Z.shape[0]):

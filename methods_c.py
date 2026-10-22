@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import ctypes as ct
 import numpy as np
+from scipy.stats import norm
 
 def _kernel_effective_n(weights, floor=1e-6):
     """Reference for the C RADISH kernel's Kish effective sample size.
@@ -255,6 +256,17 @@ def _estimate_ate_c(Xeval, X0, Y0, X1, Y1, Xh, Yh, h, W_vec, alpha):
     return float(out_ate[0]), float(out_lo[0]), float(out_hi[0]), float(out_pp[0])
 
 
+def _variance_safeguarded_result(borrow_result, reference_result, alpha):
+    """Keep the RADISH point estimate and impose a concurrent-only SE floor."""
+    ate, lo, hi, _ = borrow_result
+    _, ref_lo, ref_hi, _ = reference_result
+    z = norm.ppf(1.0 - alpha / 2.0)
+    se = max((hi - lo) / (2.0 * z),
+             (ref_hi - ref_lo) / (2.0 * z))
+    return (ate, ate - z * se, ate + z * se,
+            float(norm.cdf(ate / se)) if se > 1e-12 else 0.5)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # KBCD
 # ═══════════════════════════════════════════════════════════════════
@@ -463,8 +475,12 @@ class RADISH:
             Xc.shape[1], self.h, self.n0_fin,
             Rn, W, D, T2,
         )
-        return _estimate_ate_c(Xc, Xc[i0], Y[i0], Xc[i1], Y[i1],
-                               self.X_h, self.Y_h, self.h, W, self.alpha)
+        borrowed = _estimate_ate_c(Xc, Xc[i0], Y[i0], Xc[i1], Y[i1],
+                                   self.X_h, self.Y_h, self.h, W, self.alpha)
+        concurrent = _estimate_ate_c(Xc, Xc[i0], Y[i0], Xc[i1], Y[i1],
+                                     self.X_h, self.Y_h, self.h,
+                                     np.zeros(n), self.alpha)
+        return _variance_safeguarded_result(borrowed, concurrent, self.alpha)
 
     def compute_diagnostics(self, X, Y, Z):
         Xc = _arr(_as_2d(X)); Y = _arr(Y); Z = np.asarray(Z, int)

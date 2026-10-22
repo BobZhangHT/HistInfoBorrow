@@ -100,4 +100,17 @@ tmp/
 reports/
 tmp_*.txt
 # Internal revision notes are not part of the public package
-REVISION_PLAN.md
+REVISION_PLAN*.md
+REVISION_NOTES*.md
+POLISHING_REVIEW*.md
+EDITOR_REVIEW*.md
+*AUDIT*.md
+*AUDIT*.json
+*AUDIT*.html
+PRESERVATION_CHECKS*.json
+CLAIM_SUPPORT_MAP*.md
+EQUIVALENCE_LEDGER*.md
+TECHNICAL_RISK_REGISTER*.md
+MANIFEST.md
+refine-logs/
+tests/

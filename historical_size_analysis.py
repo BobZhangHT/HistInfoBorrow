@@ -291,43 +291,73 @@ def advantage_change(df):
     return pd.DataFrame(rows)
 
 
-def _plot_sensitivity(comparison, out_path):
-    sizes = sorted({int(comparison.N_H_Low.iloc[0]), int(comparison.N_H_High.iloc[0])})
-    power = comparison[(comparison.Method == "RADISH") & (comparison.Effect == "Power")].copy()
-    scenario_order = list(config.get_mode_scenarios("hist_size"))
-    power["ScenarioIndex"] = pd.Categorical(
-        power.Scenario, categories=scenario_order, ordered=True)
-    power = power.sort_values("ScenarioIndex")
-    labels = [SCENARIO_DISPLAY.get(s, s.split("_")[0])
-              for s in power.Scenario]
-    x = np.arange(len(labels))
+def _plot_sensitivity(df, out_path):
+    """Show borrowing-method gains over KBCD at each historical sample size."""
+    power = _prepare(df)
+    power = power[power.effect_type == "Power"].copy()
+    scenarios = list(config.get_mode_scenarios("hist_size"))
+    sizes = sorted(int(v) for v in power.n_historical.unique())
+    x = np.arange(len(scenarios))
+    labels = [f"S{i + 1}" for i in range(len(scenarios))]
 
-    fig, axes = plt.subplots(2, 2, figsize=(6.83, 5.25), sharex=True)
-    panels = [
-        ("RMSE", "RMSE", "(a) RMSE"),
-        ("Rejection", "Calibrated power", "(b) Calibrated power"),
-        ("Width", "CI width", "(c) Confidence-interval width"),
-        ("Mean_W", "Mean borrowing weight", "(d) Borrowing weight"),
-    ]
-    for ax, (prefix, ylabel, title) in zip(axes.flat, panels):
-        for n_h, marker, linestyle, alpha in zip(
-                sizes, ["o", "s"], ["--", "-"], [0.58, 1.0]):
-            ax.plot(x, power[f"{prefix}_NH{n_h}"],
-                    color=METHOD_COLORS["RADISH"], marker=marker,
-                    linestyle=linestyle, alpha=alpha, linewidth=1.8,
-                    label=fr"$N_H={n_h}$")
-        ax.set_ylabel(ylabel)
-        ax.set_title(title, loc="left")
-        ax.grid(alpha=0.25)
-        if prefix == "Rejection":
-            ax.set_ylim(0.80, 1.01)
-        elif prefix == "Mean_W":
-            ax.set_ylim(0, 0.92)
-    for ax in axes[-1, :]:
-        ax.set_xticks(x, labels)
-        ax.set_xlabel("Scenario")
-    axes[0, 0].legend(frameon=False)
-    fig.tight_layout()
+    rows = []
+    for (n_h, scenario, method), cell in power.groupby(
+            ["n_historical", "scenario", "method"], sort=False):
+        rows.append({"N_H": int(n_h), "Scenario": scenario, "Method": method,
+                     "RMSE": float(np.sqrt(cell.sq_error.mean())),
+                     "Power": float(cell.reported_rejection.mean())})
+    summary = pd.DataFrame(rows)
+
+    fig, axes = plt.subplots(2, 2, figsize=(6.83, 5.15), sharex=True)
+    markers = {"CAHB": "s", "RADISH": "^"}
+    regime_names = ("Compatible", "Small", "Moderate", "Severe")
+    regime_colors = ("#EAF4EA", "#EAF1F8", "#FFF3DA", "#F7E6E6")
+    for col, n_h in enumerate(sizes):
+        cell = summary[summary.N_H == n_h].set_index(["Scenario", "Method"])
+        for method in ("CAHB", "RADISH"):
+            rmse = np.array([cell.loc[(s, method), "RMSE"] for s in scenarios])
+            base = np.array([cell.loc[(s, "KBCD"), "RMSE"] for s in scenarios])
+            rel_eff = (base / rmse) ** 2
+            power_gain = np.array([
+                cell.loc[(s, method), "Power"] - cell.loc[(s, "KBCD"), "Power"]
+                for s in scenarios])
+            style = dict(color=METHOD_COLORS[method], marker=markers[method],
+                         linewidth=1.7, markersize=4.5, label=method)
+            axes[0, col].plot(x, rel_eff, **style)
+            axes[1, col].plot(x, power_gain, **style)
+
+        axes[0, col].axhline(1.0, color=METHOD_COLORS["KBCD"], linestyle="--",
+                            linewidth=1.1)
+        axes[1, col].axhline(0.0, color=METHOD_COLORS["KBCD"], linestyle="--",
+                            linewidth=1.1)
+        axes[0, col].set_title(fr"({chr(97 + col)}) $N_H={n_h}$")
+        axes[1, col].set_title(fr"({chr(99 + col)}) $N_H={n_h}$")
+        for ax in axes[:, col]:
+            for j, color in enumerate(regime_colors):
+                ax.axvspan(2 * j - 0.5, 2 * j + 1.5, color=color,
+                           alpha=0.42, zorder=0)
+            ax.grid(axis="y", alpha=0.25)
+            ax.set_xticks(x, labels)
+            ax.set_xlim(-0.45, len(scenarios) - 0.55)
+        y_lo, y_hi = axes[0, col].get_ylim()
+        axes[0, col].set_ylim(y_lo, y_hi + 0.14 * (y_hi - y_lo))
+        for j, name in enumerate(regime_names):
+            axes[0, col].annotate(name, xy=(2 * j + 0.5, 0.985),
+                                  xycoords=("data", "axes fraction"),
+                                  ha="center", va="top", fontsize=6.2,
+                                  color="0.30")
+    axes[0, 0].set_ylabel("Relative efficiency vs KBCD")
+    axes[1, 0].set_ylabel("Calibrated-power difference vs KBCD")
+    for ax in axes[1, :]:
+        ax.set_xlabel("Simulation scenario")
+    handles = [
+        plt.Line2D([], [], color=METHOD_COLORS[m], marker=markers[m],
+                   label=METHOD_LABELS[m]) for m in ("CAHB", "RADISH")]
+    handles.append(plt.Line2D([], [], color=METHOD_COLORS["KBCD"],
+                              linestyle="--", label="KBCD reference"))
+    fig.legend(handles=handles, loc="upper center", ncol=3, frameon=False,
+               bbox_to_anchor=(0.5, 1.01))
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
@@ -388,7 +418,7 @@ def run_analysis(df, out_dir):
     comparison.to_csv(table_dir / "paired_history_size_comparison.csv", index=False)
     contrasts.to_csv(table_dir / "radish_method_contrasts.csv", index=False)
     advantage.to_csv(table_dir / "radish_advantage_change.csv", index=False)
-    _plot_sensitivity(comparison, plot_dir / "fig_historical_size_sensitivity.pdf")
+    _plot_sensitivity(df, plot_dir / "fig_historical_size_sensitivity.pdf")
     _plot_conflict_robustness(
         comparison, plot_dir / "fig_historical_size_robustness.pdf")
 
