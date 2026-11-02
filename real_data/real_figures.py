@@ -229,7 +229,12 @@ def _global_local_factor_labels():
 def make_global_local_F4(summary, suffix=""):
     """Plot overall performance across the four conflict structures."""
     order = _global_local_order()
-    labels = _global_local_factor_labels()
+    labels = [
+        "Zero mean shift\nSmall variation",
+        "Large mean shift\nSmall variation",
+        "Zero mean shift\nLarge variation",
+        "Large mean shift\nLarge variation",
+    ]
     x = np.arange(len(order), dtype=float)
     fig, axes = plt.subplots(2, 2, figsize=(COL2_W, 5.1), sharex=True)
     panels = [
@@ -259,15 +264,11 @@ def make_global_local_F4(summary, suffix=""):
             ax.axhspan(max(0, 100 * ALPHA - half), 100 * ALPHA + half,
                        color="0.80", alpha=0.35, zorder=0)
             ax.axhline(100 * ALPHA, color="0.35", linestyle=":", linewidth=1)
-            ax.text(0.02, 0.94, "Target = 5%", transform=ax.transAxes,
-                    ha="left", va="top", fontsize=7.2, color="0.30")
         if metric == "bias":
             ax.axhline(0, color="0.35", linestyle=":", linewidth=1)
-            ax.text(0.98, 0.51, "No bias", transform=ax.transAxes,
-                    ha="right", va="bottom", fontsize=7.2, color="0.30")
         ax.set_title(title, fontsize=10)
         ax.set_ylabel(ylabel)
-        ax.set_xticks(x, labels, fontsize=7.2)
+        ax.set_xticks(x, labels, fontsize=6.5)
         ax.grid(axis="y", alpha=0.22, linewidth=0.5)
         ax.spines[["top", "right"]].set_visible(False)
     axes[1, 0].set_xlabel("Conflict structure")
@@ -283,6 +284,8 @@ def make_global_local_F4(summary, suffix=""):
                         wspace=0.27, hspace=0.34)
     out = FIG_DIR / f"F1_global_local{suffix}.pdf"
     fig.savefig(out, bbox_inches="tight")
+    with matplotlib.rc_context({"svg.fonttype": "none"}):
+        fig.savefig(out.with_suffix(".svg"), bbox_inches="tight")
     fig.savefig(out.with_suffix(".png"), dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"[global-local F4] -> {out}")
